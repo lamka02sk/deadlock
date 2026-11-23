@@ -85,13 +85,10 @@ pub fn claim(socket: &Path, request: &Request) -> io::Result<Instance> {
 pub fn serve(listener: &UnixListener, mut on_request: impl FnMut(Request)) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        // A client that never sends its line must not stall the next launch.
-        if stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .is_err()
-        {
-            continue;
-        }
+        // A client that never sends its line must not stall the next launch. macOS
+        // refuses the timeout (EINVAL) once the client has closed its end, which is the
+        // usual case; the read then ends at the end of the stream, so the error is ignored.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut line = String::new();
         if BufReader::new(stream).read_line(&mut line).is_ok() {
             let line = line.trim_end_matches('\n');
