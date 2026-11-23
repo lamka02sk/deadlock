@@ -28,9 +28,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  # macOS package (Apple Silicon) on a tag push, as a workflow artifact.
+  # macOS package (Apple Silicon) on a tag push, attached to the tag's release.
   package-macos:
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     needs: [check, check-macos]
     runs-on: macos-latest
     steps:
@@ -38,15 +40,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: packaging/macos/package.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: deadlock-macos-${{ github.ref_name }}
-          path: target/package/*.dmg
+      # A tag pushed without a release gets one; the two package jobs may race to
+      # create it, so the loser's error is ignored and the upload reports real ones.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --generate-notes 2>/dev/null || true
+          gh release upload "$TAG" --clobber target/package/*.dmg
 
-  # Linux packages on a tag push, as workflow artifacts. Windows packages are not
+  # Linux packages on a tag push, attached to the tag's release. Windows packages are not
   # built yet.
   package-linux:
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     needs: check
     runs-on: ubuntu-latest
     steps:
@@ -56,9 +65,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang dpkg-dev libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan1
       - uses: Swatinem/rust-cache@v2
       - run: packaging/linux/package.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: deadlock-linux-${{ github.ref_name }}
-          path: |
-            target/package/*.deb
-            target/package/*.AppImage
+      # A tag pushed without a release gets one; the two package jobs may race to
+      # create it, so the loser's error is ignored and the upload reports real ones.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --generate-notes 2>/dev/null || true
+          gh release upload "$TAG" --clobber target/package/*.deb target/package/*.AppImage
