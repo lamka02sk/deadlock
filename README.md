@@ -52,4 +52,15 @@ also libwayland-client. The `.deb` declares these; the AppImage takes them from 
 host. Packages are built on the build machine's glibc, so they run on systems with
 that glibc or newer.
 
-macOS and Windows packages are not built yet.
+## Package (macOS)
+
+```sh
+packaging/macos/package.sh
+```
+
+Runs on macOS only. Writes `target/package/Deadlock-<version>-<arch>.dmg` with
+`Deadlock.app` for the architecture of the build machine; CI builds the Apple Silicon
+one on every tag push. The app is ad-hoc signed, not notarized: on first launch macOS
+blocks it until it is allowed in System Settings → Privacy & Security → Open Anyway.
+
+Windows packages are not built yet.

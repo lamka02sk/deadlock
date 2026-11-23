@@ -19,8 +19,32 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Linux packages on a tag push, as workflow artifacts. macOS and Windows packages
-  # are not built yet.
+  # Compiles and tests on macOS, so a break there shows on the push that causes it.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # macOS package (Apple Silicon) on a tag push, as a workflow artifact.
+  package-macos:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [check, check-macos]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: packaging/macos/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deadlock-macos-${{ github.ref_name }}
+          path: target/package/*.dmg
+
+  # Linux packages on a tag push, as workflow artifacts. Windows packages are not
+  # built yet.
   package-linux:
     if: startsWith(github.ref, 'refs/tags/')
     needs: check
