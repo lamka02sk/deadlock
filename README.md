@@ -43,7 +43,8 @@ packaging/linux/package.sh
 
 Builds the release binary and writes `target/package/deadlock_<version>_amd64.deb`
 and `target/package/Deadlock-<version>-x86_64.AppImage`. Needs `dpkg-deb` and
-`dpkg-shlibdeps` (package `dpkg-dev`) and `curl`; it downloads `appimagetool` into
+`dpkg-shlibdeps` (package `dpkg-dev`), `desktop-file-validate` (package
+`desktop-file-utils`) and `curl`; it downloads `appimagetool` into
 `target/package-tools/` once. No root needed. CI builds both on
 every tag push and attaches them to the tag's GitHub release.
 

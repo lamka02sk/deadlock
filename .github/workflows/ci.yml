@@ -61,8 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install GPUI system libraries and dpkg-dev
-        run: sudo apt-get update && sudo apt-get install -y clang dpkg-dev libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan1
+      - name: Install GPUI system libraries and packaging tools
+        run: sudo apt-get update && sudo apt-get install -y clang dpkg-dev desktop-file-utils libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan1
       - uses: Swatinem/rust-cache@v2
       - run: packaging/linux/package.sh
       # A tag pushed without a release gets one; the two package jobs may race to

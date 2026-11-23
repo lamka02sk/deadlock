@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the release binary and packs it as a .deb and an AppImage in target/package/.
 # Usage: package.sh [deb|appimage|all] (default all).
-# Needs dpkg-deb and dpkg-shlibdeps (dpkg-dev); the AppImage also needs curl, and
+# Needs dpkg-deb and dpkg-shlibdeps (dpkg-dev); the AppImage also needs curl and
+# desktop-file-validate (desktop-file-utils), and
 # downloads appimagetool into target/package-tools/ the first time. No root needed.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
