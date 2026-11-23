@@ -1,0 +1,32 @@
+SQL_ID  a5az2fd6mdmk2, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ c.country, COUNT(*) AS n, 
+SUM(i.qty) AS qty FROM customers c JOIN orders o ON o.customer_id = 
+c.id JOIN items i ON i.order_id = o.id WHERE o.status = 'paid' GROUP BY 
+c.country
+ 
+Plan hash value: 952114628
+ 
+-----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name      | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |           |      1 |        |      5 |00:00:00.06 |     833 |       |       |          |
+|   1 |  HASH GROUP BY       |           |      1 |      5 |      5 |00:00:00.06 |     833 |  1063K|  1063K|          |
+|*  2 |   HASH JOIN          |           |      1 |  39701 |  40000 |00:00:00.26 |     833 |  2474K|  2474K| 2104K (0)|
+|*  3 |    HASH JOIN         |           |      1 |  20000 |  20000 |00:00:00.19 |     391 |  2493K|  2493K| 1965K (0)|
+|   4 |     TABLE ACCESS FULL| CUSTOMERS |      1 |  20000 |  20000 |00:00:00.01 |      75 |       |       |          |
+|*  5 |     TABLE ACCESS FULL| ORDERS    |      1 |  20000 |  20000 |00:00:00.04 |     316 |       |       |          |
+|   6 |    TABLE ACCESS FULL | ITEMS     |      1 |    120K|    120K|00:00:00.21 |     442 |       |       |          |
+-----------------------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   2 - access("I"."ORDER_ID"="O"."ID")
+   3 - access("O"."CUSTOMER_ID"="C"."ID")
+   5 - filter("O"."STATUS"='paid')
+ 
+Note
+-----
+   - this is an adaptive plan
+ 

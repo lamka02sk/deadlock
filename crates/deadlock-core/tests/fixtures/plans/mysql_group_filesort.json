@@ -1,0 +1,33 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "12107.85"
+    },
+    "ordering_operation": {
+      "using_filesort": true,
+      "grouping_operation": {
+        "using_temporary_table": true,
+        "using_filesort": false,
+        "table": {
+          "table_name": "items",
+          "access_type": "ALL",
+          "rows_examined_per_scan": 120196,
+          "rows_produced_per_join": 120196,
+          "filtered": "100.00",
+          "cost_info": {
+            "read_cost": "88.25",
+            "eval_cost": "12019.60",
+            "prefix_cost": "12107.85",
+            "data_read_per_join": "11M"
+          },
+          "used_columns": [
+            "id",
+            "sku",
+            "qty"
+          ]
+        }
+      }
+    }
+  }
+}

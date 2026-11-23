@@ -1,0 +1,54 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 158.3702971,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "index",
+          "possible_keys": ["PRIMARY"],
+          "key": "country",
+          "key_length": "9",
+          "used_key_parts": ["country"],
+          "loops": 1,
+          "rows": 19874,
+          "cost": 2.93981441,
+          "filtered": 100,
+          "using_index": true
+        }
+      },
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": ["PRIMARY", "customer_id"],
+          "key": "customer_id",
+          "key_length": "5",
+          "used_key_parts": ["customer_id"],
+          "ref": ["plantest.c.id"],
+          "loops": 19874,
+          "rows": 2,
+          "cost": 56.1378512,
+          "filtered": 100,
+          "attached_condition": "o.`status` = 'paid'"
+        }
+      },
+      {
+        "table": {
+          "table_name": "i",
+          "access_type": "ref",
+          "possible_keys": ["order_id"],
+          "key": "order_id",
+          "key_length": "5",
+          "used_key_parts": ["order_id"],
+          "ref": ["plantest.o.id"],
+          "loops": 39748,
+          "rows": 1,
+          "cost": 72.70898688,
+          "filtered": 100
+        }
+      }
+    ]
+  }
+}

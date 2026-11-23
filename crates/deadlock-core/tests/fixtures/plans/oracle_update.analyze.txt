@@ -1,0 +1,21 @@
+SQL_ID  gmryuq07t1160, child number 0
+-------------------------------------
+UPDATE /*+ GATHER_PLAN_STATISTICS */ orders SET total = total + 1 WHERE 
+created_at < DATE '2026-01-02'
+ 
+Plan hash value: 2257038838
+ 
+-------------------------------------------------------------------------------------------
+| Id  | Operation         | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------
+|   0 | UPDATE STATEMENT  |             |      3 |        |      0 |00:00:00.01 |    1549 |
+|   1 |  UPDATE           | ORDERS      |      3 |        |      0 |00:00:00.01 |    1549 |
+|*  2 |   INDEX RANGE SCAN| IDX_CREATED |      3 |   1439 |   3699 |00:00:00.01 |      12 |
+-------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   2 - access("CREATED_AT"<TO_DATE(' 2026-01-02 00:00:00', 'syyyy-mm-dd 
+              hh24:mi:ss'))
+ 

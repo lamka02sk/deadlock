@@ -1,0 +1,3 @@
+-> Filter: (customers.email like '%9@x.io')  (cost=2002 rows=2197) (actual time=0.341..64.4 rows=2000 loops=1)
+    -> Table scan on customers  (cost=2002 rows=19775) (actual time=0.0522..31.1 rows=20000 loops=1)
+

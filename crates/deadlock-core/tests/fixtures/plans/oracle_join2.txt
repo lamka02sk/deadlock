@@ -1,0 +1,23 @@
+Plan hash value: 206905276
+ 
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation                               | Name        | Rows  | Bytes | Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                        |             |   500 | 13500 |    41   (3)| 00:00:01 |
+|*  1 |  COUNT STOPKEY                          |             |       |       |            |          |
+|   2 |   VIEW                                  |             |  1601 | 43227 |    41   (3)| 00:00:01 |
+|*  3 |    SORT ORDER BY STOPKEY                |             |  1601 | 70444 |    41   (3)| 00:00:01 |
+|*  4 |     HASH JOIN                           |             |  1601 | 70444 |    40   (0)| 00:00:01 |
+|*  5 |      TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS      |  1601 | 43227 |    18   (0)| 00:00:01 |
+|*  6 |       INDEX RANGE SCAN                  | IDX_CREATED |  2401 |       |     7   (0)| 00:00:01 |
+|   7 |      TABLE ACCESS FULL                  | CUSTOMERS   | 20000 |   332K|    22   (0)| 00:00:01 |
+-------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   1 - filter(ROWNUM<=500)
+   3 - filter(ROWNUM<=500)
+   4 - access("C"."ID"="O"."CUSTOMER_ID")
+   5 - filter("O"."STATUS"='paid' OR "O"."STATUS"='shipped')
+   6 - access("O"."CREATED_AT">=TO_DATE(' 2026-02-10 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))

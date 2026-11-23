@@ -1,0 +1,1102 @@
+//! Editor tabs: new, open, save, close, consoles, the tab strip, and the tab list in
+//! `state.json`.
+
+use std::path::{Path, PathBuf};
+
+use deadlock_core::connection::{ConnectionConfig, Environment};
+use deadlock_core::project::{TabState, console_path, load_text, save_text};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px,
+};
+
+use super::{Conn, Front, Shell};
+use crate::assets::{Icon, icon};
+use crate::query::{Kind, QueryTab, Scope, TabEvent, TxMode, View};
+use crate::theme::{Palette, tab_height};
+use deadlock_core::edit::TableRef;
+
+impl Shell {
+    /// A saved connection, as a tab binds to it.
+    pub(super) fn binding(&self, id: Option<&str>) -> Option<ConnectionConfig> {
+        self.config(id?).cloned()
+    }
+
+    /// Reopens the tabs listed in `state.json`. Files that are gone are skipped.
+    pub(super) fn restore_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = std::mem::take(&mut self.project.state.tabs);
+        let front = self.project.state.active_tab;
+        for tab in saved {
+            let (kind, connection, text) = match tab {
+                TabState::File {
+                    path: Some(path),
+                    connection,
+                    ..
+                } => match std::fs::read_to_string(&path) {
+                    Ok(text) => (Kind::File(Some(path)), connection, text),
+                    Err(e) => {
+                        eprintln!("deadlock: {}: {e}", path.display());
+                        continue;
+                    }
+                },
+                TabState::File {
+                    path: None,
+                    connection,
+                    text,
+                } => (Kind::File(None), connection, text.unwrap_or_default()),
+                TabState::Table {
+                    connection,
+                    database,
+                    table,
+                } => (
+                    Kind::Table(TableRef { database, table }),
+                    Some(connection),
+                    String::new(),
+                ),
+                TabState::Console { connection } => {
+                    match console_path(self.project.root(), &connection)
+                        .and_then(|p| load_text(&p).map(|t| (p, t)))
+                    {
+                        Ok((path, text)) => (Kind::Console(path), Some(connection), text),
+                        Err(e) => {
+                            eprintln!("deadlock: console: {e}");
+                            continue;
+                        }
+                    }
+                }
+            };
+            let binding = self.binding(connection.as_deref());
+            self.add_tab(kind, binding, text, window, cx);
+        }
+        self.front = match front {
+            Some(i) if i < self.tabs.len() => Front::Query(i),
+            _ if self.tabs.is_empty() => Front::None,
+            _ => Front::Query(0),
+        };
+        if let Some(tab) = self.front_tab().cloned() {
+            tab.update(cx, |t, cx| t.open_table(cx));
+        }
+        self.follow_front(cx);
+    }
+
+    pub(super) fn add_tab(
+        &mut self,
+        kind: Kind,
+        binding: Option<ConnectionConfig>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let untitled = matches!(kind, Kind::File(None));
+        let inline = self.results_inline(cx);
+        let root = self.project.root().to_owned();
+        let tab = cx.new(|cx| {
+            let mut t = QueryTab::new(kind, binding, text, window, cx);
+            t.inline = inline;
+            t.root = root.clone();
+            t
+        });
+        if untitled {
+            self.untitled += 1;
+            let n = self.untitled;
+            tab.update(cx, |t, _| t.untitled = n);
+        }
+        let sub = cx.subscribe_in(&tab, window, Self::on_tab_event);
+        self.tabs.push((tab, sub));
+        self.tabs.len() - 1
+    }
+
+    fn on_tab_event(
+        &mut self,
+        tab: &Entity<QueryTab>,
+        e: &TabEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let conn = tab.read(cx).connection.as_ref().map(|c| c.id.clone());
+        match e {
+            TabEvent::NeedSession => self.provide_session(tab, cx),
+            TabEvent::OpenTable(table) => {
+                if let Some(conn) = conn {
+                    self.open_table(&conn, table.clone(), View::Structure, window, cx);
+                }
+            }
+            TabEvent::SchemaChanged(database) => {
+                if let Some(conn) = conn
+                    && matches!(self.conns.get(&conn), Some(Conn::Connected(_)))
+                {
+                    self.load(vec![conn, database.clone()], cx);
+                }
+            }
+            TabEvent::ResultsInline(inline) => {
+                let inline = *inline;
+                self.project.state.results_in_panel = Some(!inline);
+                for (t, _) in &self.tabs {
+                    t.update(cx, |t, cx| t.set_inline(inline, cx));
+                }
+                self.schedule_save(cx);
+            }
+            TabEvent::KeysChanged(db, removed, added) => {
+                if let Some(conn) = conn {
+                    self.keys_changed(&conn, db, removed.clone(), added.clone(), cx);
+                }
+            }
+            TabEvent::Recorded => self.history_changed(cx),
+            TabEvent::Changed => {
+                if matches!(tab.read(cx).kind, Kind::File(None)) {
+                    self.schedule_save(cx);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Hands a tab its connection's settings and password, connecting the connection
+    /// (and asking for the password) first when needed.
+    pub(super) fn provide_session(&mut self, tab: &Entity<QueryTab>, cx: &mut Context<Self>) {
+        let Some(id) = tab.read(cx).connection.as_ref().map(|c| c.id.clone()) else {
+            return;
+        };
+        let (Some(config), Some(password)) = (self.config(&id).cloned(), self.passwords.get(&id))
+        else {
+            if !matches!(self.conns.get(&id), Some(Conn::Connecting)) && self.prompt.is_none() {
+                self.connect(&id, cx);
+            }
+            return;
+        };
+        let password = password.clone();
+        tab.update(cx, |t, cx| t.connect(config, password, cx));
+    }
+
+    /// The connection `id` connected or failed: tabs waiting for it go on or give up.
+    pub(super) fn resume_tabs(&mut self, id: &str, error: Option<&str>, cx: &mut Context<Self>) {
+        let waiting: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|(t, _)| t.clone())
+            .filter(|t| {
+                let t = t.read(cx);
+                t.needs_session() && t.connection.as_ref().is_some_and(|c| c.id == id)
+            })
+            .collect();
+        for tab in waiting {
+            match error {
+                None => self.provide_session(&tab, cx),
+                Some(e) => tab.update(cx, |t, cx| t.fail_session(e.to_owned(), cx)),
+            }
+        }
+    }
+
+    pub(super) fn front_tab(&self) -> Option<&Entity<QueryTab>> {
+        match self.front {
+            Front::Query(i) => self.tabs.get(i).map(|(t, _)| t),
+            _ => None,
+        }
+    }
+
+    /// The toolbar and status bar follow the front tab's connection.
+    pub(super) fn follow_front(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self
+            .front_tab()
+            .and_then(|t| t.read(cx).connection.as_ref())
+        {
+            self.active = Some(c.id.clone());
+        }
+        if let Front::Sessions(i) = self.front
+            && let Some((t, _)) = self.sessions.get(i)
+        {
+            self.active = Some(t.read(cx).connection.id.clone());
+        }
+        if let Front::Config(i) = self.front
+            && let Some((t, _)) = self.configs.get(i)
+        {
+            self.active = Some(t.read(cx).connection.id.clone());
+        }
+        if let Front::Diagram(i) = self.front
+            && let Some((t, _)) = self.diagrams.get(i)
+        {
+            self.active = Some(t.read(cx).connection.id.clone());
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    pub(super) fn show_tab(&mut self, front: Front, window: &mut Window, cx: &mut Context<Self>) {
+        self.front = front;
+        if let Some(tab) = self.front_tab().cloned() {
+            if tab.read(cx).table.is_some() {
+                tab.update(cx, |t, cx| {
+                    t.open_table(cx);
+                    t.focus_table(window, cx);
+                });
+            } else {
+                let editor = tab.read(cx).editor.clone();
+                editor.update(cx, |e, cx| e.focus(window, cx));
+            }
+        }
+        self.follow_front(cx);
+    }
+
+    /// Opens a table or view of connection `conn` as a tab, or brings its tab forward;
+    /// a reference link asks for its Structure view.
+    pub(super) fn open_table(
+        &mut self,
+        conn: &str,
+        table: TableRef,
+        view: View,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(binding) = self.binding(Some(conn)) else {
+            return;
+        };
+        let open = self.tabs.iter().position(|(t, _)| {
+            let t = t.read(cx);
+            t.kind == Kind::Table(table.clone())
+                && t.connection.as_ref().is_some_and(|c| c.id == conn)
+        });
+        let i = open.unwrap_or_else(|| {
+            self.add_tab(Kind::Table(table), Some(binding), String::new(), window, cx)
+        });
+        self.active = Some(conn.to_owned());
+        if view == View::Structure
+            && let Some((tab, _)) = self.tabs.get(i)
+        {
+            tab.update(cx, |t, _| {
+                if let Some(t) = &mut t.table {
+                    t.view = View::Structure;
+                }
+            });
+        }
+        self.show_tab(Front::Query(i), window, cx);
+    }
+
+    /// Ctrl+N: an untitled buffer on the active connection.
+    pub(super) fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let binding = self.binding(self.active.as_deref());
+        let i = self.add_tab(Kind::File(None), binding, String::new(), window, cx);
+        self.show_tab(Front::Query(i), window, cx);
+    }
+
+    /// Ctrl+Shift+N: the active connection's console, opened or brought forward.
+    pub(super) fn open_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(binding) = self.binding(self.active.as_deref()) else {
+            return;
+        };
+        let open = self.tabs.iter().position(|(t, _)| {
+            let t = t.read(cx);
+            matches!(t.kind, Kind::Console(_))
+                && t.connection.as_ref().is_some_and(|c| c.id == binding.id)
+        });
+        let i = match open {
+            Some(i) => i,
+            None => match console_path(self.project.root(), &binding.id)
+                .and_then(|p| load_text(&p).map(|t| (p, t)))
+            {
+                Ok((path, text)) => {
+                    self.add_tab(Kind::Console(path), Some(binding), text, window, cx)
+                }
+                Err(e) => {
+                    eprintln!("deadlock: console: {e}");
+                    return;
+                }
+            },
+        };
+        self.show_tab(Front::Query(i), window, cx);
+    }
+
+    /// Ctrl+O: the native file picker, starting in the project folder.
+    pub(super) fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Open".into()),
+        });
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let paths = match picked.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(e)) => {
+                    eprintln!("deadlock: file picker: {e:#}");
+                    return;
+                }
+            };
+            let _ = cx.update_window(handle, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    for path in paths {
+                        this.open_path(path, window, cx);
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let open = self
+            .tabs
+            .iter()
+            .position(|(t, _)| t.read(cx).kind == Kind::File(Some(path.clone())));
+        let i = match open {
+            Some(i) => i,
+            None => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let binding = self.binding(self.active.as_deref());
+                    self.add_tab(Kind::File(Some(path)), binding, text, window, cx)
+                }
+                Err(e) => {
+                    eprintln!("deadlock: {}: {e}", path.display());
+                    return;
+                }
+            },
+        };
+        self.show_tab(Front::Query(i), window, cx);
+    }
+
+    /// Ctrl+S: writes the front tab; an untitled buffer asks where first.
+    pub(super) fn save_front(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.front_tab().cloned() {
+            self.save_tab(&tab, None, cx);
+        }
+    }
+
+    /// Saves `tab`, then closes tab `close` (a save prompt's "Save").
+    fn save_tab(&mut self, tab: &Entity<QueryTab>, close: Option<usize>, cx: &mut Context<Self>) {
+        let kind = tab.read(cx).kind.clone();
+        match kind {
+            Kind::Table(_) => {}
+            Kind::Console(_) => tab.update(cx, |t, cx| t.save_console(cx)),
+            Kind::File(Some(path)) => {
+                if write(tab, &path, cx) {
+                    self.after_save(close, cx);
+                }
+            }
+            Kind::File(None) => {
+                let picked = cx.prompt_for_new_path(self.project.root(), Some("query.sql"));
+                let tab = tab.clone();
+                cx.spawn(async move |this, cx| {
+                    let path = match picked.await {
+                        Ok(Ok(Some(path))) => path,
+                        Ok(Ok(None)) | Err(_) => return,
+                        Ok(Err(e)) => {
+                            eprintln!("deadlock: save picker: {e:#}");
+                            return;
+                        }
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        if write(&tab, &path, cx) {
+                            tab.update(cx, |t, _| t.kind = Kind::File(Some(path)));
+                            this.after_save(close, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn after_save(&mut self, close: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(i) = close {
+            self.remove_tab(i, cx);
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Closes tab `i`, asking first about pending table changes, then about an open
+    /// transaction, then about unsaved changes. Consoles save themselves and never ask
+    /// about the text.
+    pub(super) fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(i).map(|(t, _)| t.clone()) else {
+            return;
+        };
+        if tab.read(cx).pending_changes(cx) > 0 && !std::mem::take(&mut self.pending_settled) {
+            let question = format!(
+                "Submit the pending changes before closing {}?",
+                self.tab_title(tab.read(cx))
+            );
+            self.settle_pending(vec![tab.clone()], question, cx, move |this, window, cx| {
+                if let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) {
+                    this.pending_settled = true;
+                    this.close_tab(i, window, cx);
+                }
+            });
+            return;
+        }
+        self.pending_settled = false;
+        if !std::mem::take(&mut self.tx_settled) {
+            let question = format!(
+                "Commit or roll back before closing {}?",
+                self.tab_title(tab.read(cx))
+            );
+            self.settle(vec![tab.clone()], question, cx, move |this, window, cx| {
+                // The tab may have moved while the prompt was open.
+                if let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) {
+                    this.tx_settled = true;
+                    this.close_tab(i, window, cx);
+                }
+            });
+            return;
+        }
+        let (ask, title) = {
+            let t = tab.read(cx);
+            let ask = match &t.kind {
+                Kind::Console(_) | Kind::Table(_) => false,
+                Kind::File(None) => !t.text(cx).trim().is_empty(),
+                Kind::File(Some(_)) => t.dirty,
+            };
+            (ask, self.tab_title(t))
+        };
+        if !ask {
+            tab.update(cx, |t, cx| t.save_console(cx));
+            self.remove_tab(i, cx);
+            return;
+        }
+        let answer = crate::dialog::ask(
+            window,
+            cx,
+            crate::dialog::Ask::new(
+                format!("Save changes to {title}?"),
+                &["Save", "Don't Save", "Cancel"],
+            ),
+        );
+        cx.spawn(async move |this, cx| {
+            let Some(answer) = answer.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                // The tab may have moved while the prompt was open.
+                let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) else {
+                    return;
+                };
+                match answer {
+                    0 => this.save_tab(&tab, Some(i), cx),
+                    1 => this.remove_tab(i, cx),
+                    _ => {}
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn remove_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        let (tab, _) = self.tabs.remove(i);
+        tab.update(cx, |t, cx| t.close_session(cx));
+        self.front = match self.front {
+            Front::Query(f) if f == i => match self.tabs.len() {
+                0 => Front::None,
+                n => Front::Query(i.min(n - 1)),
+            },
+            Front::Query(f) if f > i => Front::Query(f - 1),
+            other => other,
+        };
+        self.follow_front(cx);
+    }
+
+    /// The front file tab, when choosing connection `id` would move it there.
+    pub(super) fn moving_front(&self, id: &str, cx: &gpui_kit::App) -> Option<Entity<QueryTab>> {
+        self.front_tab()
+            .filter(|t| {
+                let t = t.read(cx);
+                matches!(t.kind, Kind::File(_)) && t.connection.as_ref().is_none_or(|c| c.id != id)
+            })
+            .cloned()
+    }
+
+    /// Asks Commit / Roll back / Cancel when any of `tabs` holds an open transaction,
+    /// ends it as answered, then runs `then`. Cancel, or a failed commit or rollback,
+    /// stops there: the transaction stays as it is.
+    pub(super) fn settle(
+        &mut self,
+        tabs: Vec<Entity<QueryTab>>,
+        question: String,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+    ) {
+        let handle = self.window;
+        let checks: Vec<_> = tabs
+            .iter()
+            .map(|t| t.update(cx, |t, cx| t.check_tx(true, false, cx)))
+            .collect();
+        let titles: Vec<String> = tabs.iter().map(|t| self.tab_title(t.read(cx))).collect();
+        cx.spawn(async move |this, cx| {
+            let mut open = Vec::new();
+            for ((tab, check), title) in tabs.into_iter().zip(checks).zip(titles) {
+                // A lost connection has nothing left to commit; the tab says so.
+                if check.await == Ok(true) {
+                    open.push((tab, title));
+                }
+            }
+            if !open.is_empty() {
+                let names: Vec<&str> = open.iter().map(|(_, t)| t.as_str()).collect();
+                let detail = if names.len() == 1 {
+                    format!("{} has uncommitted changes.", names[0])
+                } else {
+                    format!("{} have uncommitted changes.", names.join(", "))
+                };
+                let Ok(answer) = cx.update_window(handle, |_, window, cx| {
+                    crate::dialog::ask(
+                        window,
+                        cx,
+                        crate::dialog::Ask::new(
+                            question.clone(),
+                            &["Commit", "Roll Back", "Cancel"],
+                        )
+                        .text(detail),
+                    )
+                }) else {
+                    return;
+                };
+                let commit = match answer.await {
+                    Some(0) => true,
+                    Some(1) => false,
+                    _ => return,
+                };
+                for (tab, _) in open {
+                    let end = tab.update(cx, |t, cx| t.end_tx(commit, cx));
+                    if end.await.is_err() {
+                        return;
+                    }
+                }
+            }
+            let _ = cx.update_window(handle, |_, window, cx| {
+                this.update(cx, |this, cx| then(this, window, cx))
+            });
+        })
+        .detach();
+    }
+
+    /// Asks Submit / Discard / Cancel when any of `tabs` holds pending table changes,
+    /// submits or discards them as answered, then runs `then`. Cancel, or a failed
+    /// submit, stops there and the changes stay pending.
+    pub(super) fn settle_pending(
+        &mut self,
+        tabs: Vec<Entity<QueryTab>>,
+        question: String,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+    ) {
+        let handle = self.window;
+        let open: Vec<(Entity<QueryTab>, String, usize)> = tabs
+            .into_iter()
+            .filter_map(|t| {
+                let n = t.read(cx).pending_changes(cx);
+                (n > 0).then(|| {
+                    let title = self.tab_title(t.read(cx));
+                    (t, title, n)
+                })
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            if !open.is_empty() {
+                let detail = match open.as_slice() {
+                    [(_, title, n)] => format!(
+                        "{title} has {n} pending {} that {} not been submitted.",
+                        if *n == 1 { "change" } else { "changes" },
+                        if *n == 1 { "has" } else { "have" }
+                    ),
+                    _ => {
+                        let names: Vec<&str> = open.iter().map(|(_, t, _)| t.as_str()).collect();
+                        format!(
+                            "{} have changes that have not been submitted.",
+                            names.join(", ")
+                        )
+                    }
+                };
+                let Ok(answer) = cx.update_window(handle, |_, window, cx| {
+                    crate::dialog::ask(
+                        window,
+                        cx,
+                        crate::dialog::Ask::new(question.clone(), &["Submit", "Discard", "Cancel"])
+                            .text(detail),
+                    )
+                }) else {
+                    return;
+                };
+                match answer.await {
+                    Some(0) => {
+                        for (tab, _, _) in &open {
+                            let Ok(task) = cx.update_window(handle, |_, window, cx| {
+                                tab.update(cx, |t, cx| t.submit_table(window, cx))
+                            }) else {
+                                return;
+                            };
+                            if task.await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Some(1) => {
+                        for (tab, _, _) in &open {
+                            tab.update(cx, |t, cx| t.discard_now(cx));
+                        }
+                    }
+                    _ => return,
+                }
+            }
+            let _ = cx.update_window(handle, |_, window, cx| {
+                this.update(cx, |this, cx| then(this, window, cx))
+            });
+        })
+        .detach();
+    }
+
+    /// Binds the front file tab to the connection chosen in the switcher.
+    pub(super) fn rebind_front(&mut self, id: &str, cx: &mut Context<Self>) {
+        let binding = self.binding(Some(id));
+        if let Some(tab) = self.front_tab().cloned()
+            && matches!(tab.read(cx).kind, Kind::File(_))
+        {
+            tab.update(cx, |t, cx| t.set_connection(binding, cx));
+            self.schedule_save(cx);
+        }
+    }
+
+    pub(super) fn run_front(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if let Some(tab) = self.front_tab().cloned() {
+            tab.update(cx, |t, cx| t.run(scope, cx));
+        }
+    }
+
+    /// Commits (`true`) or rolls back the front tab's transaction.
+    pub(super) fn end_front_tx(&mut self, commit: bool, cx: &mut Context<Self>) {
+        if let Some(tab) = self.front_tab().cloned()
+            && tab.read(cx).tx_open
+            && !tab.read(cx).is_running()
+        {
+            tab.update(cx, |t, cx| t.end_tx(commit, cx)).detach();
+        }
+    }
+
+    /// Switches the front tab's transaction mode. Going to Auto with an open
+    /// transaction asks to commit or roll back first.
+    pub(super) fn set_front_tx_mode(&mut self, mode: TxMode, cx: &mut Context<Self>) {
+        self.tx_menu_open = false;
+        cx.notify();
+        let Some(tab) = self.front_tab().cloned() else {
+            return;
+        };
+        if mode == TxMode::Auto && tab.read(cx).tx_mode == TxMode::Manual {
+            let question = "Commit or roll back before switching to Auto?".into();
+            self.settle(vec![tab.clone()], question, cx, move |_, _, cx| {
+                tab.update(cx, |t, cx| t.set_tx_mode(mode, cx));
+            });
+        } else {
+            tab.update(cx, |t, cx| t.set_tx_mode(mode, cx));
+        }
+    }
+
+    /// Explains the front tab's statement; `analyze` measures it.
+    pub(super) fn explain_front(&mut self, analyze: bool, cx: &mut Context<Self>) {
+        if self.front_can_explain(cx)
+            && let Some(tab) = self.front_tab().cloned()
+        {
+            tab.update(cx, |t, cx| t.explain(analyze, cx));
+        }
+    }
+
+    /// Whether the front tab's engine explains statements: from the tab's own session,
+    /// or else the connection's. Before either is open it may: like Run, Explain then
+    /// connects first, and an engine without plans says so in Messages.
+    pub(super) fn front_can_explain(&self, cx: &App) -> bool {
+        let Some(t) = self.front_tab().map(|t| t.read(cx)) else {
+            return false;
+        };
+        if t.table.is_some() {
+            return false;
+        }
+        t.can_explain().unwrap_or_else(|| {
+            t.connection
+                .as_ref()
+                .and_then(|c| match self.conns.get(&c.id) {
+                    Some(Conn::Connected(d)) => Some(d.capabilities().explain),
+                    _ => None,
+                })
+                .unwrap_or(true)
+        })
+    }
+
+    pub(super) fn stop_front(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.front_tab().cloned() {
+            tab.update(cx, |t, cx| t.stop(cx));
+        }
+    }
+
+    pub(super) fn format_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.front_tab().cloned() {
+            tab.update(cx, |t, cx| t.format(window, cx));
+        }
+    }
+
+    /// `recent.sql`, `Untitled-2`, `local console`, `orders`.
+    pub(super) fn tab_title(&self, t: &QueryTab) -> String {
+        match &t.kind {
+            Kind::Table(r) => r.table.clone(),
+            Kind::File(Some(p)) => deadlock_core::project::folder_name(p),
+            Kind::File(None) => format!("Untitled-{}", t.untitled),
+            Kind::Console(_) => {
+                let name = t.connection.as_ref().map_or("?", |c| c.name.as_str());
+                format!("{name} console")
+            }
+        }
+    }
+
+    /// The tab list as `state.json` keeps it.
+    pub(super) fn sync_tabs(&mut self, cx: &gpui_kit::App) {
+        self.project.state.tabs = self
+            .tabs
+            .iter()
+            .map(|(t, _)| {
+                let t = t.read(cx);
+                let connection = t.connection.as_ref().map(|c| c.id.clone());
+                match &t.kind {
+                    Kind::File(path) => TabState::File {
+                        path: path.clone(),
+                        text: path.is_none().then(|| t.text(cx)),
+                        connection,
+                    },
+                    Kind::Console(_) => TabState::Console {
+                        connection: connection.unwrap_or_default(),
+                    },
+                    Kind::Table(r) => TabState::Table {
+                        connection: connection.unwrap_or_default(),
+                        database: r.database.clone(),
+                        table: r.table.clone(),
+                    },
+                }
+            })
+            .collect();
+        self.project.state.active_tab = match self.front {
+            Front::Query(i) => Some(i),
+            _ => None,
+        };
+    }
+
+    /// Writes every console buffer now. For closing the window.
+    pub(super) fn flush_consoles(&self, cx: &gpui_kit::App) {
+        for (t, _) in &self.tabs {
+            let t = t.read(cx);
+            if let (Kind::Console(path), true) = (&t.kind, t.dirty)
+                && let Err(e) = save_text(path, &t.text(cx))
+            {
+                eprintln!("deadlock: console: {e}");
+            }
+        }
+    }
+
+    /// Files with unsaved changes; asked about when the window closes.
+    pub(super) fn dirty_files(&self, cx: &gpui_kit::App) -> Vec<Entity<QueryTab>> {
+        self.tabs
+            .iter()
+            .filter(|(t, _)| {
+                let t = t.read(cx);
+                t.dirty && matches!(t.kind, Kind::File(Some(_)))
+            })
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
+    /// Saves every file tab with a path. Returns whether all writes worked.
+    pub(super) fn save_files(&self, tabs: &[Entity<QueryTab>], cx: &mut Context<Self>) -> bool {
+        tabs.iter().all(|tab| match tab.read(cx).kind.clone() {
+            Kind::File(Some(path)) => write(tab, &path, cx),
+            _ => true,
+        })
+    }
+}
+
+/// Writes the tab's text to `path` and clears its dirty mark.
+fn write(tab: &Entity<QueryTab>, path: &Path, cx: &mut gpui_kit::App) -> bool {
+    match save_text(path, &tab.read(cx).text(cx)) {
+        Ok(()) => {
+            tab.update(cx, |t, cx| {
+                t.dirty = false;
+                cx.emit(TabEvent::Changed);
+            });
+            true
+        }
+        Err(e) => {
+            eprintln!("deadlock: {e}");
+            false
+        }
+    }
+}
+
+/// The tab strip: editor tabs, then the New connection tab.
+pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
+    let p = *cx.global::<Palette>();
+    let tab = |id: SharedString, on: bool| {
+        // `.tab`: 36 px, `--tx3` until hovered or in front, 2 px blue underline in front.
+        div()
+            .id(id.clone())
+            .group(id)
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(tab_height())
+            .pl(px(12.))
+            .pr(px(6.))
+            .border_b_2()
+            .border_color(if on {
+                p.blue
+            } else {
+                gpui_kit::transparent_black()
+            })
+            .text_color(if on { p.tx } else { p.tx3 })
+            .when(on, |d| d.font_weight(FontWeight::MEDIUM))
+            .hover(|s| s.text_color(p.tx))
+            .whitespace_nowrap()
+            .flex_none()
+    };
+    let editors = shell.tabs.iter().enumerate().map(|(i, (t, _))| {
+        let on = shell.front == Front::Query(i);
+        let t = t.read(cx);
+        let console = matches!(t.kind, Kind::Console(_));
+        let table = matches!(t.kind, Kind::Table(_));
+        let key = t.is_key();
+        let title = shell.tab_title(t);
+        let tip = match (&t.kind, t.connection.as_ref()) {
+            (Kind::Table(r), c) => format!(
+                "{}.{}{}",
+                r.database,
+                r.table,
+                c.map_or(String::new(), |c| format!(" · {}", c.name))
+            ),
+            (Kind::File(Some(path)), c) => format!(
+                "{}{}",
+                path.display(),
+                c.map_or(String::new(), |c| format!(" · {}", c.name))
+            ),
+            (_, Some(c)) => format!("Runs on {}", c.name),
+            (_, None) => "No connection".into(),
+        };
+        let group: SharedString = format!("editor-tab-{i}").into();
+        let element = tab(group.clone(), on)
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.show_tab(Front::Query(i), window, cx)),
+            )
+            .when(console, |d| d.child(icon(Icon::Console, p.tx3)))
+            .when(table && !key, |d| d.child(icon(Icon::Table, p.tx3)))
+            // A Redis key's name, in mono as in the design.
+            .when(key, |d| {
+                d.font_family(crate::theme::MONO_FONT)
+                    .text_size(crate::theme::data_size())
+            })
+            .child(title)
+            .when(
+                t.connection
+                    .as_ref()
+                    .is_some_and(|c| c.environment == Environment::Production),
+                |d| d.child(super::production_marker(&p)),
+            )
+            .when(t.dirty && !console && !table, |d| {
+                d.child(div().size(px(6.)).rounded_full().bg(p.tx3))
+            })
+            // A table's pending changes and an open transaction share the warn dot.
+            .when(t.tx_open || table && t.dirty, |d| {
+                d.child(div().size(px(6.)).rounded_full().bg(p.warn))
+            })
+            .child(
+                div()
+                    .id(("close-tab", i))
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .opacity(if on { 1. } else { 0. })
+                    .group_hover(group, |s| s.opacity(1.))
+                    .hover(|s| s.bg(p.hover))
+                    .child(icon(Icon::Close, p.tx3).size(px(12.)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab(i, window, cx);
+                    })),
+            );
+        // A table tab's menu: Import CSV into the table.
+        let import = match (&t.kind, &t.connection) {
+            (Kind::Table(r), Some(c)) if !key => Some((c.id.clone(), r.clone())),
+            _ => None,
+        };
+        match import {
+            Some((id, r)) => {
+                let shell = cx.entity();
+                element
+                    .context_menu(move |menu, _, _| {
+                        let (shell, id, r) = (shell.clone(), id.clone(), r.clone());
+                        menu.item(
+                            gpui_kit::component::menu::PopupMenuItem::new("Import CSV…").on_click(
+                                move |_, window, cx| {
+                                    shell.update(cx, |s, cx| {
+                                        s.open_import(&id, Some(r.clone()), window, cx);
+                                    });
+                                },
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            }
+            None => element.into_any_element(),
+        }
+    });
+    let screens =
+        shell.sessions.iter().enumerate().map(|(i, (t, _))| {
+            let on = shell.front == Front::Sessions(i);
+            let c = &t.read(cx).connection;
+            let redis = c.engine == deadlock_core::connection::Engine::Redis;
+            let tip = format!("Sessions and locks · {}", c.name);
+            let production = c.environment == Environment::Production;
+            let group: SharedString = format!("sessions-tab-{i}").into();
+            tab(group.clone(), on)
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.show_tab(Front::Sessions(i), window, cx)
+                }))
+                .child(icon(Icon::Sessions, if on { p.tx } else { p.tx3 }))
+                .child(if redis {
+                    "Clients and slow log"
+                } else {
+                    "Sessions and locks"
+                })
+                .when(production, |d| d.child(super::production_marker(&p)))
+                .child(
+                    div()
+                        .id(("close-sessions", i))
+                        .size(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .opacity(if on { 1. } else { 0. })
+                        .group_hover(group, |s| s.opacity(1.))
+                        .hover(|s| s.bg(p.hover))
+                        .child(icon(Icon::Close, p.tx3).size(px(12.)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_sessions(i, cx);
+                        })),
+                )
+        });
+    let configs = shell.configs.iter().enumerate().map(|(i, (t, _))| {
+        let on = shell.front == Front::Config(i);
+        let t = t.read(cx);
+        let c = &t.connection;
+        let tip = format!("Server configuration · {}", c.name);
+        let production = c.environment == Environment::Production;
+        let pending = t.pending_count() > 0;
+        let group: SharedString = format!("config-tab-{i}").into();
+        tab(group.clone(), on)
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.show_tab(Front::Config(i), window, cx)),
+            )
+            .child(icon(Icon::Config, if on { p.tx } else { p.tx3 }))
+            .child("Server configuration")
+            .when(production, |d| d.child(super::production_marker(&p)))
+            .when(pending, |d| {
+                d.child(div().size(px(6.)).rounded_full().bg(p.warn))
+            })
+            .child(
+                div()
+                    .id(("close-config", i))
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .opacity(if on { 1. } else { 0. })
+                    .group_hover(group, |s| s.opacity(1.))
+                    .hover(|s| s.bg(p.hover))
+                    .child(icon(Icon::Close, p.tx3).size(px(12.)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_config(i, window, cx);
+                    })),
+            )
+    });
+    let import = shell.import.as_ref().map(|(t, _)| {
+        let on = shell.front == Front::Import;
+        tab("import-tab".into(), on)
+            .on_click(cx.listener(|this, _, window, cx| this.show_tab(Front::Import, window, cx)))
+            .child(icon(Icon::Import, if on { p.tx } else { p.tx3 }))
+            .child(t.read(cx).title())
+            .child(
+                div()
+                    .id("close-import")
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .opacity(if on { 1. } else { 0. })
+                    .group_hover("import-tab", |s| s.opacity(1.))
+                    .hover(|s| s.bg(p.hover))
+                    .child(icon(Icon::Close, p.tx3).size(px(12.)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_import(cx);
+                    })),
+            )
+    });
+    let settings = shell.settings_tab.as_ref().map(|_| {
+        let on = shell.front == Front::Settings;
+        tab("settings-tab".into(), on)
+            .on_click(cx.listener(|this, _, window, cx| this.show_tab(Front::Settings, window, cx)))
+            .child(icon(Icon::Config, if on { p.tx } else { p.tx3 }))
+            .child("Settings")
+            .child(
+                div()
+                    .id("close-settings")
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .opacity(if on { 1. } else { 0. })
+                    .group_hover("settings-tab", |s| s.opacity(1.))
+                    .hover(|s| s.bg(p.hover))
+                    .child(icon(Icon::Close, p.tx3).size(px(12.)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_settings(cx);
+                    })),
+            )
+    });
+    let form = shell.form.as_ref().map(|_| {
+        tab("form-tab".into(), shell.front == Front::Form)
+            .pr(px(12.))
+            .on_click(cx.listener(|this, _, window, cx| this.show_tab(Front::Form, window, cx)))
+            .child(icon(Icon::Plus, p.tx))
+            .child("New connection")
+    });
+    div()
+        .id("tab-strip")
+        .flex()
+        .flex_none()
+        .h(tab_height() + px(1.))
+        .px(px(4.))
+        .border_b_1()
+        .border_color(p.line)
+        .overflow_x_scroll()
+        .children(editors)
+        .children(screens)
+        .children(configs)
+        .children(super::diagram::diagram_tabs(shell, cx))
+        .children(import)
+        .children(settings)
+        .children(form)
+}

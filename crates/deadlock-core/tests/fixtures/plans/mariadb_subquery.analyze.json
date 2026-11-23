@@ -1,0 +1,81 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.140716651
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 0.59009552,
+    "r_loops": 1,
+    "r_total_time_ms": 4.930437014,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "ref",
+          "possible_keys": ["country"],
+          "key": "country",
+          "key_length": "9",
+          "used_key_parts": ["country"],
+          "ref": ["const"],
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 4000,
+          "r_rows": 4000,
+          "cost": 0.59009552,
+          "r_table_time_ms": 0.374645633,
+          "r_other_time_ms": 0.378702777,
+          "r_engine_stats": {
+            "pages_accessed": 14
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "attached_condition": "c.country = 'SK'",
+          "r_filtered": 100,
+          "using_index": true
+        }
+      }
+    ],
+    "subqueries": [
+      {
+        "subquery_cache": {
+          "state": "disabled",
+          "r_loops": 200,
+          "r_hit_ratio": 0,
+          "query_block": {
+            "select_id": 2,
+            "cost": 0.00193929,
+            "r_loops": 4000,
+            "r_total_time_ms": 4.014332237,
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "o",
+                  "access_type": "ref",
+                  "possible_keys": ["customer_id"],
+                  "key": "customer_id",
+                  "key_length": "5",
+                  "used_key_parts": ["customer_id"],
+                  "ref": ["plantest.c.id"],
+                  "loops": 1,
+                  "r_loops": 4000,
+                  "rows": 2,
+                  "r_rows": 3,
+                  "cost": 0.00193929,
+                  "r_table_time_ms": 2.782762307,
+                  "r_other_time_ms": 0.5304679,
+                  "r_engine_stats": {
+                    "pages_accessed": 8000
+                  },
+                  "filtered": 100,
+                  "r_total_filtered": 100,
+                  "r_filtered": 100,
+                  "using_index": true
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

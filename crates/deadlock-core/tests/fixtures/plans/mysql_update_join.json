@@ -1,0 +1,75 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "4607.46"
+    },
+    "nested_loop": [
+      {
+        "table": {
+          "update": true,
+          "table_name": "o",
+          "access_type": "range",
+          "possible_keys": [
+            "idx_created",
+            "customer_id"
+          ],
+          "key": "idx_created",
+          "used_key_parts": [
+            "created_at"
+          ],
+          "key_length": "6",
+          "rows_examined_per_scan": 5759,
+          "rows_produced_per_join": 5759,
+          "filtered": "100.00",
+          "cost_info": {
+            "read_cost": "2015.91",
+            "eval_cost": "575.90",
+            "prefix_cost": "2591.81",
+            "data_read_per_join": "359K"
+          },
+          "used_columns": [
+            "id",
+            "customer_id",
+            "status",
+            "total",
+            "created_at"
+          ],
+          "attached_condition": "((`plantest`.`o`.`created_at` < TIMESTAMP'2026-01-05 00:00:00') and (`plantest`.`o`.`customer_id` is not null))"
+        }
+      },
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "eq_ref",
+          "possible_keys": [
+            "PRIMARY",
+            "country"
+          ],
+          "key": "PRIMARY",
+          "used_key_parts": [
+            "id"
+          ],
+          "key_length": "4",
+          "ref": [
+            "plantest.o.customer_id"
+          ],
+          "rows_examined_per_scan": 1,
+          "rows_produced_per_join": 1127,
+          "filtered": "19.58",
+          "cost_info": {
+            "read_cost": "1439.75",
+            "eval_cost": "112.77",
+            "prefix_cost": "4607.46",
+            "data_read_per_join": "458K"
+          },
+          "used_columns": [
+            "id",
+            "country"
+          ],
+          "attached_condition": "(`plantest`.`c`.`country` = 'SK')"
+        }
+      }
+    ]
+  }
+}

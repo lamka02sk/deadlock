@@ -1,0 +1,19 @@
+SQL_ID  bh0y6yk11hhhb, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ * FROM customers WHERE id = 42
+ 
+Plan hash value: 62687379
+ 
+-----------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |             |      1 |        |      1 |00:00:00.01 |       3 |
+|   1 |  TABLE ACCESS BY INDEX ROWID| CUSTOMERS   |      1 |      1 |      1 |00:00:00.01 |       3 |
+|*  2 |   INDEX UNIQUE SCAN         | SYS_C009000 |      1 |      1 |      1 |00:00:00.01 |       2 |
+-----------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   2 - access("ID"=42)
+ 

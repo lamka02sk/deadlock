@@ -1,0 +1,27 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "2001.75"
+    },
+    "table": {
+      "table_name": "customers",
+      "access_type": "ALL",
+      "rows_examined_per_scan": 19775,
+      "rows_produced_per_join": 2197,
+      "filtered": "11.11",
+      "cost_info": {
+        "read_cost": "1782.05",
+        "eval_cost": "219.70",
+        "prefix_cost": "2001.75",
+        "data_read_per_join": "892K"
+      },
+      "used_columns": [
+        "id",
+        "email",
+        "country"
+      ],
+      "attached_condition": "(`plantest`.`customers`.`email` like '%9@x.io')"
+    }
+  }
+}

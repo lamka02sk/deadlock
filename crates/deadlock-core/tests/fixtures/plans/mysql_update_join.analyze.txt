@@ -1,0 +1,7 @@
+-> Update o (immediate)  (actual time=136..136 rows=0 loops=1)
+    -> Nested loop inner join  (cost=4607 rows=1128) (actual time=0.258..134 rows=1152 loops=1)
+        -> Filter: ((o.created_at < TIMESTAMP'2026-01-05 00:00:00') and (o.customer_id is not null))  (cost=2592 rows=5759) (actual time=0.0344..31.1 rows=5759 loops=1)
+            -> Index range scan on o using idx_created over (NULL < created_at < '2026-01-05 00:00:00')  (cost=2592 rows=5759) (actual time=0.0261..13.4 rows=5759 loops=1)
+        -> Filter: (c.country = 'SK')  (cost=0.25 rows=0.196) (actual time=0.0119..0.0128 rows=0.2 loops=5759)
+            -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (actual time=0.00359..0.00506 rows=1 loops=5759)
+

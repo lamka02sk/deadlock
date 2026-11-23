@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Deadlock
+GenericName=Database IDE
+Comment=Database IDE for MySQL, MariaDB, Oracle and Redis
+Exec=deadlock %f
+Icon=deadlock
+Terminal=false
+Categories=Development;Database;
+MimeType=application/sql;text/x-sql;
+Keywords=SQL;MySQL;MariaDB;Oracle;Redis;database;
+StartupNotify=true

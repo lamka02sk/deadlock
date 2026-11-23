@@ -1,0 +1,6 @@
+-> Table scan on <union temporary>  (cost=903..956 rows=4099) (actual time=15.7..33 rows=4003 loops=1)
+    -> Union materialize with deduplication  (cost=903..903 rows=4099) (actual time=15.7..15.7 rows=4003 loops=1)
+        -> Index lookup on customers using country (country='SK'), with index condition: (customers.country = 'SK')  (cost=473 rows=4000) (actual time=0.248..8.29 rows=4000 loops=1)
+        -> Filter: (orders.id < 100)  (cost=20.1 rows=99) (actual time=0.0237..0.468 rows=99 loops=1)
+            -> Index range scan on orders using PRIMARY over (id < 100)  (cost=20.1 rows=99) (actual time=0.0154..0.164 rows=99 loops=1)
+

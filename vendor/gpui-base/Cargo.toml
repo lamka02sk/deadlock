@@ -1,0 +1,75 @@
+# Vendored from gpui-component (https://github.com/longbridge/gpui-component)
+# crates/base at rev 1c7e7f7c6c8d6585da909804496614da01bb8663, wired in through
+# `[patch]` in the workspace Cargo.toml. Workspace-inherited fields are written out;
+# dev-dependencies, benches and examples are dropped. Deadlock's changes: see PATCHES.md.
+[package]
+description = "Behavior, interaction, and infrastructure foundations for GPUI applications."
+license = "Apache-2.0"
+name = "gpui-base"
+repository = "https://github.com/longbridge/gpui-kit"
+version = "0.10.0"
+edition = "2024"
+publish = false
+autobenches = false
+autoexamples = false
+autotests = false
+
+[lib]
+doctest = false
+
+[features]
+gpui-fast = ["dep:gpui-fast"]
+decimal = ["dep:rust_decimal"]
+test-support = ["gpui/test-support", "gpui-fast?/test-support", "dep:image"]
+inspector = ["gpui_macros/inspector", "gpui/inspector", "gpui-fast?/inspector"]
+
+[dependencies]
+anyhow = "1"
+aho-corasick = "1.1.3"
+data-url = "0.3"
+futures = "0.3"
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-fast = { package = "gpui-fast", version = "0.1.17", features = ["windows-manifest-provided-by-host"], optional = true }
+image = { version = "0.25", optional = true }
+gpui_macros = { package = "gpui-pre-macros", version = "=0.3.12" }
+instant = { version = "0.1", features = ["wasm-bindgen"] }
+itertools = "0.13.0"
+jiff = "1.0"
+lsp-types = { version = "0.97.0", features = ["proposed"] }
+markdown = { version = "1.0.0", features = ["serde"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3.0"
+num-traits = "0.2"
+ropey = { version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_lf", "metric_utf16"] }
+regex = "1"
+rust_decimal = { version = "1.37.0", optional = true }
+schemars = "1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
+smallvec = "1"
+sum-tree = { package = "gpui-pre-sum-tree", version = "=0.3.12" }
+tracing = "0.1.41"
+sys-locale = "0.3"
+unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-segmentation = "1.12.0"
+web-time = "1"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+smol = "2"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+async-channel = "2.3.1"
+jiff = { version = "1.0", features = ["js"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSAccessibility", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58.0", features = ["Wdk", "Wdk_System", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "settings"] }

@@ -1,0 +1,22 @@
+SQL_ID  28wqf4kgbyxnt, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ t.customer_id, t.n FROM (SELECT 
+customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id) t WHERE 
+t.n > 3
+ 
+Plan hash value: 1936677329
+ 
+-------------------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name   | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |        |      1 |        |      0 |00:00:00.01 |     316 |       |       |          |
+|*  1 |  FILTER             |        |      1 |        |      0 |00:00:00.01 |     316 |       |       |          |
+|   2 |   HASH GROUP BY     |        |      1 |   1007 |  20000 |00:00:00.03 |     316 |  2225K|  1978K| 1949K (0)|
+|   3 |    TABLE ACCESS FULL| ORDERS |      1 |  60000 |  60000 |00:00:00.01 |     316 |       |       |          |
+-------------------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   1 - filter(COUNT(*)>3)
+ 

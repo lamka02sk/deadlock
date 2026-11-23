@@ -1,0 +1,38 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 4.79987412,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "range",
+          "possible_keys": ["idx_created", "customer_id"],
+          "key": "idx_created",
+          "key_length": "6",
+          "used_key_parts": ["created_at"],
+          "loops": 1,
+          "rows": 2401,
+          "cost": 2.57286128,
+          "filtered": 100,
+          "attached_condition": "o.created_at >= '2026-02-10' and o.`status` in ('paid','shipped') and o.customer_id is not null"
+        }
+      },
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "eq_ref",
+          "possible_keys": ["PRIMARY"],
+          "key": "PRIMARY",
+          "key_length": "4",
+          "used_key_parts": ["id"],
+          "ref": ["plantest.o.customer_id"],
+          "loops": 2401,
+          "rows": 1,
+          "cost": 2.22701284,
+          "filtered": 100
+        }
+      }
+    ]
+  }
+}

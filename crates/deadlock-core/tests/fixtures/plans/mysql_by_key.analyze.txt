@@ -1,0 +1,2 @@
+-> Rows fetched before execution  (cost=0..0 rows=1) (actual time=0.00237..0.00356 rows=1 loops=1)
+

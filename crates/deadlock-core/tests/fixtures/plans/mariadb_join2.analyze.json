@@ -1,0 +1,61 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.173535133
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 4.79987412,
+    "r_loops": 1,
+    "r_total_time_ms": 1.273029629,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "range",
+          "possible_keys": ["idx_created", "customer_id"],
+          "key": "idx_created",
+          "key_length": "6",
+          "used_key_parts": ["created_at"],
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 2401,
+          "r_rows": 750,
+          "cost": 2.57286128,
+          "r_table_time_ms": 0.669549274,
+          "r_other_time_ms": 0.138456425,
+          "r_engine_stats": {
+            "pages_accessed": 1524
+          },
+          "filtered": 100,
+          "r_total_filtered": 66.66666667,
+          "attached_condition": "o.created_at >= '2026-02-10' and o.`status` in ('paid','shipped') and o.customer_id is not null",
+          "r_filtered": 66.66666667
+        }
+      },
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "eq_ref",
+          "possible_keys": ["PRIMARY"],
+          "key": "PRIMARY",
+          "key_length": "4",
+          "used_key_parts": ["id"],
+          "ref": ["plantest.o.customer_id"],
+          "loops": 2401,
+          "r_loops": 500,
+          "rows": 1,
+          "r_rows": 1,
+          "cost": 2.22701284,
+          "r_table_time_ms": 0.409171233,
+          "r_other_time_ms": 0.049282973,
+          "r_engine_stats": {
+            "pages_accessed": 1003
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "r_filtered": 100
+        }
+      }
+    ]
+  }
+}

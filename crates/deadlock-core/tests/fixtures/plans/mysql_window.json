@@ -1,0 +1,53 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "1199.44"
+    },
+    "windowing": {
+      "windows": [
+        {
+          "name": "<unnamed window>",
+          "using_filesort": true,
+          "filesort_key": [
+            "`status`",
+            "`total` desc"
+          ],
+          "functions": [
+            "rank"
+          ]
+        }
+      ],
+      "cost_info": {
+        "sort_cost": "999.00"
+      },
+      "table": {
+        "table_name": "orders",
+        "access_type": "range",
+        "possible_keys": [
+          "PRIMARY"
+        ],
+        "key": "PRIMARY",
+        "used_key_parts": [
+          "id"
+        ],
+        "key_length": "4",
+        "rows_examined_per_scan": 999,
+        "rows_produced_per_join": 999,
+        "filtered": "100.00",
+        "cost_info": {
+          "read_cost": "100.54",
+          "eval_cost": "99.90",
+          "prefix_cost": "200.44",
+          "data_read_per_join": "62K"
+        },
+        "used_columns": [
+          "id",
+          "status",
+          "total"
+        ],
+        "attached_condition": "(`plantest`.`orders`.`id` < 1000)"
+      }
+    }
+  }
+}

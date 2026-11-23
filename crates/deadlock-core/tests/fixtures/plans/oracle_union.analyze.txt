@@ -1,0 +1,24 @@
+SQL_ID  03wzuy3t9hk3x, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ email FROM customers WHERE country 
+= 'SK' UNION SELECT status FROM orders WHERE id < 100
+ 
+Plan hash value: 2072668989
+ 
+------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |             |      1 |        |   4003 |00:00:00.01 |      78 |       |       |          |
+|   1 |  HASH UNIQUE                          |             |      1 |   4099 |   4003 |00:00:00.01 |      78 |  1600K|  1600K| 1553K (0)|
+|   2 |   UNION-ALL                           |             |      1 |   4099 |   4099 |00:00:00.03 |      78 |       |       |          |
+|*  3 |    TABLE ACCESS FULL                  | CUSTOMERS   |      1 |   4000 |   4000 |00:00:00.01 |      75 |       |       |          |
+|   4 |    TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS      |      1 |     99 |     99 |00:00:00.01 |       3 |       |       |          |
+|*  5 |     INDEX RANGE SCAN                  | SYS_C009001 |      1 |     99 |     99 |00:00:00.01 |       2 |       |       |          |
+------------------------------------------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   3 - filter("COUNTRY"='SK')
+   5 - access("ID"<100)
+ 

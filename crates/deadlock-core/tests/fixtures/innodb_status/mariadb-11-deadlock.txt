@@ -1,0 +1,118 @@
+
+=====================================
+2026-11-23 00:00:02 0x70d17c0c46c0 INNODB MONITOR OUTPUT
+=====================================
+Per second averages calculated from the last 13 seconds
+-----------------
+BACKGROUND THREAD
+-----------------
+srv_master_thread loops: 0 srv_active, 134 srv_idle
+srv_master_thread log flush and writes: 134
+----------
+SEMAPHORES
+----------
+------------------------
+LATEST DETECTED DEADLOCK
+------------------------
+2026-11-22 23:59:59 0x70d17c15a6c0
+*** (1) TRANSACTION:
+TRANSACTION 1991, ACTIVE 2 sec starting index read
+mysql tables in use 1, locked 1
+LOCK WAIT 3 lock struct(s), heap size 1120, 2 row lock(s), undo log entries 1
+MariaDB thread id 63, OS thread handle 124045032269504, query id 143 localhost root Updating
+UPDATE p9_orders SET status='a' WHERE id=2
+*** WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 408 page no 3 n bits 320 index PRIMARY of table `deadlock`.`p9_orders` trx id 1991 lock_mode X locks rec but not gap waiting
+Record lock, heap no 3 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+ 0: len 4; hex 80000002; asc     ;;
+ 1: len 6; hex 0000000007c8; asc       ;;
+ 2: len 7; hex 120000002d0110; asc     -  ;;
+ 3: len 5; hex 8000000500; asc      ;;
+ 4: len 3; hex 6e6577; asc new;;
+
+*** CONFLICTING WITH:
+RECORD LOCKS space id 408 page no 3 n bits 320 index PRIMARY of table `deadlock`.`p9_orders` trx id 1992 lock_mode X locks rec but not gap
+Record lock, heap no 3 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+ 0: len 4; hex 80000002; asc     ;;
+ 1: len 6; hex 0000000007c8; asc       ;;
+ 2: len 7; hex 120000002d0110; asc     -  ;;
+ 3: len 5; hex 8000000500; asc      ;;
+ 4: len 3; hex 6e6577; asc new;;
+
+
+*** (2) TRANSACTION:
+TRANSACTION 1992, ACTIVE 1 sec starting index read
+mysql tables in use 1, locked 1
+LOCK WAIT 3 lock struct(s), heap size 1120, 2 row lock(s), undo log entries 1
+MariaDB thread id 64, OS thread handle 124045032883904, query id 142 localhost root Updating
+UPDATE p9_orders SET total=5 WHERE id=1
+*** WAITING FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 408 page no 3 n bits 320 index PRIMARY of table `deadlock`.`p9_orders` trx id 1992 lock_mode X locks rec but not gap waiting
+Record lock, heap no 2 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+ 0: len 4; hex 80000001; asc     ;;
+ 1: len 6; hex 0000000007c7; asc       ;;
+ 2: len 7; hex 110000002e0110; asc     .  ;;
+ 3: len 5; hex 8000000a00; asc      ;;
+ 4: len 1; hex 61; asc a;;
+
+*** CONFLICTING WITH:
+RECORD LOCKS space id 408 page no 3 n bits 320 index PRIMARY of table `deadlock`.`p9_orders` trx id 1991 lock_mode X locks rec but not gap
+Record lock, heap no 2 PHYSICAL RECORD: n_fields 5; compact format; info bits 0
+ 0: len 4; hex 80000001; asc     ;;
+ 1: len 6; hex 0000000007c7; asc       ;;
+ 2: len 7; hex 110000002e0110; asc     .  ;;
+ 3: len 5; hex 8000000a00; asc      ;;
+ 4: len 1; hex 61; asc a;;
+
+*** WE ROLL BACK TRANSACTION (1)
+------------
+TRANSACTIONS
+------------
+Trx id counter 1995
+Purge done for trx's n:o < 1995 undo n:o < 0 state: running but idle
+History list length 0
+LIST OF TRANSACTIONS FOR EACH SESSION:
+--------
+FILE I/O
+--------
+Pending flushes (fsync): 0
+194 OS file reads, 0 OS file writes, 20 OS fsyncs
+0.00 reads/s, 0 avg bytes/read, 0.00 writes/s, 0.69 fsyncs/s
+---
+LOG
+---
+Log sequence number 25169724
+Log flushed up to   25169724
+Pages flushed up to 25157755
+Last checkpoint at  25157739
+----------------------
+BUFFER POOL AND MEMORY
+----------------------
+Total large memory allocated 167772160
+Dictionary memory allocated 855000
+Buffer pool size   8112
+Free buffers       7789
+Database pages     323
+Old database pages 0
+Modified db pages  45
+Percent of dirty pages(LRU & free pages): 0.555
+Max dirty pages percent: 90.000
+Pending reads 0
+Pending writes: LRU 0, flush list 0
+Pages made young 0, not young 0
+0.00 youngs/s, 0.00 non-youngs/s
+Pages read 177, created 146, written 0
+0.00 reads/s, 0.38 creates/s, 0.00 writes/s
+Buffer pool hit rate 1000 / 1000, young-making rate 0 / 1000 not 0 / 1000
+Pages read ahead 0.00/s, evicted without access 0.00/s, Random read ahead 0.00/s
+LRU len: 323, unzip_LRU len: 0
+I/O sum[0]:cur[0], unzip sum[0]:cur[0]
+--------------
+ROW OPERATIONS
+--------------
+0 read views open inside InnoDB
+state: sleeping
+----------------------------
+END OF INNODB MONITOR OUTPUT
+============================
+

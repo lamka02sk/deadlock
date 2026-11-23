@@ -1,0 +1,28 @@
+[package]
+name = "deadlock"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+deadlock-core = { path = "../deadlock-core" }
+dirs = "6"
+# Already in the tree (through deadlock-core): the import's encoding list.
+encoding_rs = "0.8"
+# Already in the tree through GPUI: rasterises the exported SVG into a PNG.
+resvg = { version = "0.46", default-features = false, features = ["text"] }
+gpui-kit = { workspace = true, features = ["component", "assets", "x11", "tree-sitter-sql"] }
+rust-embed = "8"
+serde_json = "1"
+sqlformat = "0.5"
+tree-sitter-sequel = "0.3"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+gpui-fps.workspace = true
+
+[lints]
+workspace = true

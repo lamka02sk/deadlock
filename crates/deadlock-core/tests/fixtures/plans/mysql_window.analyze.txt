@@ -1,0 +1,5 @@
+-> Window aggregate: rank() OVER (PARTITION BY orders.`status` ORDER BY orders.total desc )   (cost=0 rows=999) (actual time=6.37..10.9 rows=999 loops=1)
+    -> Sort: orders.`status`, orders.total DESC  (cost=200 rows=999) (actual time=6.36..7.81 rows=999 loops=1)
+        -> Filter: (orders.id < 1000)  (cost=200 rows=999) (actual time=0.0332..4.63 rows=999 loops=1)
+            -> Index range scan on orders using PRIMARY over (id < 1000)  (cost=200 rows=999) (actual time=0.0261..1.62 rows=999 loops=1)
+

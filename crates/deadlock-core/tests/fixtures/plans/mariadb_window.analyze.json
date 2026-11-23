@@ -1,0 +1,54 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.13866738
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 0.19753437,
+    "r_loops": 1,
+    "r_total_time_ms": 0.701081939,
+    "window_functions_computation": {
+      "sorts": [
+        {
+          "filesort": {
+            "sort_key": "orders.`status`, orders.total desc",
+            "r_loops": 1,
+            "r_total_time_ms": 0.230733921,
+            "r_used_priority_queue": false,
+            "r_output_rows": 999,
+            "r_buffer_size": "180KiB",
+            "r_sort_mode": "sort_key,rowid"
+          }
+        }
+      ],
+      "temporary_table": {
+        "nested_loop": [
+          {
+            "table": {
+              "table_name": "orders",
+              "access_type": "range",
+              "possible_keys": ["PRIMARY"],
+              "key": "PRIMARY",
+              "key_length": "4",
+              "used_key_parts": ["id"],
+              "loops": 1,
+              "r_loops": 1,
+              "rows": 999,
+              "r_rows": 999,
+              "cost": 0.19753437,
+              "r_table_time_ms": 0.123317933,
+              "r_other_time_ms": 0.16294723,
+              "r_engine_stats": {
+                "pages_accessed": 10
+              },
+              "filtered": 100,
+              "r_total_filtered": 100,
+              "attached_condition": "orders.`id` < 1000",
+              "r_filtered": 100
+            }
+          }
+        ]
+      }
+    }
+  }
+}

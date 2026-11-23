@@ -1,0 +1,24 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "table": {
+      "update": true,
+      "table_name": "orders",
+      "access_type": "range",
+      "possible_keys": [
+        "idx_created"
+      ],
+      "key": "idx_created",
+      "used_key_parts": [
+        "created_at"
+      ],
+      "key_length": "6",
+      "ref": [
+        "const"
+      ],
+      "rows_examined_per_scan": 1439,
+      "filtered": "100.00",
+      "attached_condition": "(`plantest`.`orders`.`created_at` < TIMESTAMP'2026-01-02 00:00:00')"
+    }
+  }
+}

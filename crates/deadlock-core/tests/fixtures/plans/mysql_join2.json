@@ -1,0 +1,77 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "1248.78"
+    },
+    "ordering_operation": {
+      "using_filesort": false,
+      "nested_loop": [
+        {
+          "table": {
+            "table_name": "o",
+            "access_type": "range",
+            "possible_keys": [
+              "idx_created",
+              "customer_id"
+            ],
+            "key": "idx_created",
+            "used_key_parts": [
+              "created_at"
+            ],
+            "key_length": "6",
+            "rows_examined_per_scan": 2401,
+            "rows_produced_per_join": 480,
+            "filtered": "20.00",
+            "index_condition": "(`plantest`.`o`.`created_at` >= TIMESTAMP'2026-02-10 00:00:00')",
+            "backward_index_scan": true,
+            "cost_info": {
+              "read_cost": "1032.69",
+              "eval_cost": "48.02",
+              "prefix_cost": "1080.71",
+              "data_read_per_join": "30K"
+            },
+            "used_columns": [
+              "id",
+              "customer_id",
+              "status",
+              "total",
+              "created_at"
+            ],
+            "attached_condition": "((`plantest`.`o`.`status` in ('paid','shipped')) and (`plantest`.`o`.`customer_id` is not null))"
+          }
+        },
+        {
+          "table": {
+            "table_name": "c",
+            "access_type": "eq_ref",
+            "possible_keys": [
+              "PRIMARY"
+            ],
+            "key": "PRIMARY",
+            "used_key_parts": [
+              "id"
+            ],
+            "key_length": "4",
+            "ref": [
+              "plantest.o.customer_id"
+            ],
+            "rows_examined_per_scan": 1,
+            "rows_produced_per_join": 480,
+            "filtered": "100.00",
+            "cost_info": {
+              "read_cost": "120.05",
+              "eval_cost": "48.02",
+              "prefix_cost": "1248.78",
+              "data_read_per_join": "195K"
+            },
+            "used_columns": [
+              "id",
+              "email"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

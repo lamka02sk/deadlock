@@ -1,0 +1,79 @@
+# Dev and test databases. Credentials are for local development only.
+# Ports bind to 127.0.0.1, so nothing is reachable from other machines.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: deadlock
+      MYSQL_DATABASE: deadlock
+      MYSQL_USER: deadlock
+      MYSQL_PASSWORD: deadlock
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pdeadlock"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: deadlock
+      MARIADB_DATABASE: deadlock
+      MARIADB_USER: deadlock
+      MARIADB_PASSWORD: deadlock
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  oracle:
+    # Community-maintained Oracle Database Free image; ships healthcheck.sh and APP_USER setup.
+    image: gvenzl/oracle-free:23-slim
+    environment:
+      ORACLE_PASSWORD: deadlock
+      APP_USER: deadlock
+      APP_USER_PASSWORD: deadlock
+    ports:
+      - "127.0.0.1:1521:1521"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  redis:
+    image: redis:8
+    command: ["redis-server", "--requirepass", "deadlock"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "deadlock", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # SSH server for the tunnel tests: user deadlock, password deadlock, and the keys in
+  # crates/deadlock-core/tests/fixtures/ssh/authorized. Reaches the databases by service name.
+  ssh:
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment:
+      USER_NAME: deadlock
+      USER_PASSWORD: deadlock
+      PASSWORD_ACCESS: "true"
+      PUBLIC_KEY_DIR: /keys
+    volumes:
+      - ./crates/deadlock-core/tests/fixtures/ssh/authorized:/keys:ro
+      - ./crates/deadlock-core/tests/fixtures/ssh/allow-forwarding.sh:/custom-cont-init.d/allow-forwarding.sh:ro
+    ports:
+      - "127.0.0.1:2222:2222"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 2222"]
+      interval: 5s
+      timeout: 5s
+      retries: 30

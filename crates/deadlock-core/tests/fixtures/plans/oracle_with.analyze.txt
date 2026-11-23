@@ -1,0 +1,26 @@
+SQL_ID  3xj7945p52drs, child number 0
+-------------------------------------
+WITH big AS (SELECT customer_id FROM orders WHERE total > 490) SELECT 
+c.email FROM customers c JOIN big b ON b.customer_id = c.id
+ 
+Plan hash value: 23084738
+ 
+---------------------------------------------------------------------------------------------------------------------
+| Id  | Operation          | Name      | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+---------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |           |      1 |        |   1080 |00:00:00.15 |     402 |       |       |          |
+|*  1 |  HASH JOIN         |           |      1 |   1082 |   1080 |00:00:00.15 |     402 |  2171K|  2171K| 1588K (0)|
+|*  2 |   TABLE ACCESS FULL| ORDERS    |      1 |   1082 |   1080 |00:00:00.01 |     316 |       |       |          |
+|   3 |   TABLE ACCESS FULL| CUSTOMERS |      1 |  20000 |  20000 |00:00:00.03 |      86 |       |       |          |
+---------------------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   1 - access("CUSTOMER_ID"="C"."ID")
+   2 - filter("TOTAL">490)
+ 
+Note
+-----
+   - this is an adaptive plan
+ 

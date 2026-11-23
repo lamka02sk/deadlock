@@ -1,0 +1,5 @@
+-> Sort: s DESC  (actual time=403..403 rows=300 loops=1)
+    -> Table scan on <temporary>  (actual time=401..402 rows=300 loops=1)
+        -> Aggregate using temporary table  (actual time=401..401 rows=300 loops=1)
+            -> Table scan on items  (cost=12108 rows=120196) (actual time=0.135..186 rows=120000 loops=1)
+

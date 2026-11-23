@@ -1,0 +1,1459 @@
+//! MySQL and MariaDB on `mysql_async`. One driver; the flavor comes from `VERSION()`.
+
+use std::sync::Arc;
+
+use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
+use mysql_async::consts::{ColumnFlags, ColumnType, StatusFlags};
+use mysql_async::prelude::Queryable;
+use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
+use tokio::sync::{Mutex, oneshot};
+
+use crate::classify::{Statement, classify};
+use crate::connection::{ConnectionConfig, Encryption, Engine};
+use crate::diagram::Diagram;
+use crate::edit::{Change, ChangeKind, ColumnInfo, TableInfo, TableRef, pick_key, quote_ident};
+use crate::plan::{self, Plan};
+use crate::structure::{
+    ForeignKey, Generated, Index, IndexPart, StructureColumn, TableFacts, TableStructure,
+};
+use std::collections::{HashMap, HashSet};
+
+use crate::driver::{
+    BoxFuture, Capabilities, Column, Driver, DriverError, NodeKind, ObjectNode, ObjectPath, Result,
+    ResultStream, Value, page_size,
+};
+
+mod config;
+mod sessions;
+
+/// The `program_name` connection attribute: marks Deadlock's sessions to the server.
+/// mysql_async drops it on TLS connections, so [`OURS`] marks them in this process.
+const PROGRAM_NAME: &str = "Deadlock";
+
+/// Session ids this process has open, by server address.
+static OURS: std::sync::Mutex<std::collections::BTreeSet<(String, u16, u32)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn ours() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<(String, u16, u32)>> {
+    OURS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// MySQL's binary collation: byte strings, not text.
+const BINARY_CHARSET: u16 = 63;
+
+pub struct Mysql {
+    /// The SSH tunnel the connection goes through: closes with the driver.
+    pub(crate) tunnel: Option<crate::ssh::Tunnel>,
+    conn: Arc<Mutex<Conn>>,
+    /// Kept for the side connection that cancels.
+    opts: Opts,
+    id: u32,
+    version: String,
+    /// Writes are refused before sending; the session is also read-only on the server.
+    read_only: bool,
+    mariadb: bool,
+    /// Host and port, for [`OURS`].
+    server: (String, u16),
+}
+
+impl Drop for Mysql {
+    fn drop(&mut self) {
+        ours().remove(&(self.server.0.clone(), self.server.1, self.id));
+    }
+}
+
+fn opts(config: &ConnectionConfig, password: &str, ssl: Option<SslOpts>) -> Opts {
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    OptsBuilder::default()
+        .ip_or_hostname(config.host.clone())
+        .tcp_port(config.port)
+        .user(non_empty(&config.user))
+        .pass(non_empty(password))
+        .db_name(non_empty(&config.database))
+        .ssl_opts(ssl)
+        .connect_attribute("program_name", PROGRAM_NAME)
+        .into()
+}
+
+pub async fn connect(config: &ConnectionConfig, password: &str) -> Result<Mysql> {
+    let lax = SslOpts::default().with_danger_accept_invalid_certs(true);
+    let (conn, opts) = match config.encryption {
+        Encryption::Off => open(opts(config, password, None)).await?,
+        Encryption::Require => open(opts(config, password, Some(lax))).await?,
+        Encryption::VerifyCertificate => {
+            open(opts(config, password, Some(SslOpts::default()))).await?
+        }
+        // shortcut: a TLS failure and a sign-in failure look alike here, so any error
+        // retries in plain text once.
+        Encryption::Prefer => match open(opts(config, password, Some(lax))).await {
+            Ok(c) => c,
+            Err(_) => open(opts(config, password, None)).await?,
+        },
+    };
+    let mut conn = conn;
+    let raw: Option<String> = conn.query_first("SELECT VERSION()").await?;
+    let raw = raw.unwrap_or_default();
+    if config.read_only {
+        conn.query_drop("SET SESSION TRANSACTION READ ONLY").await?;
+    }
+    ours().insert((config.host.clone(), config.port, conn.id()));
+    Ok(Mysql {
+        tunnel: None,
+        server: (config.host.clone(), config.port),
+        read_only: config.read_only,
+        mariadb: raw.contains("MariaDB"),
+        id: conn.id(),
+        conn: Arc::new(Mutex::new(conn)),
+        opts,
+        version: version_label(&raw),
+    })
+}
+
+async fn open(opts: Opts) -> Result<(Conn, Opts)> {
+    Ok((Conn::new(opts.clone()).await?, opts))
+}
+
+/// `8.4.3` → `MySQL 8.4.3`; `11.8.2-MariaDB-ubu2404` → `MariaDB 11.8.2`.
+fn version_label(raw: &str) -> String {
+    let number = raw.split('-').next().unwrap_or(raw);
+    let flavor = if raw.contains("MariaDB") {
+        "MariaDB"
+    } else {
+        "MySQL"
+    };
+    format!("{flavor} {number}")
+}
+
+impl Driver for Mysql {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::SQL
+    }
+
+    fn server_version(&self) -> &str {
+        &self.version
+    }
+
+    fn execute<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<ResultStream>> {
+        let conn = Arc::clone(&self.conn);
+        let refused = self.read_only.then(|| classify(text, Engine::Mysql));
+        let text = text.to_owned();
+        Box::pin(async move {
+            if let Some(s) = refused.filter(Statement::changes) {
+                return Err(DriverError::ReadOnly(s.verb));
+            }
+            let (head_tx, head) = oneshot::channel();
+            tokio::spawn(run(conn, text, head_tx));
+            head.await.map_err(|_| DriverError::Gone)?
+        })
+    }
+
+    fn cancel(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let mut side = Conn::new(self.opts.clone()).await?;
+            side.query_drop(format!("KILL QUERY {}", self.id)).await?;
+            side.disconnect().await?;
+            Ok(())
+        })
+    }
+
+    fn classify<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<Statement>> {
+        Box::pin(async move { Ok(classify(text, Engine::Mysql)) })
+    }
+
+    fn set_auto_commit(&self, on: bool) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let sql = if on {
+                "SET autocommit = 1"
+            } else {
+                "SET autocommit = 0"
+            };
+            Ok(self.conn.lock().await.query_drop(sql).await?)
+        })
+    }
+
+    fn end_transaction(&self, commit: bool) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+            Ok(self.conn.lock().await.query_drop(sql).await?)
+        })
+    }
+
+    /// From the status flags of a ping's OK packet: fresh even after an error, and the
+    /// ping fails when the connection is gone.
+    fn transaction_open(&self) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            conn.ping().await?;
+            let flags = conn
+                .last_ok_packet()
+                .map_or(StatusFlags::empty(), |ok| ok.status_flags());
+            Ok(flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS))
+        })
+    }
+
+    fn table_info<'a>(&'a self, t: &'a TableRef) -> BoxFuture<'a, Result<TableInfo>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            let args = (&t.database, &t.table);
+            let kind: Option<(String, Option<u64>)> = conn
+                .exec_first(
+                    "SELECT TABLE_TYPE, TABLE_ROWS FROM information_schema.TABLES \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                    args,
+                )
+                .await?;
+            let Some((table_type, estimated_rows)) = kind else {
+                return Err(DriverError::Invalid(format!(
+                    "{}.{} does not exist",
+                    t.database, t.table
+                )));
+            };
+            let rows: Vec<(String, String, String, String, String)> = conn
+                .exec(
+                    "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, EXTRA \
+                     FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    args,
+                )
+                .await?;
+            let indexes: Vec<(String, i64, Option<String>)> = conn
+                .exec(
+                    "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                    args,
+                )
+                .await?;
+            let mode: Option<String> = conn.query_first("SELECT @@SESSION.sql_mode").await?;
+            drop(conn);
+            let columns: Vec<ColumnInfo> = rows
+                .into_iter()
+                .map(|(name, data_type, column_type, nullable, extra)| {
+                    let extra = extra.to_ascii_uppercase();
+                    ColumnInfo {
+                        name,
+                        data_type: data_type.to_ascii_lowercase(),
+                        column_type: column_type.to_ascii_lowercase(),
+                        nullable: nullable == "YES",
+                        auto_increment: extra.contains("AUTO_INCREMENT"),
+                        // `DEFAULT_GENERATED` is an expression default, not a generated column.
+                        generated: ["VIRTUAL", "STORED", "PERSISTENT"]
+                            .iter()
+                            .any(|g| extra.contains(g)),
+                        pseudo: false,
+                    }
+                })
+                .collect();
+            let indexes: Vec<_> = indexes
+                .into_iter()
+                .map(|(name, non_unique, col)| (name, non_unique != 0, col))
+                .collect();
+            let view = table_type.ends_with("VIEW");
+            Ok(TableInfo {
+                key: if view {
+                    None
+                } else {
+                    pick_key(&columns, &indexes)
+                },
+                columns,
+                view,
+                estimated_rows,
+                backslash_escapes: !mode.unwrap_or_default().contains("NO_BACKSLASH_ESCAPES"),
+                oracle: false,
+                read_only: None,
+            })
+        })
+    }
+
+    fn structure<'a>(&'a self, t: &'a TableRef) -> BoxFuture<'a, Result<TableStructure>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            let args = (&t.database, &t.table);
+            let table: Option<TableRow> = conn
+                .exec_first(
+                    "SELECT TABLE_TYPE, ENGINE, TABLE_COLLATION, TABLE_ROWS, DATA_LENGTH, \
+                     INDEX_LENGTH, TABLE_COMMENT FROM information_schema.TABLES \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                    args,
+                )
+                .await?;
+            let Some(table) = table else {
+                return Err(DriverError::Invalid(format!(
+                    "{}.{} does not exist",
+                    t.database, t.table
+                )));
+            };
+            let columns: Vec<ColumnRow> = conn
+                .exec(
+                    "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, \
+                     GENERATION_EXPRESSION, DATA_TYPE, COLUMN_COMMENT \
+                     FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    args,
+                )
+                .await?;
+            // MariaDB has no functional key parts, and no EXPRESSION column.
+            let expression = if self.mariadb { "NULL" } else { "EXPRESSION" };
+            let indexes: Vec<IndexRow> = conn
+                .exec(
+                    format!(
+                        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, {expression}, COLLATION, \
+                         SUB_PART, INDEX_TYPE FROM information_schema.STATISTICS \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                         ORDER BY INDEX_NAME <> 'PRIMARY', INDEX_NAME, SEQ_IN_INDEX"
+                    ),
+                    args,
+                )
+                .await?;
+            let keys: Vec<KeyRow> = conn
+                .exec(
+                    "SELECT k.CONSTRAINT_NAME, k.TABLE_SCHEMA, k.TABLE_NAME, k.COLUMN_NAME, \
+                     k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, \
+                     r.UPDATE_RULE, r.DELETE_RULE \
+                     FROM information_schema.KEY_COLUMN_USAGE k \
+                     JOIN information_schema.REFERENTIAL_CONSTRAINTS r \
+                       ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA \
+                      AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME \
+                     WHERE k.REFERENCED_TABLE_NAME IS NOT NULL \
+                       AND (k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? \
+                         OR k.REFERENCED_TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME = ?) \
+                     ORDER BY k.TABLE_SCHEMA, k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+                    (&t.database, &t.table, &t.database, &t.table),
+                )
+                .await?;
+            let view = table.0.ends_with("VIEW");
+            let what = if view { "VIEW" } else { "TABLE" };
+            let name = format!("{}.{}", quote_ident(&t.database), quote_ident(&t.table));
+            let row: Option<mysql_async::Row> = conn
+                .query_first(format!("SHOW CREATE {what} {name}"))
+                .await?;
+            let ddl = row
+                .and_then(|mut r| r.take_opt::<String, _>(1))
+                .and_then(std::result::Result::ok)
+                .unwrap_or_default();
+            let mode: Option<String> = conn.query_first("SELECT @@SESSION.sql_mode").await?;
+            drop(conn);
+            let backslash = !mode.unwrap_or_default().contains("NO_BACKSLASH_ESCAPES");
+            let flavor = (self.mariadb, backslash);
+            let mut s = structure_from_rows(t, flavor, table, columns, indexes, keys);
+            s.ddl = ddl;
+            Ok(s)
+        })
+    }
+
+    /// Estimated: `EXPLAIN FORMAT=JSON` on both flavors. Measured: `EXPLAIN ANALYZE`
+    /// (the tree) on MySQL, `ANALYZE FORMAT=JSON` on MariaDB; both run the statement.
+    fn explain<'a>(&'a self, statement: &'a str, analyze: bool) -> BoxFuture<'a, Result<Plan>> {
+        Box::pin(async move {
+            if analyze && self.read_only {
+                let s = classify(statement, Engine::Mysql);
+                if s.changes() {
+                    return Err(DriverError::ReadOnly(s.verb));
+                }
+            }
+            let sql = match (analyze, self.mariadb) {
+                (false, _) => format!("EXPLAIN FORMAT=JSON {statement}"),
+                (true, false) => format!("EXPLAIN ANALYZE {statement}"),
+                (true, true) => format!("ANALYZE FORMAT=JSON {statement}"),
+            };
+            let mut conn = self.conn.lock().await;
+            let database: Option<Option<String>> = conn.query_first("SELECT DATABASE()").await?;
+            let raw: Option<String> = conn.query_first(sql).await?;
+            drop(conn);
+            let raw = raw.ok_or_else(|| DriverError::Invalid("the server sent no plan".into()))?;
+            let plan = if analyze && !self.mariadb {
+                plan::mysql_tree(&raw)
+            } else {
+                plan::json(&raw, analyze)
+            };
+            let mut plan = plan.map_err(DriverError::Invalid)?;
+            plan.database = database.flatten();
+            Ok(plan)
+        })
+    }
+
+    fn apply<'a>(&'a self, changes: &'a [Change], auto: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.read_only {
+                return Err(DriverError::ReadOnly("a submit".into()));
+            }
+            let (begin, done, undo) = if auto {
+                ("START TRANSACTION", "COMMIT", "ROLLBACK")
+            } else {
+                (
+                    "SAVEPOINT deadlock_submit",
+                    "RELEASE SAVEPOINT deadlock_submit",
+                    "ROLLBACK TO SAVEPOINT deadlock_submit",
+                )
+            };
+            let mut conn = self.conn.lock().await;
+            conn.query_drop(begin).await?;
+            for (i, c) in changes.iter().enumerate() {
+                let outcome = match conn.query_drop(c.sql.as_str()).await {
+                    Ok(()) => {
+                        let rows = touched(c.kind, &conn.info(), conn.affected_rows());
+                        if rows == 1 {
+                            Ok(())
+                        } else {
+                            Err(DriverError::Invalid(format!(
+                                "change {} of {} touched {rows} rows instead of 1: someone else \
+                                 may have changed or removed the row. Nothing was submitted.",
+                                i + 1,
+                                changes.len()
+                            )))
+                        }
+                    }
+                    Err(e) => Err(DriverError::Invalid(format!(
+                        "change {} of {} failed: {e}. Nothing was submitted.",
+                        i + 1,
+                        changes.len()
+                    ))),
+                };
+                if let Err(e) = outcome {
+                    if let Err(u) = conn.query_drop(undo).await {
+                        return Err(DriverError::Invalid(format!(
+                            "{e} Undoing it failed too: {u}"
+                        )));
+                    }
+                    return Err(e);
+                }
+            }
+            if let Err(e) = conn.query_drop(done).await {
+                let _ = conn.query_drop(undo).await;
+                return Err(e.into());
+            }
+            Ok(())
+        })
+    }
+
+    fn config(&self) -> BoxFuture<'_, Result<crate::config::ServerConfig>> {
+        Box::pin(async move { config::read(&mut *self.conn.lock().await, self.mariadb).await })
+    }
+
+    fn apply_config<'a>(
+        &'a self,
+        cfg: &'a crate::config::ServerConfig,
+        changes: &'a [crate::config::ConfigChange],
+    ) -> BoxFuture<'a, Result<crate::config::Applied>> {
+        Box::pin(async move {
+            if self.read_only {
+                return Err(DriverError::Invalid(
+                    "not applied: the connection is read-only".into(),
+                ));
+            }
+            Ok(config::apply(&mut *self.conn.lock().await, cfg, changes).await)
+        })
+    }
+
+    fn sessions(&self) -> BoxFuture<'_, Result<crate::sessions::Snapshot>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            let mut snap = sessions::snapshot(&mut conn, self.mariadb, self.id).await?;
+            drop(conn);
+            let ours = ours();
+            for s in &mut snap.sessions {
+                let id = u32::try_from(s.id).unwrap_or(0);
+                s.deadlock |= ours.contains(&(self.server.0.clone(), self.server.1, id));
+            }
+            Ok(snap)
+        })
+    }
+
+    fn waiting_sessions(&self) -> BoxFuture<'_, Result<usize>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            sessions::waiting(&mut conn, self.mariadb).await
+        })
+    }
+
+    fn cancel_statement(&self, id: crate::sessions::SessionId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            Ok(self
+                .conn
+                .lock()
+                .await
+                .query_drop(format!("KILL QUERY {id}"))
+                .await?)
+        })
+    }
+
+    fn end_session(&self, id: crate::sessions::SessionId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if id == u64::from(self.id) {
+                return Err(DriverError::Invalid(
+                    "not ended: this is the session the screen itself uses".into(),
+                ));
+            }
+            Ok(self
+                .conn
+                .lock()
+                .await
+                .query_drop(format!("KILL {id}"))
+                .await?)
+        })
+    }
+
+    fn last_deadlock(&self) -> BoxFuture<'_, Result<Option<String>>> {
+        Box::pin(async move {
+            let row: Option<(String, String, String)> = self
+                .conn
+                .lock()
+                .await
+                .query_first("SHOW ENGINE INNODB STATUS")
+                .await?;
+            Ok(row.and_then(|(_, _, status)| {
+                crate::sessions::deadlock_section(&status).map(str::to_owned)
+            }))
+        })
+    }
+
+    /// The tree's bulk load of the database, plus its foreign keys column by column.
+    fn diagram<'a>(&'a self, schema: &'a str) -> BoxFuture<'a, Result<Diagram>> {
+        Box::pin(async move {
+            let groups = self.children(&ObjectPath(vec![schema.to_owned()])).await?;
+            let keys: Vec<crate::diagram::KeyRow> = self
+                .conn
+                .lock()
+                .await
+                .exec(
+                    "SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, \
+                     REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE \
+                     WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_SCHEMA = ? \
+                     ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
+                    (schema, schema),
+                )
+                .await?;
+            Ok(Diagram::from_tree(groups, keys))
+        })
+    }
+
+    /// `[]`: the databases. `[db, …]`: the database's groups, each loaded down to the
+    /// columns in four `information_schema` queries, then walked down the rest of the path.
+    fn children<'a>(&'a self, node: &'a ObjectPath) -> BoxFuture<'a, Result<Vec<ObjectNode>>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            let Some((db, rest)) = node.0.split_first() else {
+                let names: Vec<String> = conn
+                    .query(
+                        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
+                    )
+                    .await?;
+                return Ok(databases(names));
+            };
+            let tables: Vec<(String, String)> = conn
+                .exec(
+                    "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
+                     WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+                    (db,),
+                )
+                .await?;
+            let routines: Vec<(String, String)> = conn
+                .exec(
+                    "SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES \
+                     WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_NAME",
+                    (db,),
+                )
+                .await?;
+            let columns: Vec<(String, String, String, String)> = conn
+                .exec(
+                    "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY \
+                     FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION",
+                    (db,),
+                )
+                .await?;
+            let foreign: Vec<(String, String)> = conn
+                .exec(
+                    "SELECT DISTINCT TABLE_NAME, COLUMN_NAME \
+                     FROM information_schema.KEY_COLUMN_USAGE \
+                     WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL",
+                    (db,),
+                )
+                .await?;
+            drop(conn);
+            let mut nodes = database_children(tables, routines, columns, foreign);
+            for name in rest {
+                nodes = nodes
+                    .into_iter()
+                    .find(|n| &n.name == name)
+                    .and_then(|n| n.children)
+                    .ok_or_else(|| DriverError::Invalid(format!("no object named {name}")))?;
+            }
+            Ok(nodes)
+        })
+    }
+}
+
+/// `(type, engine, collation, rows, data bytes, index bytes, comment)`.
+type TableRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<String>,
+);
+/// `(name, type, nullable, default, extra, generation expression, data type, comment)`.
+type ColumnRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+/// `(index, non-unique, column, expression, collation, prefix, method)`.
+type IndexRow = (
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    String,
+);
+/// `(name, schema, table, column, referenced schema, table, column, on update, on delete)`.
+type KeyRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// The `information_schema` rows of one table as a [`TableStructure`], without the DDL.
+/// MySQL and MariaDB write defaults and generation expressions differently; both come
+/// out as SQL.
+/// `flavor`: MariaDB, and whether the session treats `\` as an escape.
+fn structure_from_rows(
+    t: &TableRef,
+    (mariadb, backslash): (bool, bool),
+    table: TableRow,
+    columns: Vec<ColumnRow>,
+    indexes: Vec<IndexRow>,
+    keys: Vec<KeyRow>,
+) -> TableStructure {
+    let (table_type, engine, collation, rows, data_bytes, index_bytes, comment) = table;
+    let view = table_type.ends_with("VIEW");
+    let mut out_indexes: Vec<Index> = Vec::new();
+    for (name, non_unique, column, expression, collation, prefix, method) in indexes {
+        if out_indexes.last().is_none_or(|i| i.name != name) {
+            out_indexes.push(Index {
+                primary: name == "PRIMARY",
+                unique: non_unique == 0,
+                kind: method,
+                parts: Vec::new(),
+                name,
+                constraint: None,
+            });
+        }
+        let (column, expression) = match (column, expression) {
+            (Some(c), _) => (c, false),
+            (None, e) => (e.unwrap_or_default(), true),
+        };
+        if let Some(last) = out_indexes.last_mut() {
+            last.parts.push(IndexPart {
+                column,
+                expression,
+                descending: collation.as_deref() == Some("D"),
+                prefix: prefix.and_then(|n| u32::try_from(n).ok()),
+            });
+        }
+    }
+    let (mut foreign_keys, mut referenced_by): (Vec<ForeignKey>, Vec<ForeignKey>) =
+        (Vec::new(), Vec::new());
+    let mut all: Vec<ForeignKey> = Vec::new();
+    for (name, db, tbl, col, rdb, rtbl, rcol, on_update, on_delete) in keys {
+        let same = all
+            .last()
+            .is_some_and(|k| k.name == name && k.from.database == db && k.from.table == tbl);
+        if !same {
+            all.push(ForeignKey {
+                name,
+                from: TableRef {
+                    database: db,
+                    table: tbl,
+                },
+                from_columns: Vec::new(),
+                to: TableRef {
+                    database: rdb,
+                    table: rtbl,
+                },
+                to_columns: Vec::new(),
+                on_delete: on_delete.to_ascii_lowercase(),
+                on_update: on_update.to_ascii_lowercase(),
+            });
+        }
+        if let Some(k) = all.last_mut() {
+            k.from_columns.push(col);
+            k.to_columns.push(rcol);
+        }
+    }
+    for k in all {
+        // A key from the table to itself shows in both lists.
+        if k.to == *t {
+            referenced_by.push(k.clone());
+        }
+        if k.from == *t {
+            foreign_keys.push(k);
+        }
+    }
+    let primary: HashSet<&str> = out_indexes
+        .iter()
+        .filter(|i| i.primary)
+        .flat_map(|i| i.parts.iter().map(|p| p.column.as_str()))
+        .collect();
+    let foreign: HashSet<&str> = foreign_keys
+        .iter()
+        .flat_map(|k| k.from_columns.iter().map(String::as_str))
+        .collect();
+    let columns = columns
+        .into_iter()
+        .map(
+            |(name, column_type, nullable, default, extra, generation, data_type, comment)| {
+                column_from_row(
+                    (mariadb, backslash),
+                    StructureColumn {
+                        primary_key: primary.contains(name.as_str()),
+                        foreign_key: foreign.contains(name.as_str()),
+                        name,
+                        column_type,
+                        nullable: nullable == "YES",
+                        comment,
+                        ..StructureColumn::default()
+                    },
+                    default,
+                    &extra,
+                    generation,
+                    &data_type,
+                )
+            },
+        )
+        .collect();
+    TableStructure {
+        view,
+        columns,
+        indexes: out_indexes,
+        foreign_keys,
+        referenced_by,
+        facts: TableFacts {
+            engine,
+            collation,
+            rows,
+            data_bytes,
+            index_bytes,
+            // MySQL writes `VIEW` as a view's comment.
+            comment: if view {
+                String::new()
+            } else {
+                comment.unwrap_or_default()
+            },
+            tablespace: None,
+        },
+        checks: Vec::new(),
+        ddl: String::new(),
+        backslash_escapes: backslash,
+        oracle: false,
+    }
+}
+
+/// Fills in a column's default, generation expression and extra.
+fn column_from_row(
+    (mariadb, backslash): (bool, bool),
+    mut c: StructureColumn,
+    default: Option<String>,
+    extra: &str,
+    generation: Option<String>,
+    data_type: &str,
+) -> StructureColumn {
+    let upper = extra.to_ascii_uppercase();
+    let generated = [
+        "VIRTUAL GENERATED",
+        "STORED GENERATED",
+        "PERSISTENT GENERATED",
+    ]
+    .iter()
+    .find(|g| upper.contains(*g));
+    let mut rest = extra.to_owned();
+    for token in [
+        "DEFAULT_GENERATED",
+        "VIRTUAL GENERATED",
+        "STORED GENERATED",
+        "PERSISTENT GENERATED",
+    ] {
+        if let Some(i) = rest.to_ascii_uppercase().find(token) {
+            rest.replace_range(i..i + token.len(), "");
+        }
+    }
+    c.extra = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let (Some(g), Some(expr)) = (generated, generation.filter(|e| !e.is_empty())) {
+        // MySQL wraps the expression in parentheses already; MariaDB does not.
+        let expression = if mariadb { format!("({expr})") } else { expr };
+        c.generated = Some(Generated {
+            expression,
+            stored: !g.starts_with("VIRTUAL"),
+        });
+        return c;
+    }
+    c.default = match default {
+        None => None,
+        // MariaDB writes the default as SQL, and `NULL` for a NULL default.
+        Some(d) if mariadb => (d != "NULL").then_some(d),
+        // MySQL writes literals bare and marks expressions.
+        Some(d) if upper.contains("DEFAULT_GENERATED") => Some(d),
+        Some(d) => {
+            let ty = data_type.to_ascii_lowercase();
+            let bare = ty == "bit"
+                || [
+                    "tinyint",
+                    "smallint",
+                    "mediumint",
+                    "int",
+                    "bigint",
+                    "decimal",
+                    "float",
+                    "double",
+                ]
+                .contains(&ty.as_str());
+            Some(if bare {
+                d
+            } else {
+                crate::edit::quote_str(&d, backslash)
+            })
+        }
+    };
+    c
+}
+
+const SYSTEM_SCHEMAS: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
+
+/// User databases first, then the system schemas, each group in the server's order.
+fn databases(names: Vec<String>) -> Vec<ObjectNode> {
+    let (system, user): (Vec<_>, Vec<_>) = names
+        .into_iter()
+        .partition(|n| SYSTEM_SCHEMAS.contains(&n.to_ascii_lowercase().as_str()));
+    user.into_iter()
+        .map(|n| ObjectNode::new(n, NodeKind::Database))
+        .chain(system.into_iter().map(|n| ObjectNode {
+            system: true,
+            ..ObjectNode::new(n, NodeKind::Database)
+        }))
+        .collect()
+}
+
+/// The Tables, Views and Routines groups of one database, with every column inside.
+/// Rows are `(table, type)`, `(routine, type)`, `(table, column, type, key)` and
+/// `(table, column)` for columns that reference another table.
+fn database_children(
+    tables: Vec<(String, String)>,
+    routines: Vec<(String, String)>,
+    columns: Vec<(String, String, String, String)>,
+    foreign: Vec<(String, String)>,
+) -> Vec<ObjectNode> {
+    let foreign: HashSet<(String, String)> = foreign.into_iter().collect();
+    let mut by_table: HashMap<String, Vec<ObjectNode>> = HashMap::new();
+    for (table, name, ty, key) in columns {
+        let foreign_key = foreign.contains(&(table.clone(), name.clone()));
+        by_table.entry(table).or_default().push(ObjectNode {
+            detail: ty,
+            primary_key: key == "PRI",
+            foreign_key,
+            ..ObjectNode::new(name, NodeKind::Column)
+        });
+    }
+    let (mut table_nodes, mut view_nodes) = (Vec::new(), Vec::new());
+    for (name, ty) in tables {
+        let is_view = ty.ends_with("VIEW");
+        let children = Some(by_table.remove(&name).unwrap_or_default());
+        let kind = if is_view {
+            NodeKind::View
+        } else {
+            NodeKind::Table
+        };
+        let node = ObjectNode {
+            children,
+            ..ObjectNode::new(name, kind)
+        };
+        if is_view {
+            view_nodes.push(node);
+        } else {
+            table_nodes.push(node);
+        }
+    }
+    let routine_nodes = routines
+        .into_iter()
+        .map(|(name, ty)| ObjectNode {
+            detail: ty.to_ascii_lowercase(),
+            ..ObjectNode::new(name, NodeKind::Routine)
+        })
+        .collect();
+    [
+        ("Tables", table_nodes),
+        ("Views", view_nodes),
+        ("Routines", routine_nodes),
+    ]
+    .into_iter()
+    .map(|(name, children)| ObjectNode {
+        children: Some(children),
+        ..ObjectNode::new(name, NodeKind::Group)
+    })
+    .collect()
+}
+
+/// Runs `text` and streams its result sets one after another: each stream carries the
+/// sender for the next. A set whose stream was dropped is read to its end and skipped.
+async fn run(conn: Arc<Mutex<Conn>>, text: String, head: oneshot::Sender<Result<ResultStream>>) {
+    let mut conn = conn.lock_owned().await;
+    let mut result = match conn.query_iter(text).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = head.send(Err(e.into()));
+            return;
+        }
+    };
+    let mut head = head;
+    loop {
+        let cols: Vec<mysql_async::Column> = result.columns_ref().to_vec();
+        let columns = cols
+            .iter()
+            .map(|c| Column {
+                name: c.name_str().into_owned(),
+                type_name: type_name(c.column_type()),
+            })
+            .collect();
+        let (tx, stream) = if cols.is_empty() {
+            let (tx, mut s) = ResultStream::channel(Vec::new());
+            s.affected_rows = Some(result.affected_rows());
+            (tx, s)
+        } else {
+            ResultStream::channel(columns)
+        };
+        let (next, stream) = stream.followed();
+        // Nobody waits for this set or any after it; dropping the result skips the rest.
+        let mut tx = head.send(Ok(stream)).is_ok().then_some(tx);
+        let size = page_size();
+        let mut page = Vec::with_capacity(size);
+        loop {
+            match result.next().await {
+                Ok(Some(row)) => {
+                    let Some(sender) = &tx else { continue };
+                    page.push(
+                        cols.iter()
+                            .zip(row.unwrap_raw())
+                            .map(|(c, v)| v.map_or(Value::Null, |v| cell(c, v)))
+                            .collect(),
+                    );
+                    if page.len() == size
+                        && sender.send(Ok(std::mem::take(&mut page))).await.is_err()
+                    {
+                        tx = None;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    if let Some(sender) = &tx {
+                        let _ = sender.send(Err(e.into())).await;
+                    } else {
+                        let _ = next.send(Err(e.into()));
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some(sender) = tx
+            && !page.is_empty()
+        {
+            let _ = sender.send(Ok(page)).await;
+        }
+        if result.is_empty() {
+            // A later statement's error waits as the pending result; `next` hands it over
+            // here instead of to the session's next query.
+            if let Err(e) = result.next().await {
+                let _ = next.send(Err(e.into()));
+            }
+            return;
+        }
+        head = next;
+    }
+}
+
+/// Rows a change touched: for an UPDATE the rows it matched (`Rows matched: 1  Changed: 0`),
+/// since setting a value it already has changes nothing; otherwise the affected rows.
+fn touched(kind: ChangeKind, info: &str, affected: u64) -> u64 {
+    if kind != ChangeKind::Update {
+        return affected;
+    }
+    info.split("Rows matched:")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(affected)
+}
+
+/// `MYSQL_TYPE_VAR_STRING` → `VAR_STRING`.
+fn type_name(t: ColumnType) -> String {
+    let name = format!("{t:?}");
+    name.strip_prefix("MYSQL_TYPE_").unwrap_or(&name).to_owned()
+}
+
+/// Maps a text-protocol value onto [`Value`] using the column's type.
+fn cell(col: &mysql_async::Column, v: mysql_async::Value) -> Value {
+    use mysql_async::Value as M;
+    let bytes = match v {
+        M::NULL => return Value::Null,
+        M::Bytes(b) => b,
+        M::Int(i) => return Value::Int(i),
+        M::UInt(u) => return Value::UInt(u),
+        M::Float(f) => return Value::Float(f.into()),
+        M::Double(f) => return Value::Float(f),
+        // The binary protocol's forms; the text protocol sends bytes.
+        other => return Value::Text(other.as_sql(true)),
+    };
+    let t = col.column_type();
+    if t == ColumnType::MYSQL_TYPE_BIT
+        || col.character_set() == BINARY_CHARSET
+            && !t.is_numeric_type()
+            && !is_temporal(t)
+            // MySQL sends JSON with the binary charset; it is UTF-8 text.
+            && t != ColumnType::MYSQL_TYPE_JSON
+    {
+        return Value::Bytes(bytes);
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => return Value::Bytes(e.into_bytes()),
+    };
+    let unsigned = col.flags().contains(ColumnFlags::UNSIGNED_FLAG);
+    let parsed = match t {
+        ColumnType::MYSQL_TYPE_TINY
+        | ColumnType::MYSQL_TYPE_SHORT
+        | ColumnType::MYSQL_TYPE_INT24
+        | ColumnType::MYSQL_TYPE_LONG
+        | ColumnType::MYSQL_TYPE_LONGLONG
+        | ColumnType::MYSQL_TYPE_YEAR => {
+            if unsigned {
+                text.parse().ok().map(Value::UInt)
+            } else {
+                text.parse().ok().map(Value::Int)
+            }
+        }
+        ColumnType::MYSQL_TYPE_FLOAT | ColumnType::MYSQL_TYPE_DOUBLE => {
+            text.parse().ok().map(Value::Float)
+        }
+        ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            return Value::Decimal(text);
+        }
+        ColumnType::MYSQL_TYPE_DATE => NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+            .ok()
+            .map(Value::Date),
+        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+            NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(Value::DateTime)
+        }
+        ColumnType::MYSQL_TYPE_TIME => parse_time(&text).map(Value::Time),
+        _ => None,
+    };
+    // Zero dates and other values outside the typed range stay as the server wrote them.
+    parsed.unwrap_or(Value::Text(text))
+}
+
+fn is_temporal(t: ColumnType) -> bool {
+    matches!(
+        t,
+        ColumnType::MYSQL_TYPE_DATE
+            | ColumnType::MYSQL_TYPE_DATETIME
+            | ColumnType::MYSQL_TYPE_TIMESTAMP
+            | ColumnType::MYSQL_TYPE_TIME
+            | ColumnType::MYSQL_TYPE_YEAR
+    )
+}
+
+/// `-838:59:59.5` → a signed duration.
+fn parse_time(text: &str) -> Option<TimeDelta> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text),
+    };
+    let (hms, frac) = rest.split_once('.').unwrap_or((rest, ""));
+    let mut parts = hms.split(':').map(str::parse::<i64>);
+    let (h, m, s) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    let micros = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<6}").get(..6)?.parse::<i64>().ok()?
+    };
+    let d = TimeDelta::hours(h)
+        + TimeDelta::minutes(m)
+        + TimeDelta::seconds(s)
+        + TimeDelta::microseconds(micros);
+    Some(if negative { -d } else { d })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn updates_count_matched_rows() {
+        let info = "Rows matched: 1  Changed: 0  Warnings: 0";
+        assert_eq!(touched(ChangeKind::Update, info, 0), 1);
+        assert_eq!(touched(ChangeKind::Update, "", 0), 0);
+        assert_eq!(touched(ChangeKind::Delete, info, 0), 0);
+    }
+
+    #[test]
+    fn version_labels_detect_the_flavor() {
+        assert_eq!(version_label("8.4.3"), "MySQL 8.4.3");
+        assert_eq!(version_label("11.8.2-MariaDB-ubu2404"), "MariaDB 11.8.2");
+    }
+
+    fn s(v: &str) -> String {
+        v.to_owned()
+    }
+
+    #[test]
+    fn system_schemas_come_last_and_dimmed() {
+        let got = databases(vec![
+            s("information_schema"),
+            s("app"),
+            s("mysql"),
+            s("zoo"),
+        ]);
+        let names: Vec<_> = got.iter().map(|n| (n.name.as_str(), n.system)).collect();
+        assert_eq!(
+            names,
+            [
+                ("app", false),
+                ("zoo", false),
+                ("information_schema", true),
+                ("mysql", true)
+            ]
+        );
+        assert!(
+            got.iter()
+                .all(|n| n.kind == NodeKind::Database && n.children.is_none())
+        );
+    }
+
+    #[test]
+    fn database_rows_become_groups_with_columns() {
+        let groups = database_children(
+            vec![
+                (s("orders"), s("BASE TABLE")),
+                (s("totals"), s("VIEW")),
+                (s("empty"), s("BASE TABLE")),
+            ],
+            vec![(s("refund"), s("PROCEDURE"))],
+            vec![
+                (s("orders"), s("id"), s("bigint unsigned"), s("PRI")),
+                (s("orders"), s("customer_id"), s("bigint"), s("MUL")),
+                (s("orders"), s("note"), s("varchar(20)"), s("")),
+                (s("totals"), s("sum"), s("decimal(12,2)"), s("")),
+            ],
+            vec![(s("orders"), s("customer_id"))],
+        );
+        let names: Vec<_> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Tables", "Views", "Routines"]);
+        let tables = groups[0].children.as_ref().unwrap();
+        assert_eq!(tables.len(), 2);
+        let orders = &tables[0];
+        assert_eq!(orders.kind, NodeKind::Table);
+        let cols = orders.children.as_ref().unwrap();
+        assert_eq!(cols.len(), 3);
+        assert!(cols[0].primary_key && !cols[0].foreign_key);
+        assert_eq!(cols[0].detail, "bigint unsigned");
+        assert!(cols[1].foreign_key && !cols[1].primary_key);
+        assert!(!cols[2].primary_key && !cols[2].foreign_key);
+        assert_eq!(tables[1].children, Some(vec![]));
+        let views = groups[1].children.as_ref().unwrap();
+        assert_eq!(views[0].kind, NodeKind::View);
+        assert_eq!(views[0].children.as_ref().unwrap()[0].name, "sum");
+        let routines = groups[2].children.as_ref().unwrap();
+        assert_eq!(routines[0].detail, "procedure");
+        assert!(!routines[0].has_children());
+    }
+
+    fn probe(mariadb: bool) -> TableStructure {
+        let t = TableRef {
+            database: s("p"),
+            table: s("child"),
+        };
+        let o = |v: &str| Some(s(v));
+        let col = |name: &str,
+                   ty: &str,
+                   null: &str,
+                   def: Option<String>,
+                   extra: &str,
+                   generation: Option<String>,
+                   dt: &str| {
+            (
+                s(name),
+                s(ty),
+                s(null),
+                def,
+                s(extra),
+                generation,
+                s(dt),
+                String::new(),
+            )
+        };
+        let columns = if mariadb {
+            vec![
+                col(
+                    "id",
+                    "bigint(20) unsigned",
+                    "NO",
+                    None,
+                    "auto_increment",
+                    None,
+                    "bigint",
+                ),
+                col("pa", "int(11)", "YES", o("NULL"), "", None, "int"),
+                col(
+                    "title",
+                    "varchar(200)",
+                    "NO",
+                    o("'it''s'"),
+                    "",
+                    None,
+                    "varchar",
+                ),
+                col("qty", "int(11)", "NO", o("0"), "", None, "int"),
+                col(
+                    "created",
+                    "datetime",
+                    "YES",
+                    o("current_timestamp()"),
+                    "on update current_timestamp()",
+                    None,
+                    "datetime",
+                ),
+                col(
+                    "total",
+                    "decimal(10,2)",
+                    "YES",
+                    None,
+                    "STORED GENERATED",
+                    o("`qty` * 2"),
+                    "decimal",
+                ),
+                col(
+                    "v",
+                    "int(11)",
+                    "YES",
+                    None,
+                    "VIRTUAL GENERATED",
+                    o("`qty` + 1"),
+                    "int",
+                ),
+            ]
+        } else {
+            vec![
+                col(
+                    "id",
+                    "bigint unsigned",
+                    "NO",
+                    None,
+                    "auto_increment",
+                    o(""),
+                    "bigint",
+                ),
+                col("pa", "int", "YES", None, "", o(""), "int"),
+                col(
+                    "title",
+                    "varchar(200)",
+                    "NO",
+                    o("it's"),
+                    "",
+                    o(""),
+                    "varchar",
+                ),
+                col("qty", "int", "NO", o("0"), "", o(""), "int"),
+                col(
+                    "created",
+                    "datetime",
+                    "YES",
+                    o("CURRENT_TIMESTAMP"),
+                    "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+                    o(""),
+                    "datetime",
+                ),
+                col(
+                    "total",
+                    "decimal(10,2)",
+                    "YES",
+                    None,
+                    "STORED GENERATED",
+                    o("(`qty` * 2)"),
+                    "decimal",
+                ),
+                col(
+                    "v",
+                    "int",
+                    "YES",
+                    None,
+                    "VIRTUAL GENERATED",
+                    o("(`qty` + 1)"),
+                    "int",
+                ),
+            ]
+        };
+        let ix =
+            |name: &str,
+             nu: i64,
+             c: Option<&str>,
+             e: Option<&str>,
+             coll: Option<&str>,
+             sub: Option<u64>,
+             m: &str| { (s(name), nu, c.map(s), e.map(s), coll.map(s), sub, s(m)) };
+        let indexes = vec![
+            ix("PRIMARY", 0, Some("id"), None, Some("A"), None, "BTREE"),
+            ix("ft_body", 1, Some("body"), None, None, None, "FULLTEXT"),
+            ix("ix_desc", 1, Some("qty"), None, Some("D"), None, "BTREE"),
+            ix(
+                "ix_desc",
+                1,
+                Some("created"),
+                None,
+                Some("A"),
+                None,
+                "BTREE",
+            ),
+            ix(
+                "ix_fn",
+                1,
+                None,
+                Some("lower(`title`)"),
+                Some("A"),
+                None,
+                "BTREE",
+            ),
+            ix(
+                "uq_title",
+                0,
+                Some("title"),
+                None,
+                Some("A"),
+                Some(50),
+                "BTREE",
+            ),
+        ];
+        let key = |name: &str, tbl: &str, col: &str, rtbl: &str, rcol: &str| {
+            (
+                s(name),
+                s("p"),
+                s(tbl),
+                s(col),
+                s("p"),
+                s(rtbl),
+                s(rcol),
+                s("SET NULL"),
+                s("CASCADE"),
+            )
+        };
+        let keys = vec![
+            key("fk_back", "grandchild", "child_id", "child", "id"),
+            key("fk_parent", "child", "pa", "parent", "a"),
+            key("fk_parent", "child", "pb", "parent", "b"),
+            key("fk_self", "child", "pa", "child", "id"),
+        ];
+        let table = (
+            s("BASE TABLE"),
+            o("InnoDB"),
+            o("utf8mb4_general_ci"),
+            Some(3),
+            Some(16384),
+            Some(81920),
+            o("kids"),
+        );
+        structure_from_rows(&t, (mariadb, true), table, columns, indexes, keys)
+    }
+
+    #[test]
+    fn structure_rows_map_alike_on_both_flavors() {
+        for mariadb in [false, true] {
+            let st = probe(mariadb);
+            let c = &st.columns;
+            assert_eq!(c[0].key_label(), "PK", "{mariadb}");
+            assert_eq!(c[0].extra, "auto_increment");
+            assert_eq!(c[0].default, None);
+            assert_eq!(c[1].key_label(), "FK");
+            assert_eq!(c[1].default, None, "{mariadb}");
+            assert_eq!(c[2].default.as_deref(), Some("'it''s'"), "{mariadb}");
+            assert!(!c[2].nullable && c[1].nullable);
+            assert_eq!(c[3].default.as_deref(), Some("0"));
+            assert!(
+                c[4].extra
+                    .to_ascii_lowercase()
+                    .starts_with("on update current_timestamp"),
+                "{mariadb}"
+            );
+            assert!(
+                c[4].default
+                    .as_deref()
+                    .is_some_and(|d| d.to_ascii_lowercase().starts_with("current_timestamp"))
+            );
+            assert_eq!(
+                c[5].default_label(),
+                "generated always as (`qty` * 2) stored",
+                "{mariadb}"
+            );
+            assert_eq!(
+                c[6].default_label(),
+                "generated always as (`qty` + 1) virtual"
+            );
+            let names: Vec<_> = st.indexes.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["PRIMARY", "ft_body", "ix_desc", "ix_fn", "uq_title"]
+            );
+            assert_eq!(st.indexes[0].kind_label(), "primary");
+            assert_eq!(st.indexes[1].kind_label(), "fulltext");
+            assert_eq!(st.indexes[2].parts_label(), "qty desc, created");
+            assert_eq!(st.indexes[2].kind_label(), "btree");
+            assert_eq!(st.indexes[3].parts_label(), "(lower(`title`))");
+            assert_eq!(st.indexes[4].parts_label(), "title(50)");
+            assert_eq!(st.indexes[4].kind_label(), "unique");
+            let fk: Vec<_> = st.foreign_keys.iter().map(|k| k.name.as_str()).collect();
+            assert_eq!(fk, ["fk_parent", "fk_self"]);
+            assert_eq!(st.foreign_keys[0].from_columns, ["pa", "pb"]);
+            assert_eq!(st.foreign_keys[0].to_columns, ["a", "b"]);
+            assert_eq!(st.foreign_keys[0].to.table, "parent");
+            assert_eq!(
+                (
+                    st.foreign_keys[0].on_delete.as_str(),
+                    st.foreign_keys[0].on_update.as_str()
+                ),
+                ("cascade", "set null")
+            );
+            let back: Vec<_> = st.referenced_by.iter().map(|k| k.name.as_str()).collect();
+            assert_eq!(back, ["fk_back", "fk_self"]);
+            assert_eq!(st.referenced_by[0].from.table, "grandchild");
+            assert_eq!(st.facts.size(), Some(16384 + 81920));
+            assert_eq!(st.facts.comment, "kids");
+            assert!(!st.view);
+        }
+    }
+
+    #[test]
+    fn times_parse_signed_with_fractions() {
+        assert_eq!(parse_time("01:02:03"), Some(TimeDelta::seconds(3723)));
+        assert_eq!(
+            parse_time("-838:59:59.5"),
+            Some(-(TimeDelta::seconds(838 * 3600 + 59 * 60 + 59) + TimeDelta::milliseconds(500)))
+        );
+        assert_eq!(parse_time("nope"), None);
+    }
+}

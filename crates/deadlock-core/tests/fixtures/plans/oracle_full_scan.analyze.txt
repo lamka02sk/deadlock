@@ -1,0 +1,19 @@
+SQL_ID  58jy4x6ab70d8, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ * FROM customers WHERE email LIKE 
+'%9@x.io'
+ 
+Plan hash value: 2008213504
+ 
+-----------------------------------------------------------------------------------------
+| Id  | Operation         | Name      | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |           |      1 |        |   2000 |00:00:00.01 |      95 |
+|*  1 |  TABLE ACCESS FULL| CUSTOMERS |      1 |   1000 |   2000 |00:00:00.01 |      95 |
+-----------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   1 - filter("EMAIL" LIKE '%9@x.io')
+ 

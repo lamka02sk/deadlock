@@ -1,0 +1,31 @@
+SQL_ID  0fzfbyj0wp3ta, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ o.id, c.email, o.status, o.total 
+FROM orders o JOIN customers c ON c.id = o.customer_id WHERE 
+o.created_at >= DATE '2026-02-10' AND o.status IN ('paid', 'shipped') 
+ORDER BY o.created_at DESC FETCH FIRST 500 ROWS ONLY
+ 
+Plan hash value: 206905276
+ 
+--------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                               | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+--------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                        |             |      1 |        |    500 |00:00:00.01 |      94 |       |       |          |
+|*  1 |  COUNT STOPKEY                          |             |      1 |        |    500 |00:00:00.01 |      94 |       |       |          |
+|   2 |   VIEW                                  |             |      1 |   1601 |    500 |00:00:00.01 |      94 |       |       |          |
+|*  3 |    SORT ORDER BY STOPKEY                |             |      1 |   1601 |    500 |00:00:00.01 |      94 | 74752 | 74752 |65536  (0)|
+|*  4 |     HASH JOIN                           |             |      1 |   1601 |   1601 |00:00:00.04 |      94 |  1222K|  1222K| 1636K (0)|
+|*  5 |      TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS      |      1 |   1601 |   1601 |00:00:00.01 |      19 |       |       |          |
+|*  6 |       INDEX RANGE SCAN                  | IDX_CREATED |      1 |   2401 |   2401 |00:00:00.01 |       7 |       |       |          |
+|   7 |      TABLE ACCESS FULL                  | CUSTOMERS   |      1 |  20000 |  20000 |00:00:00.01 |      75 |       |       |          |
+--------------------------------------------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   1 - filter(ROWNUM<=500)
+   3 - filter(ROWNUM<=500)
+   4 - access("C"."ID"="O"."CUSTOMER_ID")
+   5 - filter(("O"."STATUS"='paid' OR "O"."STATUS"='shipped'))
+   6 - access("O"."CREATED_AT">=TO_DATE(' 2026-02-10 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+ 

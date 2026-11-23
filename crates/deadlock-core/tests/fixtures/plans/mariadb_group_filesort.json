@@ -1,0 +1,23 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 19.8864144,
+    "filesort": {
+      "sort_key": "sum(items.qty) desc",
+      "temporary_table": {
+        "nested_loop": [
+          {
+            "table": {
+              "table_name": "items",
+              "access_type": "ALL",
+              "loops": 1,
+              "rows": 120090,
+              "cost": 19.8864144,
+              "filtered": 100
+            }
+          }
+        ]
+      }
+    }
+  }
+}

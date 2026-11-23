@@ -1,0 +1,6 @@
+-> Limit: 500 row(s)  (cost=1249 rows=480) (actual time=0.483..11.6 rows=500 loops=1)
+    -> Nested loop inner join  (cost=1249 rows=480) (actual time=0.476..10.1 rows=500 loops=1)
+        -> Filter: ((o.`status` in ('paid','shipped')) and (o.customer_id is not null))  (cost=1081 rows=480) (actual time=0.449..3.96 rows=500 loops=1)
+            -> Index range scan on o using idx_created over ('2026-02-10 00:00:00' <= created_at) (reverse), with index condition: (o.created_at >= TIMESTAMP'2026-02-10 00:00:00')  (cost=1081 rows=2401) (actual time=0.154..1.67 rows=750 loops=1)
+        -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (actual time=0.00357..0.00498 rows=1 loops=500)
+

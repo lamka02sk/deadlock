@@ -1,0 +1,33 @@
+[package]
+name = "deadlock-core"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+russh = "0.65"
+rusqlite = { version = "0.37", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+dirs = "6"
+# Both already in the tree: CSV import decodes the file's encoding as it streams.
+encoding_rs = "0.8"
+encoding_rs_io = "0.1"
+keyring = "4"
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
+oracledb = "=26.0.0-beta.6"
+# The Thick Oracle driver: ODPI-C, which loads Oracle Instant Client at run time.
+oracle = { version = "0.6.3", features = ["chrono"] }
+redis = { version = "1.8", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
+serde = { version = "1", features = ["derive"] }
+# Plans keep the server's key order.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros"] }
+
+[lints]
+workspace = true

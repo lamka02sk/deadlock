@@ -1,0 +1,6 @@
+-> Table scan on t  (cost=14049..14301 rows=19890) (actual time=240..240 rows=0 loops=1)
+    -> Materialize  (cost=14049..14049 rows=19890) (actual time=240..240 rows=0 loops=1)
+        -> Filter: (count(0) > 3)  (cost=12060 rows=19890) (actual time=240..240 rows=0 loops=1)
+            -> Group aggregate: count(0)  (cost=12060 rows=19890) (actual time=0.258..210 rows=20000 loops=1)
+                -> Covering index scan on orders using customer_id  (cost=6058 rows=60021) (actual time=0.241..91.3 rows=60000 loops=1)
+

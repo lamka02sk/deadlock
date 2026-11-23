@@ -1,0 +1,34 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 0.19753437,
+    "window_functions_computation": {
+      "sorts": [
+        {
+          "filesort": {
+            "sort_key": "orders.`status`, orders.total desc"
+          }
+        }
+      ],
+      "temporary_table": {
+        "nested_loop": [
+          {
+            "table": {
+              "table_name": "orders",
+              "access_type": "range",
+              "possible_keys": ["PRIMARY"],
+              "key": "PRIMARY",
+              "key_length": "4",
+              "used_key_parts": ["id"],
+              "loops": 1,
+              "rows": 999,
+              "cost": 0.19753437,
+              "filtered": 100,
+              "attached_condition": "orders.`id` < 1000"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

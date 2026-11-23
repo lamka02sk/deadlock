@@ -1,0 +1,23 @@
+SQL_ID  6h684fv1r18ng, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ c.id, (SELECT COUNT(*) FROM orders 
+o WHERE o.customer_id = c.id) AS n FROM customers c WHERE c.country = 
+'SK'
+ 
+Plan hash value: 1324958055
+ 
+-----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                 |      1 |        |   4000 |00:00:00.01 |     115 |
+|   1 |  SORT AGGREGATE   |                 |   4000 |      1 |   4000 |00:00:00.07 |    1168 |
+|*  2 |   INDEX RANGE SCAN| ORDERS_CUSTOMER |   4000 |      3 |  12000 |00:00:00.03 |    1168 |
+|*  3 |  TABLE ACCESS FULL| CUSTOMERS       |      1 |   4000 |   4000 |00:00:00.01 |     115 |
+-----------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   2 - access("O"."CUSTOMER_ID"=:B1)
+   3 - filter("C"."COUNTRY"='SK')
+ 

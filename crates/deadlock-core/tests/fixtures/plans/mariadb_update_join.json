@@ -1,0 +1,49 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 7.232912054,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "ref",
+          "possible_keys": ["PRIMARY", "country"],
+          "key": "country",
+          "key_length": "9",
+          "used_key_parts": ["country"],
+          "ref": ["const"],
+          "loops": 1,
+          "rows": 4000,
+          "cost": 0.59009552,
+          "filtered": 100,
+          "attached_condition": "c.country = 'SK'",
+          "using_index": true
+        }
+      },
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": ["idx_created", "customer_id"],
+          "key": "customer_id",
+          "key_length": "5",
+          "used_key_parts": ["customer_id"],
+          "ref": ["plantest.c.id"],
+          "rowid_filter": {
+            "range": {
+              "key": "idx_created",
+              "used_key_parts": ["created_at"]
+            },
+            "rows": 5759,
+            "selectivity_pct": 9.594975092
+          },
+          "loops": 4000,
+          "rows": 2,
+          "cost": 6.642816534,
+          "filtered": 9.594975471,
+          "attached_condition": "o.created_at < '2026-01-05'"
+        }
+      }
+    ]
+  }
+}

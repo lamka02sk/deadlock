@@ -1,0 +1,6 @@
+-> Filter: (c.country = 'SK')  (cost=402 rows=4000) (actual time=0.0522..18.4 rows=4000 loops=1)
+    -> Covering index lookup on c using country (country='SK')  (cost=402 rows=4000) (actual time=0.0451..6.43 rows=4000 loops=1)
+-> Select #2 (subquery in projection; dependent)
+    -> Aggregate: count(0)  (cost=0.854 rows=1) (actual time=0.0189..0.0203 rows=1 loops=4000)
+        -> Covering index lookup on o using customer_id (customer_id=c.id)  (cost=0.552 rows=3.02) (actual time=0.00383..0.00846 rows=3 loops=4000)
+
