@@ -2,8 +2,8 @@
 
 mod app;
 pub mod assets;
-mod config;
 mod color;
+mod config;
 mod connection_form;
 pub mod diagram;
 mod dialog;
