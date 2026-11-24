@@ -6,7 +6,16 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-24
+
+### Fixed
+
+- Linux packages (`.deb`, AppImage) are built on Ubuntu 24.04, so they install and run
+  there. The 0.1.1 packages were built on Ubuntu 26.04 and need glibc 2.43 or newer.
+
 ## [0.1.1] - 2026-11-24
+
+The Linux packages of this release need Ubuntu 26.04 or newer; use 0.1.2 on older systems.
 
 ### Added
 
@@ -58,6 +67,7 @@ First tagged version.
   shortcuts.
 - Linux packages (`.deb`, AppImage) and a macOS `.dmg`, attached to the release by CI.
 
-[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/lamka02sk/deadlock/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lamka02sk/deadlock/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lamka02sk/deadlock/releases/tag/v0.1.0
