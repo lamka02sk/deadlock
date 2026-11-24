@@ -13,7 +13,7 @@ categories.workspace = true
 
 [dependencies]
 russh = "0.65"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 dirs = "6"
 # Both already in the tree: CSV import decodes the file's encoding as it streams.
