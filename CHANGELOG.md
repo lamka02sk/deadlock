@@ -6,7 +6,7 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
-## [0.1.2] - 2026-11-24
+## [0.1.1] - 2026-11-24
 
 ### Added
 
@@ -58,6 +58,6 @@ First tagged version.
   shortcuts.
 - Linux packages (`.deb`, AppImage) and a macOS `.dmg`, attached to the release by CI.
 
-[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...HEAD
-[0.1.2]: https://github.com/lamka02sk/deadlock/compare/v0.1.0...v0.1.2
+[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/lamka02sk/deadlock/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lamka02sk/deadlock/releases/tag/v0.1.0
