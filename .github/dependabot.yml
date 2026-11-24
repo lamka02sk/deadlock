@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # gpui-kit and gpui-base are pinned to one git rev on purpose (see vendor/gpui-base/PATCHES.md).
+    ignore:
+      - dependency-name: gpui-kit
+      - dependency-name: gpui-fps
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

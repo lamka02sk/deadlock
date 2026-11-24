@@ -1,8 +1,15 @@
 [package]
 name = "deadlock-core"
-version = "0.1.0"
+version = "0.1.2"
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "Database drivers, project files and tooling behind the Deadlock database IDE."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 russh = "0.65"

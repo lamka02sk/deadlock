@@ -1,0 +1,4 @@
+vendor/** linguist-vendored
+Cargo.lock linguist-generated
+* text=auto eol=lf
+*.png binary

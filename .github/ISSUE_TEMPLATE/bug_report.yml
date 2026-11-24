@@ -1,0 +1,49 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you got. Screenshots help.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Deadlock version
+      description: A release version, or the commit if you built from source.
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Database engine
+      options: [MySQL, MariaDB, Oracle (Thin), Oracle (Thick), Redis, Not engine specific]
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server version
+      placeholder: e.g. MySQL 8.4.11
+  - type: input
+    id: os
+    attributes:
+      label: OS and display server
+      placeholder: e.g. Ubuntu 24.04, Wayland / macOS 15 on Apple Silicon
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Remove passwords, hostnames and data you do not want public.
+      render: shell

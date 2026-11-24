@@ -7,6 +7,12 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 publish = false
+license = "MIT"
+repository = "https://github.com/lamka02sk/deadlock"
+homepage = "https://github.com/lamka02sk/deadlock"
+readme = "README.md"
+keywords = ["database", "sql", "mysql", "redis", "gpui"]
+categories = ["development-tools", "database"]
 
 [workspace.dependencies]
 # gpui-kit is gpui-component's application crate: it re-exports gpui (the
