@@ -114,6 +114,15 @@ pub(crate) fn timestamp_text(ts: chrono::NaiveDateTime, zone: &str) -> String {
     }
 }
 
+/// Rows the dictionary queries ([`Conn::texts`]) prefetch: the driver default is 2.
+pub(crate) const DICTIONARY_ROWS: u32 = 100;
+
+/// Rows per fetch round trip for a user's statement: a whole page, plus the data
+/// view's one row past it, plus one so the end of the rows comes in the same trip.
+pub(crate) fn fetch_rows() -> u32 {
+    u32::try_from(crate::driver::page_size() + 2).unwrap_or(u32::MAX)
+}
+
 fn values(params: &[&dyn Bind]) -> Vec<Option<String>> {
     params.iter().map(|p| p.text()).collect()
 }
@@ -123,7 +132,12 @@ impl Conn for oracledb::Connection {
     fn texts(&self, sql: &str, params: &[&dyn Bind]) -> Result<Vec<Vec<Option<String>>>> {
         let vals = values(params);
         let refs: Vec<&dyn ToDbValue> = vals.iter().map(|v| v as &dyn ToDbValue).collect();
-        let cursor = self.query(sql, &refs)?;
+        // A dictionary answer of up to 100 rows comes with the execute itself.
+        let cursor = self
+            .statement(sql)?
+            .prefetch_rows(DICTIONARY_ROWS)
+            .build()?
+            .query(&refs)?;
         let n = cursor.columns().len();
         let mut out = Vec::new();
         for row in cursor {
@@ -158,9 +172,12 @@ impl Conn for oracledb::Connection {
         columns: &mut dyn FnMut(Vec<Column>) -> bool,
         row: &mut dyn FnMut(Row) -> bool,
     ) -> Result<Option<u64>> {
+        let rows = fetch_rows();
         let mut stmt = self
-            .statement(text)
-            .and_then(oracledb::StatementBuilder::build)?;
+            .statement(text)?
+            .fetch_array_size(rows)
+            .prefetch_rows(rows)
+            .build()?;
         let named: Vec<(&str, &dyn ToDbValue)> = binds
             .iter()
             .map(|(n, v)| (n.as_str(), v as &dyn ToDbValue))

@@ -4,12 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 
 use crate::connection::Engine;
-use crate::driver::{Driver, Result, ResultStream, Row, Value, page_size};
+use crate::driver::{Row, Value};
 
 /// A table or view, by database and name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,11 +632,16 @@ impl Pending {
 
     /// A new row with every column at its default. Returns its id.
     pub fn add(&mut self, columns: usize) -> RowId {
+        self.add_values(vec![Edit::Default; columns])
+    }
+
+    /// A new row with these cells, as one undo step: a duplicated row.
+    pub fn add_values(&mut self, values: Vec<Edit>) -> RowId {
         let id = self.next_id;
         self.next_id += 1;
         let row = RowId::Added(id);
         self.undo.push(vec![(row, self.snapshot(row))]);
-        self.added.push((id, vec![Edit::Default; columns]));
+        self.added.push((id, values));
         row
     }
 
@@ -1057,14 +1061,28 @@ pub fn select_sql(
     Ok(sql)
 }
 
-/// `select count(*) from <table> where (<filter>)`.
+/// `select count(*) from <table> where (<filter>)`. With `limit`, it counts no more
+/// than that many rows, so a table without statistics costs at most that much.
 ///
 /// # Errors
 /// The filter holds more than one statement.
-pub fn count_sql(t: &TableRef, info: &TableInfo, filter: &str) -> Result<String, String> {
-    let mut sql = format!("select count(*) from {}", info.qualified(t));
+pub fn count_sql(
+    t: &TableRef,
+    info: &TableInfo,
+    filter: &str,
+    limit: Option<u64>,
+) -> Result<String, String> {
+    let from = if limit.is_some() { "1" } else { "count(*)" };
+    let mut sql = format!("select {from} from {}", info.qualified(t));
     if !filter.trim().is_empty() {
         let _ = write!(sql, "\nwhere (\n{}\n)", filter.trim());
+    }
+    if let Some(n) = limit {
+        sql = if info.oracle {
+            format!("select count(*) from ({sql}\nfetch first {n} rows only\n)")
+        } else {
+            format!("select count(*) from ({sql}\nlimit {n}\n) x")
+        };
     }
     one_statement(&sql, info.engine())?;
     Ok(sql)
@@ -1078,47 +1096,77 @@ fn one_statement(sql: &str, engine: Engine) -> Result<(), String> {
     }
 }
 
-/// The rows of `select` in pages of [`page_size`], one `limit … offset …` query per
-/// page: the session is free between pages, and dropping the stream stops after the
-/// page in flight.
-///
-/// # Errors
-/// The first page's query failed.
-pub async fn browse(driver: Arc<dyn Driver>, select: String, oracle: bool) -> Result<ResultStream> {
-    let size = page_size();
-    let page = move |offset: usize| {
-        if oracle {
-            format!("{select}\noffset {offset} rows fetch next {size} rows only")
-        } else {
-            format!("{select}\nlimit {size} offset {offset}")
+/// Text that is a JSON object or array: what the Edit JSON dialog opens.
+pub fn is_json_doc(text: &str) -> bool {
+    let t = text.trim_start();
+    (t.starts_with('{') || t.starts_with('['))
+        && serde_json::from_str::<serde_json::Value>(t).is_ok()
+}
+
+/// Reflows valid JSON: `indent` spaces per level, or `None` for no whitespace at all.
+/// Only whitespace outside strings changes, so key order and number text stay exactly
+/// as they were.
+pub fn json_reflow(text: &str, indent: Option<usize>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+    let mut chars = text.chars().peekable();
+    let newline = |out: &mut String, depth: usize| {
+        if let Some(n) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(n * depth));
         }
     };
-    let mut first = driver.execute(&page(0)).await?;
-    let columns = std::mem::take(&mut first.columns);
-    let rows = first.collect().await?;
-    let full = rows.len() == size;
-    let (tx, stream) = ResultStream::channel(columns);
-    // Capacity 2: the first send cannot fail or wait.
-    let _ = tx.try_send(Ok(rows));
-    if full {
-        tokio::spawn(async move {
-            let mut offset = size;
-            // Waits for room before querying, so pages load as the grid asks.
-            while let Ok(permit) = tx.reserve().await {
-                let rows = match driver.execute(&page(offset)).await {
-                    Ok(s) => s.collect().await,
-                    Err(e) => Err(e),
-                };
-                let more = matches!(&rows, Ok(r) if r.len() == size);
-                permit.send(rows);
-                if !more {
-                    break;
-                }
-                offset += size;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
             }
-        });
+            continue;
+        }
+        match c {
+            c if c.is_whitespace() => {}
+            '"' => {
+                in_str = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                out.push(c);
+                while chars.next_if(|c| c.is_whitespace()).is_some() {}
+                if chars.peek().is_some_and(|n| matches!(n, '}' | ']')) {
+                    out.extend(chars.next());
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(if indent.is_some() { ": " } else { ":" }),
+            c => out.push(c),
+        }
     }
-    Ok(stream)
+    out
+}
+
+/// One page of `select`: `limit … offset …`, or Oracle's `offset … rows fetch next …
+/// rows only`. `select` ends with the table key in its order by, so pages are stable.
+pub fn page_sql(select: &str, oracle: bool, limit: usize, offset: usize) -> String {
+    if oracle {
+        format!("{select}\noffset {offset} rows fetch next {limit} rows only")
+    } else {
+        format!("{select}\nlimit {limit} offset {offset}")
+    }
 }
 
 #[cfg(test)]
@@ -1475,11 +1523,45 @@ mod tests {
             sql,
             "select `id`, `status`, `total` from `shop`.`orders`\nwhere (\nstatus = 'paid' -- note\n)\norder by \ntotal desc\n, `id`"
         );
-        assert!(select_sql(&t, &info, "1; delete from orders", "").is_err());
-        assert!(count_sql(&t, &info, "1); drop table x; (1").is_err());
+        // Several sort keys keep their order, and the table key still ends it.
         assert_eq!(
-            count_sql(&t, &info, "").unwrap(),
+            select_sql(&t, &info, "", "`status` desc, `total`").unwrap(),
+            "select `id`, `status`, `total` from `shop`.`orders`\norder by \n`status` desc, `total`\n, `id`"
+        );
+        assert!(select_sql(&t, &info, "1; delete from orders", "").is_err());
+        assert!(count_sql(&t, &info, "1); drop table x; (1", None).is_err());
+        assert_eq!(
+            count_sql(&t, &info, "id > 1", Some(5)).unwrap(),
+            "select count(*) from (select 1 from `shop`.`orders`\nwhere (\nid > 1\n)\nlimit 5\n) x"
+        );
+        assert_eq!(
+            count_sql(&t, &info, "", None).unwrap(),
             "select count(*) from `shop`.`orders`"
+        );
+        assert_eq!(
+            page_sql("select 1 from t\norder by id", false, 500, 1000),
+            "select 1 from t\norder by id\nlimit 500 offset 1000"
+        );
+        assert_eq!(
+            page_sql("select 1 from t", true, 200, 0),
+            "select 1 from t\noffset 0 rows fetch next 200 rows only"
+        );
+    }
+
+    #[test]
+    fn json_documents_reflow_without_changing_values() {
+        assert!(is_json_doc(" {\"a\": 1}") && is_json_doc("[]"));
+        assert!(!is_json_doc("12") && !is_json_doc("\"{}\"") && !is_json_doc("{bad"));
+        assert!(!is_json_doc("null") && !is_json_doc("true"));
+        let src = r#"{"z": [1.10, {}, "a, b: \"{ }\""], "a":{ "x" : 1e3 }, "e": [ ]}"#;
+        let pretty = json_reflow(src, Some(2));
+        assert_eq!(
+            pretty,
+            "{\n  \"z\": [\n    1.10,\n    {},\n    \"a, b: \\\"{ }\\\"\"\n  ],\n  \"a\": {\n    \"x\": 1e3\n  },\n  \"e\": []\n}"
+        );
+        assert_eq!(
+            json_reflow(&pretty, None),
+            r#"{"z":[1.10,{},"a, b: \"{ }\""],"a":{"x":1e3},"e":[]}"#
         );
     }
 

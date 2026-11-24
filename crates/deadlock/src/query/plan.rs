@@ -16,6 +16,7 @@ use gpui_kit::{
 use super::{QueryTab, TabEvent};
 use crate::assets::{Icon, icon};
 use crate::theme::{MONO_FONT, Palette, data_size, small_size, tab_height};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button};
 
 /// A plan in the Plan tab, with the statement it explains.
@@ -68,7 +69,7 @@ pub(super) fn header_actions(view: &PlanView, cx: &mut Context<QueryTab>) -> Div
     let segment = |id: &'static str, label: &'static str, on: bool, text: bool, tip| {
         segment_button(id, on, tip, &p)
             .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .clickable(cx.listener(move |this, _, _, cx| {
                 if let Some(v) = &mut this.explained {
                     v.text_view = text;
                 }
@@ -83,7 +84,7 @@ pub(super) fn header_actions(view: &PlanView, cx: &mut Context<QueryTab>) -> Div
     let mode = |id: &'static str, label: &'static str, analyze: bool, tip: String| {
         segment_button(id, measured == analyze, tip, &p)
             .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| this.reexplain(analyze, cx)))
+            .clickable(cx.listener(move |this, _, _, cx| this.reexplain(analyze, cx)))
     };
     let raw = view.plan.raw.clone();
     div()
@@ -135,7 +136,7 @@ pub(super) fn header_actions(view: &PlanView, cx: &mut Context<QueryTab>) -> Div
                 cx,
             )
             .child("Copy plan")
-            .on_click(move |_, _, cx| {
+            .clickable(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(raw.clone()));
             }),
         )
@@ -341,7 +342,6 @@ fn tree(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl IntoEl
             div()
                 .id(("plan-toggle", i))
                 .flex_none()
-                .cursor_pointer()
                 .child(icon(
                     if collapsed {
                         Icon::ChevronRight
@@ -350,7 +350,7 @@ fn tree(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl IntoEl
                     },
                     p.tx3,
                 ))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .clickable(cx.listener(move |this, _, _, cx| {
                     if let Some(v) = &mut this.explained
                         && !v.collapsed.remove(&i)
                     {
@@ -380,13 +380,12 @@ fn tree(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl IntoEl
         let estimated = mono(num_cell(NUM_W)).children(n.estimated_rows.map(rows));
         let r = row()
             .id(("plan-step", i))
-            .cursor_pointer()
             .when(selected, |d| d.bg(p.sel))
             .when(!selected, |d| {
                 let bg = p.panel;
                 d.hover(move |s| s.bg(bg))
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .clickable(cx.listener(move |this, _, _, cx| {
                 if let Some(v) = &mut this.explained {
                     v.selected = Some(i);
                 }
@@ -560,7 +559,7 @@ fn detail(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl Into
         cx,
     )
     .child("Show in query")
-    .on_click(cx.listener(move |this, _, window, cx| this.show_step(i, window, cx)));
+    .clickable(cx.listener(move |this, _, window, cx| this.show_step(i, window, cx)));
     let open = table.map(|t| {
         button(
             "plan-open",
@@ -570,7 +569,7 @@ fn detail(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl Into
             cx,
         )
         .child(format!("Open {}", t.table))
-        .on_click(cx.listener(move |_, _, _, cx| cx.emit(TabEvent::OpenTable(t.clone()))))
+        .clickable(cx.listener(move |_, _, _, cx| cx.emit(TabEvent::OpenTable(t.clone()))))
     });
     aside
         .child(

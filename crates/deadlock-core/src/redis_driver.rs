@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{ConnectionAddr, ConnectionInfo, ProtocolVersion, RedisConnectionInfo};
 
 use crate::classify::{Danger, Kind, Statement};
@@ -57,7 +57,7 @@ struct Flags {
 
 /// One database's key browser: the keys loaded so far and the cursor to go on from.
 struct Browse {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     cursor: u64,
     keys: Loaded,
     total: u64,
@@ -87,7 +87,7 @@ pub struct Redis {
     /// The SSH tunnel the connection goes through: closes with the driver.
     pub(crate) tunnel: Option<crate::ssh::Tunnel>,
     info: ConnectionInfo,
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     /// The database the connection selects.
     db: u32,
     /// This connection's `CLIENT ID`.
@@ -150,11 +150,16 @@ fn settings(config: &ConnectionConfig, password: &str, db: i64) -> Result<Connec
     Ok(redis::IntoConnectionInfo::into_connection_info(addr)?.set_redis_settings(s))
 }
 
-async fn open(info: &ConnectionInfo) -> Result<MultiplexedConnection> {
-    match redis::Client::open(info.clone())?
-        .get_multiplexed_async_connection()
-        .await
-    {
+/// A connection that reconnects by itself after a lost socket: the command that saw
+/// it fails, the next one runs on a new connection.
+async fn open(info: &ConnectionInfo) -> Result<ConnectionManager> {
+    let manager = |info: ConnectionInfo| async move {
+        let config = redis::aio::ConnectionManagerConfig::new().set_number_of_retries(2);
+        redis::Client::open(info)?
+            .get_connection_manager_with_config(config)
+            .await
+    };
+    match manager(info.clone()).await {
         Ok(c) => Ok(c),
         // Servers before 6 have no HELLO: RESP2 then.
         Err(e) if e.to_string().to_ascii_uppercase().contains("HELLO") => {
@@ -162,10 +167,7 @@ async fn open(info: &ConnectionInfo) -> Result<MultiplexedConnection> {
                 .redis_settings()
                 .clone()
                 .set_protocol(ProtocolVersion::RESP2);
-            let info = info.clone().set_redis_settings(s);
-            Ok(redis::Client::open(info)?
-                .get_multiplexed_async_connection()
-                .await?)
+            Ok(manager(info.clone().set_redis_settings(s)).await?)
         }
         Err(e) => Err(e.into()),
     }
@@ -417,7 +419,7 @@ impl Redis {
     }
 
     /// A connection to database `db`: this one for its own database, else a new one.
-    async fn db_conn(&self, db: u32) -> Result<MultiplexedConnection> {
+    async fn db_conn(&self, db: u32) -> Result<ConnectionManager> {
         if db == self.db {
             return Ok(self.conn.clone());
         }
@@ -428,7 +430,7 @@ impl Redis {
     /// One page of `SCAN cursor [MATCH pattern] COUNT n` with each key's type: the
     /// next cursor (0 at the end) and the keys found.
     async fn scan_types(
-        conn: &mut MultiplexedConnection,
+        conn: &mut ConnectionManager,
         cursor: u64,
         pattern: Option<&str>,
     ) -> Result<(u64, Vec<(Vec<u8>, KeyType)>)> {
@@ -922,7 +924,7 @@ impl Redis {
 
 /// Reads a collection page by page for [`Redis::rows`].
 struct Pager {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     key: Vec<u8>,
     kind: KeyType,
     pattern: Option<String>,
@@ -1089,7 +1091,16 @@ impl Driver for Redis {
             for a in rest {
                 cmd.arg(a);
             }
-            let reply: redis::Value = cmd.query_async(&mut conn).await.map_err(explain)?;
+            let reply: redis::Value = match cmd.query_async(&mut conn).await {
+                // The manager reconnects; a read runs again once on the new connection.
+                Err(e)
+                    if (e.is_io_error() || e.is_connection_dropped())
+                        && self.command_flags(&args).await.is_ok_and(|f| !f.write) =>
+                {
+                    cmd.query_async(&mut conn).await.map_err(explain)?
+                }
+                r => r.map_err(explain)?,
+            };
             Ok(to_result(reply))
         })
     }
@@ -1115,6 +1126,44 @@ impl Driver for Redis {
             Err(DriverError::Unsupported(
                 "Redis cannot cancel a running command",
             ))
+        })
+    }
+
+    /// Key names only, Redis has no code: `SCAN MATCH` over each database with keys,
+    /// as the sidebar search does, until [`crate::search::LIMIT`] keys. `MATCH` is
+    /// case-sensitive.
+    fn search_everywhere<'a>(
+        &'a self,
+        text: &'a str,
+        hidden: &'a [String],
+        stop: &'a std::sync::atomic::AtomicBool,
+    ) -> BoxFuture<'a, Result<Vec<crate::search::Hit>>> {
+        Box::pin(async move {
+            let pattern = rk::search_pattern(text);
+            let mut out = Vec::new();
+            for db in self.databases().await? {
+                if hidden.contains(&db.name) {
+                    continue;
+                }
+                let Some(n) = db.name.strip_prefix("db").and_then(|n| n.parse().ok()) else {
+                    continue;
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                self.search(n, &pattern, stop, &tx).await?;
+                drop(tx);
+                while let Some((_, key, kind)) = rx.recv().await {
+                    out.push(crate::search::Hit::object(
+                        db.name.clone(),
+                        rk::key_label(&key),
+                        kind.label().to_owned(),
+                    ));
+                }
+                if out.len() >= crate::search::LIMIT {
+                    out.truncate(crate::search::LIMIT);
+                    break;
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -1172,7 +1221,7 @@ impl Driver for Redis {
 
 /// Access for the admin queries next door.
 impl Redis {
-    pub(crate) fn conn(&self) -> MultiplexedConnection {
+    pub(crate) fn conn(&self) -> ConnectionManager {
         self.conn.clone()
     }
 

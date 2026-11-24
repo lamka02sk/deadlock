@@ -3,8 +3,8 @@
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, div, px, transparent_black, white,
+    App, ClickEvent, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Window, div, px, transparent_black, white,
 };
 
 use crate::assets::{Icon, icon};
@@ -62,7 +62,7 @@ pub fn button(
         .when(enabled, |d| {
             d.hover(move |s| s.bg(bg_hover).text_color(fg_hover))
         })
-        .when(!enabled, |d| d.opacity(0.38))
+        .when(!enabled, |d| d.opacity(0.38).cursor_default())
         .when(!tooltip.is_empty(), |d| {
             d.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         })
@@ -186,3 +186,12 @@ pub fn labelled(label: &'static str, input: impl IntoElement) -> Div {
 pub fn dot(color: Hsla) -> Div {
     div().size(px(8.)).flex_none().rounded_full().bg(color)
 }
+
+/// A click handler that also shows the pointer cursor, so clickable elements never forget it.
+pub trait Clickable: StatefulInteractiveElement + Styled + Sized {
+    fn clickable(self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.cursor_pointer().on_click(listener)
+    }
+}
+
+impl<T: StatefulInteractiveElement + Styled> Clickable for T {}

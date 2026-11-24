@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use deadlock_core::connection::{ConnectionConfig, Environment};
+use deadlock_core::connection::ConnectionConfig;
 use deadlock_core::project::{TabState, console_path, load_text, save_text};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -17,7 +17,12 @@ use super::{Conn, Front, Shell};
 use crate::assets::{Icon, icon};
 use crate::query::{Kind, QueryTab, Scope, TabEvent, TxMode, View};
 use crate::theme::{Palette, tab_height};
+use crate::ui::Clickable as _;
 use deadlock_core::edit::TableRef;
+use gpui_kit::{MouseButton, MouseUpEvent};
+
+/// What runs once a tab closed: [`Shell::close_tab_then`].
+pub(super) type AfterClose = Box<dyn FnOnce(&mut Shell, &mut Window, &mut Context<Shell>)>;
 
 impl Shell {
     /// A saved connection, as a tab binds to it.
@@ -104,6 +109,7 @@ impl Shell {
             let n = self.untitled;
             tab.update(cx, |t, _| t.untitled = n);
         }
+        super::complete::install(cx.entity().downgrade(), &tab, cx);
         let sub = cx.subscribe_in(&tab, window, Self::on_tab_event);
         self.tabs.push((tab, sub));
         self.tabs.len() - 1
@@ -197,29 +203,48 @@ impl Shell {
         }
     }
 
-    /// The toolbar and status bar follow the front tab's connection.
+    /// The connection the toolbar, status bar and new tabs use: the front tab's, else
+    /// the one selected in the tree, else the project's first.
+    pub(super) fn active(&self, cx: &App) -> Option<String> {
+        let front = match self.front {
+            Front::Query(i) => self
+                .tabs
+                .get(i)
+                .and_then(|(t, _)| t.read(cx).connection.as_ref().map(|c| c.id.clone())),
+            Front::Sessions(i) => self
+                .sessions
+                .get(i)
+                .map(|(t, _)| t.read(cx).connection.id.clone()),
+            Front::Config(i) => self
+                .configs
+                .get(i)
+                .map(|(t, _)| t.read(cx).connection.id.clone()),
+            Front::Diagram(i) => self
+                .diagrams
+                .get(i)
+                .map(|(t, _)| t.read(cx).connection.id.clone()),
+            Front::Object(i) => self
+                .objects
+                .get(i)
+                .map(|(t, _)| t.read(cx).connection.id.clone()),
+            Front::None | Front::Form | Front::Import | Front::Settings => None,
+        };
+        front
+            .or_else(|| {
+                let id = self.selected.as_ref()?.first()?;
+                self.config(id).map(|c| c.id.clone())
+            })
+            .or_else(|| {
+                self.project
+                    .config
+                    .connections
+                    .first()
+                    .map(|c| c.id.clone())
+            })
+    }
+
+    /// The front tab changed: the toolbar and status bar follow it.
     pub(super) fn follow_front(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self
-            .front_tab()
-            .and_then(|t| t.read(cx).connection.as_ref())
-        {
-            self.active = Some(c.id.clone());
-        }
-        if let Front::Sessions(i) = self.front
-            && let Some((t, _)) = self.sessions.get(i)
-        {
-            self.active = Some(t.read(cx).connection.id.clone());
-        }
-        if let Front::Config(i) = self.front
-            && let Some((t, _)) = self.configs.get(i)
-        {
-            self.active = Some(t.read(cx).connection.id.clone());
-        }
-        if let Front::Diagram(i) = self.front
-            && let Some((t, _)) = self.diagrams.get(i)
-        {
-            self.active = Some(t.read(cx).connection.id.clone());
-        }
         self.schedule_save(cx);
         cx.notify();
     }
@@ -261,7 +286,6 @@ impl Shell {
         let i = open.unwrap_or_else(|| {
             self.add_tab(Kind::Table(table), Some(binding), String::new(), window, cx)
         });
-        self.active = Some(conn.to_owned());
         if view == View::Structure
             && let Some((tab, _)) = self.tabs.get(i)
         {
@@ -276,14 +300,14 @@ impl Shell {
 
     /// Ctrl+N: an untitled buffer on the active connection.
     pub(super) fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let binding = self.binding(self.active.as_deref());
+        let binding = self.binding(self.active(cx).as_deref());
         let i = self.add_tab(Kind::File(None), binding, String::new(), window, cx);
         self.show_tab(Front::Query(i), window, cx);
     }
 
     /// Ctrl+Shift+N: the active connection's console, opened or brought forward.
     pub(super) fn open_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(binding) = self.binding(self.active.as_deref()) else {
+        let Some(binding) = self.binding(self.active(cx).as_deref()) else {
             return;
         };
         let open = self.tabs.iter().position(|(t, _)| {
@@ -347,7 +371,7 @@ impl Shell {
             Some(i) => i,
             None => match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    let binding = self.binding(self.active.as_deref());
+                    let binding = self.binding(self.active(cx).as_deref());
                     self.add_tab(Kind::File(Some(path)), binding, text, window, cx)
                 }
                 Err(e) => {
@@ -413,6 +437,17 @@ impl Shell {
     /// transaction, then about unsaved changes. Consoles save themselves and never ask
     /// about the text.
     pub(super) fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_then(i, None, window, cx);
+    }
+
+    /// [`Self::close_tab`], then `then` once the tab is gone. A Cancel anywhere drops it.
+    pub(super) fn close_tab_then(
+        &mut self,
+        i: usize,
+        then: Option<AfterClose>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.get(i).map(|(t, _)| t.clone()) else {
             return;
         };
@@ -424,7 +459,7 @@ impl Shell {
             self.settle_pending(vec![tab.clone()], question, cx, move |this, window, cx| {
                 if let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) {
                     this.pending_settled = true;
-                    this.close_tab(i, window, cx);
+                    this.close_tab_then(i, then, window, cx);
                 }
             });
             return;
@@ -439,7 +474,7 @@ impl Shell {
                 // The tab may have moved while the prompt was open.
                 if let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) {
                     this.tx_settled = true;
-                    this.close_tab(i, window, cx);
+                    this.close_tab_then(i, then, window, cx);
                 }
             });
             return;
@@ -456,6 +491,9 @@ impl Shell {
         if !ask {
             tab.update(cx, |t, cx| t.save_console(cx));
             self.remove_tab(i, cx);
+            if let Some(then) = then {
+                then(self, window, cx);
+            }
             return;
         }
         let answer = crate::dialog::ask(
@@ -466,18 +504,27 @@ impl Shell {
                 &["Save", "Don't Save", "Cancel"],
             ),
         );
+        let handle = self.window;
         cx.spawn(async move |this, cx| {
             let Some(answer) = answer.await else { return };
-            let _ = this.update(cx, |this, cx| {
-                // The tab may have moved while the prompt was open.
-                let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) else {
-                    return;
-                };
-                match answer {
-                    0 => this.save_tab(&tab, Some(i), cx),
-                    1 => this.remove_tab(i, cx),
-                    _ => {}
-                }
+            let _ = cx.update_window(handle, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    // The tab may have moved while the prompt was open.
+                    let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) else {
+                        return;
+                    };
+                    match answer {
+                        0 => this.save_tab(&tab, Some(i), cx),
+                        1 => this.remove_tab(i, cx),
+                        _ => {}
+                    }
+                    // A file with a path saves at once, so the tab is gone by now.
+                    if !this.tabs.iter().any(|(t, _)| *t == tab)
+                        && let Some(then) = then
+                    {
+                        then(this, window, cx);
+                    }
+                })
             });
         })
         .detach();
@@ -830,6 +877,21 @@ fn write(tab: &Entity<QueryTab>, path: &Path, cx: &mut gpui_kit::App) -> bool {
 }
 
 /// The tab strip: editor tabs, then the New connection tab.
+/// A connection's tint on its tab: a tinted background (stronger in front), a 2 px
+/// accent along the top and, behind the front tab's blue underline, along the bottom.
+pub(super) fn tinted(
+    tab: gpui_kit::Stateful<gpui_kit::Div>,
+    color: Option<gpui_kit::Hsla>,
+    on: bool,
+    p: &Palette,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let Some(c) = color else { return tab };
+    tab.relative()
+        .bg(crate::color::over(c, if on { 0.32 } else { 0.14 }, p.bg))
+        .border_color(if on { p.blue } else { c })
+        .child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(c))
+}
+
 pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
     let p = *cx.global::<Palette>();
     let tab = |id: SharedString, on: bool| {
@@ -878,11 +940,18 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
             (_, None) => "No connection".into(),
         };
         let group: SharedString = format!("editor-tab-{i}").into();
-        let element = tab(group.clone(), on)
+        let tint = t.connection.as_ref().and_then(|c| shell.color_of(&c.id));
+        let element = tinted(tab(group.clone(), on), tint, on, &p)
             .tooltip(move |window, cx| {
                 gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
             })
-            .on_click(
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_tab(i, window, cx);
+                }),
+            )
+            .clickable(
                 cx.listener(move |this, _, window, cx| this.show_tab(Front::Query(i), window, cx)),
             )
             .when(console, |d| d.child(icon(Icon::Console, p.tx3)))
@@ -893,11 +962,10 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .text_size(crate::theme::data_size())
             })
             .child(title)
-            .when(
+            .children(
                 t.connection
                     .as_ref()
-                    .is_some_and(|c| c.environment == Environment::Production),
-                |d| d.child(super::production_marker(&p)),
+                    .and_then(|c| super::env_marker(c.environment, &p)),
             )
             .when(t.dirty && !console && !table, |d| {
                 d.child(div().size(px(6.)).rounded_full().bg(p.tx3))
@@ -918,7 +986,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .group_hover(group, |s| s.opacity(1.))
                     .hover(|s| s.bg(p.hover))
                     .child(icon(Icon::Close, p.tx3).size(px(12.)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .clickable(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.close_tab(i, window, cx);
                     })),
@@ -935,13 +1003,12 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .context_menu(move |menu, _, _| {
                         let (shell, id, r) = (shell.clone(), id.clone(), r.clone());
                         menu.item(
-                            gpui_kit::component::menu::PopupMenuItem::new("Import CSV…").on_click(
-                                move |_, window, cx| {
+                            crate::assets::menu_item("Import CSV…", crate::assets::Icon::Import)
+                                .on_click(move |_, window, cx| {
                                     shell.update(cx, |s, cx| {
                                         s.open_import(&id, Some(r.clone()), window, cx);
                                     });
-                                },
-                            ),
+                                }),
                         )
                     })
                     .into_any_element()
@@ -955,13 +1022,20 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
             let c = &t.read(cx).connection;
             let redis = c.engine == deadlock_core::connection::Engine::Redis;
             let tip = format!("Sessions and locks · {}", c.name);
-            let production = c.environment == Environment::Production;
+            let env = c.environment;
             let group: SharedString = format!("sessions-tab-{i}").into();
-            tab(group.clone(), on)
+            let tint = shell.color_of(&c.id);
+            tinted(tab(group.clone(), on), tint, on, &p)
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                 })
-                .on_click(cx.listener(move |this, _, window, cx| {
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                        this.close_sessions(i, cx);
+                    }),
+                )
+                .clickable(cx.listener(move |this, _, window, cx| {
                     this.show_tab(Front::Sessions(i), window, cx)
                 }))
                 .child(icon(Icon::Sessions, if on { p.tx } else { p.tx3 }))
@@ -970,7 +1044,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                 } else {
                     "Sessions and locks"
                 })
-                .when(production, |d| d.child(super::production_marker(&p)))
+                .children(super::env_marker(env, &p))
                 .child(
                     div()
                         .id(("close-sessions", i))
@@ -983,7 +1057,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                         .group_hover(group, |s| s.opacity(1.))
                         .hover(|s| s.bg(p.hover))
                         .child(icon(Icon::Close, p.tx3).size(px(12.)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .clickable(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_sessions(i, cx);
                         })),
@@ -994,19 +1068,26 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
         let t = t.read(cx);
         let c = &t.connection;
         let tip = format!("Server configuration · {}", c.name);
-        let production = c.environment == Environment::Production;
+        let env = c.environment;
         let pending = t.pending_count() > 0;
         let group: SharedString = format!("config-tab-{i}").into();
-        tab(group.clone(), on)
+        let tint = shell.color_of(&c.id);
+        tinted(tab(group.clone(), on), tint, on, &p)
             .tooltip(move |window, cx| {
                 gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
             })
-            .on_click(
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, window, cx| {
+                    this.close_config(i, window, cx);
+                }),
+            )
+            .clickable(
                 cx.listener(move |this, _, window, cx| this.show_tab(Front::Config(i), window, cx)),
             )
             .child(icon(Icon::Config, if on { p.tx } else { p.tx3 }))
             .child("Server configuration")
-            .when(production, |d| d.child(super::production_marker(&p)))
+            .children(super::env_marker(env, &p))
             .when(pending, |d| {
                 d.child(div().size(px(6.)).rounded_full().bg(p.warn))
             })
@@ -1022,7 +1103,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .group_hover(group, |s| s.opacity(1.))
                     .hover(|s| s.bg(p.hover))
                     .child(icon(Icon::Close, p.tx3).size(px(12.)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .clickable(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.close_config(i, window, cx);
                     })),
@@ -1031,7 +1112,13 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
     let import = shell.import.as_ref().map(|(t, _)| {
         let on = shell.front == Front::Import;
         tab("import-tab".into(), on)
-            .on_click(cx.listener(|this, _, window, cx| this.show_tab(Front::Import, window, cx)))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                    this.close_import(cx);
+                }),
+            )
+            .clickable(cx.listener(|this, _, window, cx| this.show_tab(Front::Import, window, cx)))
             .child(icon(Icon::Import, if on { p.tx } else { p.tx3 }))
             .child(t.read(cx).title())
             .child(
@@ -1046,7 +1133,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .group_hover("import-tab", |s| s.opacity(1.))
                     .hover(|s| s.bg(p.hover))
                     .child(icon(Icon::Close, p.tx3).size(px(12.)))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .clickable(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.close_import(cx);
                     })),
@@ -1055,7 +1142,15 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
     let settings = shell.settings_tab.as_ref().map(|_| {
         let on = shell.front == Front::Settings;
         tab("settings-tab".into(), on)
-            .on_click(cx.listener(|this, _, window, cx| this.show_tab(Front::Settings, window, cx)))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                    this.close_settings(cx);
+                }),
+            )
+            .clickable(
+                cx.listener(|this, _, window, cx| this.show_tab(Front::Settings, window, cx)),
+            )
             .child(icon(Icon::Config, if on { p.tx } else { p.tx3 }))
             .child("Settings")
             .child(
@@ -1070,18 +1165,23 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .group_hover("settings-tab", |s| s.opacity(1.))
                     .hover(|s| s.bg(p.hover))
                     .child(icon(Icon::Close, p.tx3).size(px(12.)))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .clickable(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.close_settings(cx);
                     })),
             )
     });
-    let form = shell.form.as_ref().map(|_| {
+    let form = shell.form.as_ref().map(|(f, _)| {
+        let editing = f.read(cx).editing().map(|c| c.id.clone());
+        let label: SharedString = match editing.as_deref().and_then(|id| shell.config(id)) {
+            Some(c) => format!("Edit {}", c.name).into(),
+            None => "New connection".into(),
+        };
         tab("form-tab".into(), shell.front == Front::Form)
             .pr(px(12.))
-            .on_click(cx.listener(|this, _, window, cx| this.show_tab(Front::Form, window, cx)))
-            .child(icon(Icon::Plus, p.tx))
-            .child("New connection")
+            .clickable(cx.listener(|this, _, window, cx| this.show_tab(Front::Form, window, cx)))
+            .when(editing.is_none(), |d| d.child(icon(Icon::Plus, p.tx)))
+            .child(label)
     });
     div()
         .id("tab-strip")
@@ -1096,6 +1196,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
         .children(screens)
         .children(configs)
         .children(super::diagram::diagram_tabs(shell, cx))
+        .children(super::objects::object_tabs(shell, cx))
         .children(import)
         .children(settings)
         .children(form)

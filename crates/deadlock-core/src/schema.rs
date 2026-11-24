@@ -17,6 +17,8 @@ pub struct ConnectionTree {
     pub name: String,
     /// The databases, once loaded from the server or the cache.
     pub nodes: Option<Vec<ObjectNode>>,
+    /// Databases left out of the rows and of searches; the tree still holds them.
+    pub hidden: Vec<String>,
 }
 
 /// A load in flight or one that failed, shown as a row under the node.
@@ -238,7 +240,7 @@ impl Tree {
             let (open, id) = (row.expanded, row.id.clone());
             out.push(row);
             if open {
-                self.push_open(&mut out, &id, c.nodes.as_deref(), &|id| {
+                self.push_open(&mut out, &id, c.nodes.as_deref(), &c.hidden, &|id| {
                     self.expanded.contains(id)
                 });
             }
@@ -252,6 +254,7 @@ impl Tree {
         out: &mut Vec<Row>,
         parent: &[String],
         nodes: Option<&[ObjectNode]>,
+        hidden: &[String],
         open: &dyn Fn(&[String]) -> bool,
     ) {
         if let Some(load) = self.status.get(parent)
@@ -260,12 +263,15 @@ impl Tree {
             out.push(Row::status(parent, load));
         }
         for n in nodes.unwrap_or_default() {
+            if hidden.contains(&n.name) {
+                continue;
+            }
             let id = child_id(parent, &n.name);
             let expanded = n.has_children() && open(&id);
             out.push(Row::node(id, n, expanded));
             if expanded {
                 let id = &out[out.len() - 1].id.clone();
-                self.push_open(out, id, n.children.as_deref(), open);
+                self.push_open(out, id, n.children.as_deref(), &[], open);
             }
         }
     }
@@ -279,7 +285,7 @@ impl Tree {
         let mut found = 0;
         for c in &self.connections {
             let hits = query.find(&c.name);
-            let (children, n) = filter(c.nodes.as_deref().unwrap_or_default(), query);
+            let (children, n) = filter(c.nodes.as_deref().unwrap_or_default(), &c.hidden, query);
             found += n + usize::from(hits.is_some());
             let mut row = Row::connection(c, false);
             if hits.is_none() && children.is_empty() {
@@ -291,7 +297,13 @@ impl Tree {
             let (open, id) = (row.expanded, row.id.clone());
             out.push(row);
             if open {
-                self.push_hits(&mut out, &id, &children, c.nodes.as_deref(), flipped);
+                self.push_hits(
+                    &mut out,
+                    &id,
+                    &children,
+                    (c.nodes.as_deref(), &c.hidden),
+                    flipped,
+                );
             }
         }
         (out, found)
@@ -302,12 +314,12 @@ impl Tree {
         out: &mut Vec<Row>,
         parent: &[String],
         hits: &[Hit<'_>],
-        all: Option<&[ObjectNode]>,
+        (all, hidden): (Option<&[ObjectNode]>, &[String]),
         flipped: &HashSet<NodeId>,
     ) {
         // Opened by hand with nothing matching inside: show it whole.
         if hits.is_empty() {
-            self.push_open(out, parent, all, &|id| flipped.contains(id));
+            self.push_open(out, parent, all, hidden, &|id| flipped.contains(id));
             return;
         }
         for h in hits {
@@ -321,7 +333,13 @@ impl Tree {
             out.push(row);
             if open {
                 let id = &out[out.len() - 1].id.clone();
-                self.push_hits(out, id, &h.children, h.node.children.as_deref(), flipped);
+                self.push_hits(
+                    out,
+                    id,
+                    &h.children,
+                    (h.node.children.as_deref(), &[]),
+                    flipped,
+                );
             }
         }
     }
@@ -334,17 +352,39 @@ struct Hit<'a> {
     children: Vec<Hit<'a>>,
 }
 
-/// The matching part of `nodes`, and how many objects matched. Group names are labels,
+/// The matching part of `nodes`, and how many objects matched. Columns never match. Group names are labels,
 /// not objects, so they never match themselves.
-fn filter<'a>(nodes: &'a [ObjectNode], query: &Query) -> (Vec<Hit<'a>>, usize) {
+fn filter<'a>(nodes: &'a [ObjectNode], hidden: &[String], query: &Query) -> (Vec<Hit<'a>>, usize) {
+    filter_under(nodes, hidden, query, false)
+}
+
+/// [`filter`] for the children of a table when `table` is set: its Triggers group
+/// repeats triggers the schema's Triggers group lists, so they show but count once.
+fn filter_under<'a>(
+    nodes: &'a [ObjectNode],
+    hidden: &[String],
+    query: &Query,
+    table: bool,
+) -> (Vec<Hit<'a>>, usize) {
     let mut out = Vec::new();
     let mut found = 0;
-    for node in nodes {
-        let (children, n) = filter(node.children.as_deref().unwrap_or_default(), query);
+    for node in nodes
+        .iter()
+        .filter(|n| n.kind != NodeKind::Column && !hidden.contains(&n.name))
+    {
+        let (children, n) = filter_under(
+            node.children.as_deref().unwrap_or_default(),
+            &[],
+            query,
+            node.kind == NodeKind::Table,
+        );
         let hits = (node.kind != NodeKind::Group)
             .then(|| query.find(&node.name))
             .flatten();
-        found += n + usize::from(hits.is_some());
+        let repeat = table && node.kind == NodeKind::Group && node.name == "Triggers";
+        if !repeat {
+            found += n + usize::from(hits.is_some());
+        }
         if hits.is_some() || !children.is_empty() {
             out.push(Hit {
                 node,
@@ -490,11 +530,13 @@ mod tests {
                     id: "shop".into(),
                     name: "shop".into(),
                     nodes: Some(vec![app]),
+                    hidden: Vec::new(),
                 },
                 ConnectionTree {
                     id: "wh".into(),
                     name: "warehouse".into(),
                     nodes: Some(vec![stock]),
+                    hidden: Vec::new(),
                 },
             ],
             ..Tree::default()
@@ -556,7 +598,7 @@ mod tests {
     fn search_opens_matching_branches_and_counts() {
         let t = sample();
         let (rows, found) = t.search(&q("ord"), &HashSet::new());
-        assert_eq!(found, 3); // order_items, order_id, orders
+        assert_eq!(found, 2); // order_items, orders; columns never match
         assert_eq!(
             labels(&rows),
             [
@@ -564,14 +606,36 @@ mod tests {
                 "  app",
                 "    Tables 2 of 3",
                 "      order_items",
-                "        order_id",
                 "      orders",
                 "warehouse no matches"
             ]
         );
         assert_eq!(rows[3].hits, vec![0..3]);
-        assert!(rows[3].expanded && !rows[5].expanded && rows[5].expandable);
-        assert!(rows[6].dim && !rows[6].expanded);
+        assert!(!rows[3].expanded && rows[3].expandable);
+        assert!(rows[5].dim && !rows[5].expanded);
+    }
+
+    #[test]
+    fn a_trigger_under_its_table_and_its_group_counts_once() {
+        let trig = || ObjectNode::new("orders_bu", NodeKind::Routine);
+        let mut orders = table("orders", &["id"]);
+        orders
+            .children
+            .as_mut()
+            .unwrap()
+            .push(group("Triggers", vec![trig()]));
+        let mut t = sample();
+        t.connections[0].nodes = Some(vec![with(
+            ObjectNode::new("app", NodeKind::Database),
+            vec![
+                group("Tables", vec![orders]),
+                group("Triggers", vec![trig()]),
+            ],
+        )]);
+        let (rows, found) = t.search(&q("orders_bu"), &HashSet::new());
+        assert_eq!(found, 1);
+        // Still shown in both places.
+        assert_eq!(rows.iter().filter(|r| r.label == "orders_bu").count(), 2);
     }
 
     #[test]
@@ -595,6 +659,8 @@ mod tests {
             labels(&rows)[3..],
             [
                 "      order_items",
+                "        order_id",
+                "        qty",
                 "      orders",
                 "        id",
                 "        total",
@@ -623,5 +689,18 @@ mod tests {
         assert!(!t.set_children(&id(&["shop", "nope"]), vec![]));
         assert!(t.is_gone(&id(&["shop", "app", "Tables", "nope"])));
         assert!(!t.is_gone(&id(&["shop", "app", "Tables", "orders", "id"])));
+    }
+
+    #[test]
+    fn hidden_databases_leave_rows_and_search() {
+        let mut t = sample();
+        t.connections[0].hidden = vec!["app".into()];
+        t.expanded.insert(id(&["shop"]));
+        assert_eq!(labels(&t.rows()), ["shop", "warehouse"]);
+        let (rows, found) = t.search(&q("orders"), &HashSet::new());
+        assert_eq!(found, 0);
+        assert_eq!(labels(&rows), ["shop no matches", "warehouse no matches"]);
+        t.connections[0].hidden.clear();
+        assert!(t.search(&q("orders"), &HashSet::new()).1 > 0);
     }
 }

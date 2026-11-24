@@ -17,7 +17,7 @@ use deadlock_core::driver::{Driver, ObjectPath};
 use deadlock_core::edit::TableRef;
 use deadlock_core::schema::Query;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -30,10 +30,11 @@ use gpui_kit::{
 };
 
 use crate::app::Db;
-use crate::assets::{Icon, icon};
+use crate::assets::{Icon, icon, menu_item};
 use crate::query::View;
 use crate::shell::Trigger;
 use crate::theme::{MONO_FONT, Palette, RADIUS, UI_FONT, row_height};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button, button_icon};
 
 pub const MIN_ZOOM: f32 = 0.25;
@@ -707,7 +708,12 @@ impl DiagramTab {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(nodes)) = rx.await {
                 let _ = this.update(cx, |t, cx| {
-                    t.schemas = nodes.into_iter().map(|n| (n.name, n.system)).collect();
+                    t.schemas = nodes
+                        .into_iter()
+                        // The open schema stays listed even when hidden.
+                        .filter(|n| n.name == t.schema || !t.connection.is_hidden(&n.name))
+                        .map(|n| (n.name, n.system))
+                        .collect();
                     cx.notify();
                 });
             }
@@ -1145,7 +1151,7 @@ fn header(
                 menu_row(("diagram-schema-row", i), name == current, &p)
                     .when(*system, |d| d.text_color(p.tx3))
                     .child(SharedString::from(name.clone()))
-                    .on_click(move |_, _, cx| {
+                    .clickable(move |_, _, cx| {
                         let _ = this.update(cx, |t, cx| t.set_schema(name.clone(), cx));
                     })
             });
@@ -1193,7 +1199,7 @@ fn header(
                 menu_row(("diagram-add-row", i), false, &p)
                     .child(icon(Icon::Table, p.tx3))
                     .child(SharedString::from(name.clone()))
-                    .on_click(move |_, _, cx| {
+                    .clickable(move |_, _, cx| {
                         let _ = this.update(cx, |t, cx| t.add(i, cx));
                     })
             });
@@ -1281,7 +1287,7 @@ fn header(
                     &p,
                 )
                 .child(label)
-                .on_click(move |_, _, cx| {
+                .clickable(move |_, _, cx| {
                     let _ = this.update(cx, |t, cx| t.set_zoom(z, cx));
                 })
             });
@@ -1316,7 +1322,7 @@ fn header(
                 menu_row(label, false, &p)
                     .child(div().font_weight(FontWeight::MEDIUM).child(label))
                     .child(div().ml_auto().pl(px(8.)).text_color(p.tx3).child(what))
-                    .on_click(move |_, _, cx| {
+                    .clickable(move |_, _, cx| {
                         let _ = this.update(cx, |t, cx| t.export(png, cx));
                     })
             });
@@ -1333,7 +1339,9 @@ fn header(
         |id: &'static str, i: Icon, up: bool, tip: &'static str, cx: &mut Context<DiagramTab>| {
             button(id, Kind::Ghost, ready, tip, cx)
                 .child(button_icon(id, i, Kind::Ghost, ready, cx))
-                .on_click(cx.listener(move |t, _: &ClickEvent, _, cx| t.step_zoom(up, cx)))
+                .when(ready, |b| {
+                    b.clickable(cx.listener(move |t, _: &ClickEvent, _, cx| t.step_zoom(up, cx)))
+                })
         };
 
     div()
@@ -1379,7 +1387,9 @@ fn header(
                 cx,
             )
             .child("Arrange")
-            .on_click(cx.listener(|t, _: &ClickEvent, _, cx| t.arrange(cx))),
+            .when(ready, |b| {
+                b.clickable(cx.listener(|t, _: &ClickEvent, _, cx| t.arrange(cx)))
+            }),
         )
         .child(
             div()
@@ -1483,9 +1493,9 @@ fn body(tab: &DiagramTab, p: &Palette, cx: &mut Context<DiagramTab>) -> AnyEleme
         .context_menu(move |menu, _, cx| {
             let t = menu_entity.read(cx);
             let e = menu_entity.clone();
-            let item = |label: &'static str, act: Act| {
+            let item = |label: &'static str, ic: Icon, act: Act| {
                 let e = e.clone();
-                PopupMenuItem::new(label).on_click(
+                menu_item(label, ic).on_click(
                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                         e.update(cx, |t, cx| t.act(act, cx));
                     },
@@ -1493,13 +1503,17 @@ fn body(tab: &DiagramTab, p: &Palette, cx: &mut Context<DiagramTab>) -> AnyEleme
             };
             match t.menu_card {
                 Some(i) => menu
-                    .item(item("Open data", Act::Open(i, View::Data)))
-                    .item(item("Open structure", Act::Open(i, View::Structure)))
+                    .item(item("Open data", Icon::Table, Act::Open(i, View::Data)))
+                    .item(item(
+                        "Open structure",
+                        Icon::Config,
+                        Act::Open(i, View::Structure),
+                    ))
                     .separator()
-                    .item(item("Remove from diagram", Act::Remove(i))),
+                    .item(item("Remove from diagram", Icon::Minus, Act::Remove(i))),
                 None => menu
-                    .item(item("Arrange", Act::Arrange))
-                    .item(item("Fit", Act::Fit)),
+                    .item(item("Arrange", Icon::Diagram, Act::Arrange))
+                    .item(item("Fit", Icon::SelectAll, Act::Fit)),
             }
         })
         .into_any_element()

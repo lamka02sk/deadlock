@@ -22,6 +22,7 @@ use gpui_kit::{
 use crate::keymap::{self, ENTRIES, Entry};
 use crate::settings::{self, get};
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
+use crate::ui::Clickable as _;
 
 type Choice = Entity<SelectState<Vec<SharedString>>>;
 
@@ -468,6 +469,7 @@ fn small_button(
 fn checkbox(id: &'static str, on: bool, set: fn(&mut Settings, bool)) -> Checkbox {
     Checkbox::new(id)
         .checked(on)
+        .cursor_pointer()
         .on_click(move |checked: &bool, _, cx| {
             let v = *checked;
             settings::update(cx, |s| set(s, v));
@@ -489,7 +491,7 @@ impl SettingsTab {
                         "Change".into(),
                         &p,
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .clickable(cx.listener(move |this, _, window, cx| {
                         this.start_capture(e.id, window, cx);
                     })),
                 )
@@ -510,11 +512,11 @@ impl SettingsTab {
             .when(c.conflict.is_some(), |d| {
                 d.child(
                     small_button("shortcut-swap", "Swap".into(), &p)
-                        .on_click(cx.listener(|this, _, _, cx| this.swap(cx))),
+                        .clickable(cx.listener(|this, _, _, cx| this.swap(cx))),
                 )
             })
             .child(
-                small_button("shortcut-cancel", "Cancel".into(), &p).on_click(cx.listener(
+                small_button("shortcut-cancel", "Cancel".into(), &p).clickable(cx.listener(
                     |this, _, _, cx| {
                         this.capture = None;
                         cx.notify();
@@ -538,7 +540,7 @@ impl SettingsTab {
             .into_iter()
             .map(|(t, l)| {
                 seg_button(format!("theme-{l}").into(), l, s.theme == t, &p)
-                    .on_click(move |_, _, cx| settings::update(cx, |s| s.theme = t))
+                    .clickable(move |_, _, cx| settings::update(cx, |s| s.theme = t))
             }),
         );
         let appearance = fieldset(
@@ -603,6 +605,17 @@ impl SettingsTab {
                     ))
                     .child(checkbox("wrap", s.wrap, |s, v| s.wrap = v))
                     .into_any_element(),
+                row(&p)
+                    .child(label(
+                        "Autocomplete",
+                        Some("Suggest tables, columns and keywords while typing.".into()),
+                        None,
+                        &p,
+                    ))
+                    .child(checkbox("autocomplete", s.autocomplete, |s, v| {
+                        s.autocomplete = v
+                    }))
+                    .into_any_element(),
             ],
         );
         let results_seg = div().flex().gap(px(4.)).children(
@@ -613,7 +626,7 @@ impl SettingsTab {
             .into_iter()
             .map(|(r, l)| {
                 seg_button(format!("results-{l}").into(), l, s.results == r, &p)
-                    .on_click(move |_, _, cx| settings::update(cx, |s| s.results = r))
+                    .clickable(move |_, _, cx| settings::update(cx, |s| s.results = r))
             }),
         );
         let results = fieldset(
@@ -665,7 +678,7 @@ impl SettingsTab {
             .into_iter()
             .map(|(t, l)| {
                 seg_button(format!("tx-{l}").into(), l, s.tx_mode == t, &p)
-                    .on_click(move |_, _, cx| settings::update(cx, |s| s.tx_mode = t))
+                    .clickable(move |_, _, cx| settings::update(cx, |s| s.tx_mode = t))
             }),
         );
         let safety = fieldset(
@@ -710,11 +723,10 @@ impl SettingsTab {
                                 s.keep_history = v;
                             }))
                             .child(
-                                small_button("clear-history", "Clear history".into(), &p).on_click(
-                                    cx.listener(|this, _, window, cx| {
+                                small_button("clear-history", "Clear history".into(), &p)
+                                    .clickable(cx.listener(|this, _, window, cx| {
                                         this.clear_history(window, cx);
-                                    }),
-                                ),
+                                    })),
                             ),
                     )
                     .into_any_element(),
@@ -736,14 +748,14 @@ impl SettingsTab {
                             .text_color(p.tx3)
                             .hover(|s| s.text_color(p.tx))
                             .child(format!("{more} more in the Shortcuts section"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .clickable(cx.listener(|this, _, _, cx| {
                                 this.section = Section::Shortcuts;
                                 cx.notify();
                             })),
                     ),
                 )
                 .child(
-                    small_button("reset-shortcuts", "Reset all to defaults".into(), &p).on_click(
+                    small_button("reset-shortcuts", "Reset all to defaults".into(), &p).clickable(
                         cx.listener(|this, _, window, cx| this.reset_shortcuts(window, cx)),
                     ),
                 )
@@ -782,7 +794,7 @@ impl SettingsTab {
                 .border_b_0()
                 .child(div().flex_grow(1.))
                 .child(
-                    small_button("reset-shortcuts", "Reset all to defaults".into(), &p).on_click(
+                    small_button("reset-shortcuts", "Reset all to defaults".into(), &p).clickable(
                         cx.listener(|this, _, window, cx| this.reset_shortcuts(window, cx)),
                     ),
                 )
@@ -812,7 +824,7 @@ impl Render for SettingsTab {
                     .when(on, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
                     .when(!on, |d| d.hover(|st| st.bg(p.hover)))
                     .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .clickable(cx.listener(move |this, _, _, cx| {
                         this.section = s;
                         cx.notify();
                     }))

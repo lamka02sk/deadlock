@@ -78,7 +78,11 @@ impl Conn for oracle::Connection {
         let vals = values(params);
         let refs: Vec<&dyn ToSql> = vals.iter().map(|v| v as &dyn ToSql).collect();
         let mut out = Vec::new();
-        for row in self.query(sql, &refs)? {
+        let mut stmt = self
+            .statement(sql)
+            .prefetch_rows(super::conn::DICTIONARY_ROWS)
+            .build()?;
+        for row in stmt.query(&refs)? {
             let row = row?;
             out.push(
                 row.sql_values()
@@ -111,7 +115,12 @@ impl Conn for oracle::Connection {
         columns: &mut dyn FnMut(Vec<Column>) -> bool,
         row: &mut dyn FnMut(Row) -> bool,
     ) -> Result<Option<u64>> {
-        let mut stmt = self.statement(text).build()?;
+        let rows = super::conn::fetch_rows();
+        let mut stmt = self
+            .statement(text)
+            .fetch_array_size(rows)
+            .prefetch_rows(rows)
+            .build()?;
         let named: Vec<(&str, &dyn ToSql)> = binds
             .iter()
             .map(|(n, v)| (n.as_str(), v as &dyn ToSql))

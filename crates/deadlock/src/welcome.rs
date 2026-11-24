@@ -12,6 +12,7 @@ use gpui_kit::{
 use crate::app::{OpenFolder, Registry, open_from_welcome, pick_folder};
 use crate::assets::{APP_LOGO, Icon, icon};
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, dot, icon_button};
 
 /// Key context for the window's own bindings (Ctrl+O).
@@ -84,7 +85,7 @@ impl Render for Welcome {
                 )
                 .h(px(32.))
                 .px(px(12.))
-                .on_click(|_, _, cx| pick_folder(cx)),
+                .clickable(|_, _, cx| pick_folder(cx)),
             );
 
         let recent = if rows.is_empty() {
@@ -159,7 +160,7 @@ fn recent_row(ix: usize, path: &Path, open: bool, day: String, p: &Palette) -> S
         .rounded(RADIUS)
         .whitespace_nowrap()
         .hover(|s| s.bg(p.hover))
-        .on_click(move |_, _, cx| open_from_welcome(&target, cx))
+        .clickable(move |_, _, cx| open_from_welcome(&target, cx))
         .child(icon(Icon::Folder, p.tx3))
         .child(
             div()
@@ -231,7 +232,7 @@ fn empty_state(window: &Window, p: &Palette) -> impl IntoElement {
 }
 
 /// `~/Code/x` for paths under the home folder.
-fn tilde(path: &Path) -> String {
+pub(crate) fn tilde(path: &Path) -> String {
     match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(PathBuf::from)) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!("~/{}", rest.display()),

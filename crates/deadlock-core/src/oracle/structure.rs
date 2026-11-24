@@ -107,7 +107,7 @@ pub(super) fn structure(conn: &Connection, t: &TableRef) -> Result<TableStructur
 }
 
 /// `CREATE TABLE …;` without storage clauses, as `DBMS_METADATA` writes it.
-fn ddl(conn: &Connection, kind: &str, t: &TableRef) -> Result<String> {
+pub(super) fn ddl(conn: &Connection, kind: &str, t: &TableRef) -> Result<String> {
     conn.execute(
         "BEGIN \
            DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'DEFAULT', TRUE); \

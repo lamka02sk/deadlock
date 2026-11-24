@@ -29,6 +29,7 @@ use tokio::sync::oneshot;
 use crate::app::Db;
 use crate::export::grouped;
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::ui::Clickable as _;
 
 type Choice = Entity<SelectState<Vec<SharedString>>>;
 
@@ -661,7 +662,7 @@ fn big_button(
             };
             d.hover(move |s| s.bg(bg).text_color(fg))
         })
-        .when(!enabled, |d| d.opacity(0.38))
+        .when(!enabled, |d| d.opacity(0.38).cursor_default())
         .child(label)
 }
 
@@ -707,7 +708,7 @@ impl Render for ImportTab {
                     .rounded(RADIUS)
                     .hover(|s| s.bg(p.hover))
                     .child("Choose…")
-                    .on_click(cx.listener(|this, _, _, cx| this.choose(cx))),
+                    .clickable(cx.listener(|this, _, _, cx| this.choose(cx))),
             );
         let fields = div()
             .flex()
@@ -743,6 +744,7 @@ impl Render for ImportTab {
         let header_box = Checkbox::new("import-header")
             .checked(self.header)
             .label("The first row holds column names")
+            .cursor_pointer()
             .on_click(cx.listener(|this, on: &bool, window, cx| {
                 this.header = *on;
                 this.read_header(window, cx);
@@ -998,6 +1000,7 @@ impl Render for ImportTab {
                 Checkbox::new("import-skip")
                     .checked(self.skip_bad)
                     .label("Skip rows that cannot be imported")
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, on: &bool, _, cx| {
                         this.skip_bad = *on;
                         cx.notify();
@@ -1006,7 +1009,7 @@ impl Render for ImportTab {
             .child(div().flex_grow(1.))
             .when(running, |d| {
                 d.child(
-                    big_button("import-cancel", "Cancel".into(), false, true, &p).on_click(
+                    big_button("import-cancel", "Cancel".into(), false, true, &p).clickable(
                         cx.listener(|this, _, _, cx| {
                             this.cancel_import();
                             cx.notify();
@@ -1017,7 +1020,7 @@ impl Render for ImportTab {
             .child(
                 big_button("import-go", import_label, true, ready.is_ok(), &p)
                     .when(ready.is_ok(), |d| {
-                        d.on_click(cx.listener(|this, _, window, cx| this.import(window, cx)))
+                        d.clickable(cx.listener(|this, _, window, cx| this.import(window, cx)))
                     })
                     .when(!reason.is_empty(), |d| {
                         d.tooltip(move |window, cx| {

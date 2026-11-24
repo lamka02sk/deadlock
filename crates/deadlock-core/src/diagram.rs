@@ -63,6 +63,8 @@ impl Diagram {
                     .children
                     .unwrap_or_default()
                     .into_iter()
+                    // A table also holds its Triggers group.
+                    .filter(|c| c.kind == NodeKind::Column)
                     .map(|c| Column {
                         name: c.name,
                         data_type: c.detail,

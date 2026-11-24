@@ -24,6 +24,7 @@ use crate::app::Db;
 use crate::assets::{Icon, icon};
 use crate::query::table::highlighted;
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
 /// How often the list refreshes, and the status bar's check runs.
@@ -436,6 +437,7 @@ fn confirmation(c: &ConnectionConfig, s: &Session, end: bool) -> (String, String
             )
         }
         (false, _) if redis => format!("Unblock client {}?", s.id),
+        (true, _) if s.this_app => format!("End session {}, which this app uses?", s.id),
         (true, true) => format!("End session {} on production connection {}?", s.id, c.name),
         (true, false) => format!("End session {}?", s.id),
         (false, true) => format!(
@@ -473,13 +475,22 @@ fn confirmation(c: &ConnectionConfig, s: &Session, end: bool) -> (String, String
     if redis && end {
         detail.push_str(&format!(" (CLIENT KILL ID {})", s.id));
     }
-    if s.deadlock {
+    if s.this_app && end {
+        detail.push_str(
+            "\n\nThis is one of this app's own sessions (the sidebar's or a tab's). Whatever it \
+             is running stops, and an open transaction in it is rolled back. Deadlock will \
+             reconnect automatically.",
+        );
+    } else if s.this_app {
+        detail.push_str("\n\nThis is one of this app's own sessions.");
+    } else if s.deadlock {
         detail.push_str("\n\nThis session belongs to Deadlock.");
     }
     if c.read_only {
         detail.push_str("\n\nThe connection is read-only; this changes no data.");
     }
     let label = match (end, redis) {
+        (true, _) if s.this_app => "End this app's session",
         (true, _) => "End session",
         (false, true) => "Unblock",
         (false, false) => "Cancel statement",
@@ -501,6 +512,7 @@ fn ellipsis(s: &str, n: usize) -> String {
 fn application(s: &Session) -> String {
     match (&s.application, s.own, s.deadlock) {
         (_, true, _) => "Deadlock (this screen)".into(),
+        _ if s.this_app => "Deadlock (this app)".into(),
         (Some(a), ..) => a.clone(),
         (None, _, true) => "Deadlock".into(),
         (None, ..) => String::new(),
@@ -750,7 +762,7 @@ fn header(t: &SessionsTab, cx: &mut Context<SessionsTab>) -> impl IntoElement {
                     } else {
                         "Pause refresh"
                     })
-                    .on_click(cx.listener(|t, _, _, cx| t.toggle_pause(cx))),
+                    .clickable(cx.listener(|t, _, _, cx| t.toggle_pause(cx))),
                 ),
         )
         .when_some(t.error.as_ref().filter(|_| t.snapshot.is_some()), |d, e| {
@@ -799,7 +811,7 @@ fn card(
         .flex()
         .flex_col()
         .gap(px(4.))
-        .on_click(cx.listener(move |t, _, _, cx| t.select(id, cx)))
+        .clickable(cx.listener(move |t, _, _, cx| t.select(id, cx)))
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -958,7 +970,7 @@ fn chips(snap: &Snapshot, filter: Filter, cx: &mut Context<SessionsTab>) -> impl
             .when(on, |b| b.bg(p.tx).border_color(p.tx).text_color(p.bg))
             .child(f.label())
             .child(count)
-            .on_click(cx.listener(move |t, _, _, cx| t.set_filter(f, cx)))
+            .clickable(cx.listener(move |t, _, _, cx| t.set_filter(f, cx)))
     });
     div()
         .flex()
@@ -1007,7 +1019,7 @@ fn grid(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> impl
                 ))
             })
             .id(("sessions-head", i))
-            .on_click(cx.listener(move |t, _, _, cx| t.set_sort(col, cx)))
+            .clickable(cx.listener(move |t, _, _, cx| t.set_sort(col, cx)))
     });
     let empty = t.visible.is_empty();
     let total = snap.sessions.len();
@@ -1070,8 +1082,10 @@ fn row(t: &SessionsTab, id: SessionId, cx: &mut Context<SessionsTab>) -> AnyElem
     let waiting = s.state == State::Waiting;
     let flagged = waiting || s.state == State::Blocked || blocks(snap, id);
     let selected = t.selected == Some(id);
-    // The detail pane says which one is this screen's.
-    let app = if s.own {
+    // The detail pane says which one is this screen's; a chip alone marks this app's.
+    let app = if s.this_app {
+        String::new()
+    } else if s.own {
         "Deadlock".into()
     } else {
         application(s)
@@ -1094,7 +1108,7 @@ fn row(t: &SessionsTab, id: SessionId, cx: &mut Context<SessionsTab>) -> AnyElem
         .text_size(data_size())
         .when(selected, |d| d.bg(p.sel))
         .when(!selected, |d| d.hover(|s| s.bg(p.panel)))
-        .on_click(cx.listener(move |t, _, _, cx| {
+        .clickable(cx.listener(move |t, _, _, cx| {
             t.selected = Some(id);
             cx.notify();
         }))
@@ -1102,8 +1116,12 @@ fn row(t: &SessionsTab, id: SessionId, cx: &mut Context<SessionsTab>) -> AnyElem
         .child(cell(Some(WIDTHS[1])).child(SharedString::from(s.user.clone())))
         .child(
             cell(Some(WIDTHS[2]))
+                .flex()
+                .items_center()
+                .gap(px(6.))
                 .when(s.deadlock || s.own, |d| d.text_color(p.tx2))
-                .child(SharedString::from(app)),
+                .child(SharedString::from(app))
+                .when(s.this_app, |d| d.child(this_app_chip(&p))),
         )
         .child(
             cell(Some(WIDTHS[3]))
@@ -1130,6 +1148,20 @@ fn row(t: &SessionsTab, id: SessionId, cx: &mut Context<SessionsTab>) -> AnyElem
         )
         .child(cell(None).child(SharedString::from(statement)))
         .into_any_element()
+}
+
+/// Marks a session this app holds (the sidebar's, a tab's).
+fn this_app_chip(p: &Palette) -> Div {
+    div()
+        .flex_none()
+        .px(px(5.))
+        .border_1()
+        .border_color(p.line)
+        .rounded(px(4.))
+        .text_size(small_size())
+        .text_color(p.tx2)
+        .font_family(crate::theme::UI_FONT)
+        .child("this app")
 }
 
 /// `.dl`: a 104 px term column and the value.
@@ -1358,7 +1390,7 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
                         "Cancel statement"
                     })
                     .when(can_cancel, |b| {
-                        b.on_click(cx.listener(move |t, _, window, cx| {
+                        b.clickable(cx.listener(move |t, _, window, cx| {
                             t.act(id, false, window, cx);
                         }))
                     }),
@@ -1370,6 +1402,8 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
                         !s.own,
                         if s.own {
                             "This screen's own session cannot be ended here"
+                        } else if s.this_app {
+                            "One of this app's sessions (KILL); Deadlock reconnects it"
                         } else {
                             "Close the session (KILL); an open transaction rolls back"
                         },
@@ -1379,7 +1413,7 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
                     .text_color(p.danger)
                     .child("End session")
                     .when(!s.own, |b| {
-                        b.on_click(cx.listener(move |t, _, window, cx| {
+                        b.clickable(cx.listener(move |t, _, window, cx| {
                             t.act(id, true, window, cx);
                         }))
                     }),
@@ -1401,7 +1435,7 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
                                 .text_color(p.link)
                                 .hover(|s| s.text_color(p.tx))
                                 .child(text(format!("Show session {b}")))
-                                .on_click(cx.listener(move |t, _, _, cx| t.select(b, cx))),
+                                .clickable(cx.listener(move |t, _, _, cx| t.select(b, cx))),
                         )
                     }),
             )
@@ -1439,7 +1473,7 @@ fn slow_log(
             )
             .child("Reset")
             .when(!log.is_empty(), |b| {
-                b.on_click(cx.listener(|t, _, window, cx| t.reset_slow_log(window, cx)))
+                b.clickable(cx.listener(|t, _, window, cx| t.reset_slow_log(window, cx)))
             }),
         );
     let line = |e: &deadlock_core::sessions::SlowEntry| {
@@ -1490,7 +1524,7 @@ fn deadlock_section(t: &SessionsTab, cx: &mut Context<SessionsTab>) -> impl Into
         .px(px(16.))
         .font_weight(FontWeight::MEDIUM)
         .hover(|s| s.bg(p.hover))
-        .on_click(cx.listener(|t, _, _, cx| t.toggle_deadlock(cx)))
+        .clickable(cx.listener(|t, _, _, cx| t.toggle_deadlock(cx)))
         .tooltip(|window, cx| Tooltip::new("From SHOW ENGINE INNODB STATUS").build(window, cx))
         .child(icon(
             if d.open {
@@ -1638,7 +1672,7 @@ fn deadlock_section(t: &SessionsTab, cx: &mut Context<SessionsTab>) -> impl Into
                                     } else {
                                         "Show the server's text"
                                     })
-                                    .on_click(cx.listener(|t, _, _, cx| {
+                                    .clickable(cx.listener(|t, _, _, cx| {
                                         t.deadlock.raw = !t.deadlock.raw;
                                         cx.notify();
                                     })),
@@ -1691,6 +1725,7 @@ mod tests {
             holds: Vec::new(),
             own: false,
             deadlock: false,
+            this_app: false,
             age: None,
         }
     }

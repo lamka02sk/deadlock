@@ -41,6 +41,12 @@ pub struct ProjectState {
     /// The History panel's width, once the user changed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_width: Option<f32>,
+    /// The Files panel is open.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub files_open: bool,
+    /// The Files panel's width, once the user changed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_width: Option<f32>,
 }
 
 /// An editor tab as saved in `state.json`. Every tab is bound to a connection.
@@ -295,6 +301,8 @@ mod tests {
             },
         ];
         project.state.active_tab = Some(2);
+        project.state.files_open = true;
+        project.state.files_width = Some(300.);
         project.save_state().unwrap();
         let again = Project::open(dir.path()).unwrap();
         assert_eq!(again.state, project.state);

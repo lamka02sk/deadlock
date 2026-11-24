@@ -1,10 +1,15 @@
 //! A project window: toolbar, connections sidebar, tab strip, main area and status bar.
 
+mod complete;
 mod config;
 mod diagram;
+mod edit;
+mod everywhere;
+mod files;
 mod history;
 mod import;
 mod keys;
+mod objects;
 mod sessions;
 mod settings;
 mod sidebar;
@@ -13,14 +18,16 @@ pub(crate) use history::history_cleared;
 mod tabs;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use deadlock_core::connection::{ConnectionConfig, Environment, keychain, new_id};
-use deadlock_core::driver::Driver;
+use deadlock_core::driver::{Driver, Link};
 use deadlock_core::ssh::{SshAuth, TunnelError};
 
 use crate::connection_form::{Failure, ask_trust, try_connect};
+use crate::ui::Clickable as _;
 use deadlock_core::project::Project;
 use deadlock_core::schema::{Load, NodeId, Row, Tree};
 use gpui_kit::component::Selectable;
@@ -73,7 +80,14 @@ actions!(
         ExplainPlan,
         ExplainAnalyze,
         ToggleHistory,
-        OpenSettings
+        OpenSettings,
+        SearchEverywhere,
+        EverywherePrev,
+        EverywhereNext,
+        ToggleFiles,
+        FilterFiles,
+        RenameFile,
+        DeleteFile
     ]
 );
 
@@ -107,6 +121,8 @@ enum Front {
     Sessions(usize),
     Config(usize),
     Diagram(usize),
+    /// An object editor tab.
+    Object(usize),
     Import,
     Settings,
 }
@@ -118,13 +134,15 @@ pub struct Shell {
     tx_settled: bool,
     /// Pending table changes were just dealt with: the close in progress goes on.
     pending_settled: bool,
+    /// Unapplied object edits were just discarded: the close in progress goes on.
+    objects_settled: bool,
     tx_menu_open: bool,
     export_menu_open: bool,
     focus: FocusHandle,
     save: Option<Task<()>>,
     conns: HashMap<String, Conn>,
-    /// The connection the toolbar and status bar show.
-    active: Option<String>,
+    /// The project to switch this window to once the close checks pass.
+    switch_to: Option<std::path::PathBuf>,
     /// Passwords typed this session, for connections that keep none in the keychain.
     passwords: HashMap<String, String>,
     /// The New connection tab, while open.
@@ -137,6 +155,8 @@ pub struct Shell {
     configs: Vec<(Entity<crate::config::ConfigTab>, Subscription)>,
     /// Schema diagram tabs, one per connection, after the configuration tabs.
     diagrams: Vec<(Entity<crate::diagram::DiagramTab>, Subscription)>,
+    /// Object editor tabs, one per object, after the diagram tabs.
+    objects: Vec<(Entity<crate::object::ObjectTab>, Subscription)>,
     /// Sessions waiting on a lock, per connection, from the periodic check.
     waiting: HashMap<String, usize>,
     _watch: Task<()>,
@@ -158,6 +178,9 @@ pub struct Shell {
     list: UniformListScrollHandle,
     tree_focus: FocusHandle,
     search: Option<Search>,
+    /// The Search everywhere palette, while open.
+    everywhere: Option<everywhere::Everywhere>,
+    shift: everywhere::DoubleShift,
     prompt: Option<Prompt>,
     prompt_input: Entity<InputState>,
     prompt_ssh: Entity<InputState>,
@@ -173,6 +196,8 @@ pub struct Shell {
     history: Option<(Entity<crate::history::HistoryPanel>, Subscription)>,
     /// The Settings tab, while open.
     settings_tab: Option<Entity<crate::settings_tab::SettingsTab>>,
+    /// The Files panel's tree, filter, rename and watcher.
+    files: files::Files,
     _settings: Subscription,
     _bounds: Subscription,
     _prompt: Subscription,
@@ -211,18 +236,20 @@ impl Shell {
             window: window.window_handle(),
             tx_settled: false,
             pending_settled: false,
+            objects_settled: false,
             tx_menu_open: false,
             export_menu_open: false,
             focus,
             save: None,
             conns: HashMap::new(),
-            active: None,
+            switch_to: None,
             passwords: HashMap::new(),
             form: None,
             tabs: Vec::new(),
             sessions: Vec::new(),
             configs: Vec::new(),
             diagrams: Vec::new(),
+            objects: Vec::new(),
             waiting: HashMap::new(),
             _watch: Self::watch_waits(cx),
             front: Front::None,
@@ -238,6 +265,8 @@ impl Shell {
             list: UniformListScrollHandle::new(),
             tree_focus: cx.focus_handle(),
             search: None,
+            everywhere: None,
+            shift: everywhere::DoubleShift::default(),
             prompt: None,
             prompt_input,
             prompt_ssh,
@@ -247,6 +276,7 @@ impl Shell {
             history: None,
             import: None,
             settings_tab: None,
+            files: files::Files::new(cx),
             _settings: cx
                 .observe_global_in::<crate::settings::SettingsState>(window, |this, window, cx| {
                     this.apply_settings(window, cx)
@@ -258,13 +288,66 @@ impl Shell {
         this.rows = this.tree.rows();
         this.load_cache(cx);
         this.restore_tabs(window, cx);
+        if this.project.state.files_open {
+            this.watch_files(cx);
+        }
         let shell = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             shell
-                .update(cx, |this, cx| this.should_close(window, cx))
+                .update(cx, |this, cx| this.close(window, cx))
                 .unwrap_or(true)
         });
         this
+    }
+
+    /// The close button and Quit: closes the window rather than switching it.
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.switch_to = None;
+        self.should_close(window, cx)
+    }
+
+    /// Ends the close checks: switches the window to the chosen project, or closes it.
+    fn finish_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.switch_to.take() else {
+            window.remove_window();
+            return;
+        };
+        let handle = self.window;
+        // Deferred: replacing the window's root cannot happen inside its own update.
+        cx.defer(move |cx| {
+            if let Err(e) = crate::app::switch_project(handle, &path, cx) {
+                eprintln!("deadlock: cannot open {}: {e:#}", path.display());
+            }
+        });
+    }
+
+    /// Opens a project picked in the project menu: in this window, or in a new one.
+    fn pick_project(
+        &mut self,
+        path: std::path::PathBuf,
+        new_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switcher_open = false;
+        cx.notify();
+        let open = cx
+            .global::<crate::app::Registry>()
+            .projects
+            .contains_key(&path);
+        if new_window || open {
+            // Deferred: focusing a window cannot happen inside its own update.
+            cx.defer(move |cx| {
+                if let Err(e) = crate::app::open_project(&path, false, cx) {
+                    eprintln!("deadlock: cannot open {}: {e:#}", path.display());
+                }
+            });
+            return;
+        }
+        self.switch_to = Some(path);
+        if self.should_close(window, cx) {
+            self.finish_close(window, cx);
+        }
     }
 
     /// Asks about open transactions, then unsaved files, before the window closes.
@@ -283,7 +366,7 @@ impl Shell {
                 |this, window, cx| {
                     this.pending_settled = true;
                     if this.should_close(window, cx) {
-                        window.remove_window();
+                        this.finish_close(window, cx);
                     }
                 },
             );
@@ -299,12 +382,44 @@ impl Shell {
                 |this, window, cx| {
                     this.tx_settled = true;
                     if this.should_close(window, cx) {
-                        window.remove_window();
+                        this.finish_close(window, cx);
                     }
                 },
             );
             return false;
         }
+        let objects = self.dirty_objects(cx);
+        if !objects.is_empty() && !std::mem::take(&mut self.objects_settled) {
+            let answer = crate::dialog::ask(
+                window,
+                cx,
+                crate::dialog::Ask::new(
+                    "Discard the unapplied object changes before closing?",
+                    &["Discard", "Cancel"],
+                )
+                .text(format!(
+                    "{} have edits that were not applied.",
+                    objects.join(", ")
+                )),
+            );
+            let handle = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                if answer.await != Some(0) {
+                    return;
+                }
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.objects_settled = true;
+                        if this.should_close(window, cx) {
+                            this.finish_close(window, cx);
+                        }
+                    })
+                });
+            })
+            .detach();
+            return false;
+        }
+        self.objects_settled = false;
         let dirty = self.dirty_files(cx);
         if dirty.is_empty() {
             return true;
@@ -335,7 +450,9 @@ impl Shell {
                 .unwrap_or(false);
             if close {
                 let _ = this.update(cx, |this, _| this.may_close = true);
-                let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    this.update(cx, |this, cx| this.finish_close(window, cx))
+                });
             }
         })
         .detach();
@@ -356,16 +473,97 @@ impl Shell {
 
     /// Opens the New connection tab, or keeps the one that is open.
     fn new_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.form.is_none() {
-            let form = cx.new(|cx| ConnectionForm::new(window, cx));
-            let sub = cx.subscribe(&form, Self::on_form);
-            self.form = Some((form, sub));
+        self.open_form(None, false, window, cx);
+    }
+
+    /// Opens the form on saved connection `id`: an edit, or a new copy (`editing` off).
+    pub(super) fn edit_connection(
+        &mut self,
+        id: &str,
+        editing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.config(id).cloned() else {
+            return;
+        };
+        self.open_form(Some(config), editing, window, cx);
+    }
+
+    /// The single form tab: kept when it already shows the same target, else replaced.
+    fn open_form(
+        &mut self,
+        source: Option<ConnectionConfig>,
+        editing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = source.as_ref().filter(|_| editing).map(|c| c.id.clone());
+        let same = self.form.as_ref().is_some_and(|(f, _)| {
+            let open = f.read(cx).editing().map(|c| &c.id);
+            match (&source, &target) {
+                (None, _) => open.is_none(),
+                (Some(_), Some(id)) => open == Some(id),
+                // A duplicate always starts from the connection picked.
+                (Some(_), None) => false,
+            }
+        });
+        if !same {
+            let form = cx.new(|cx| ConnectionForm::new(source.as_ref(), editing, window, cx));
+            let sub = cx.subscribe_in(&form, window, Self::on_form);
+            self.form = Some((form.clone(), sub));
+            if let Some(id) = target {
+                self.provide_known_password(&id, form, cx);
+            }
         }
         self.front = Front::Form;
         cx.notify();
     }
 
-    fn on_form(&mut self, _: Entity<ConnectionForm>, event: &FormEvent, cx: &mut Context<Self>) {
+    /// Hands the edit form the stored password, so Test connection works unchanged.
+    fn provide_known_password(
+        &mut self,
+        id: &str,
+        form: Entity<ConnectionForm>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(p) = self.passwords.get(id) {
+            form.update(cx, |f, _| f.known_password = Some(p.clone()));
+            return;
+        }
+        if !self.config(id).is_some_and(|c| c.keychain) {
+            return;
+        }
+        let (root, id) = (self.project.root().to_owned(), id.to_owned());
+        let rx = cx
+            .global::<Db>()
+            .0
+            .spawn_blocking(move || keychain::load(&root, &id));
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(p))) = rx.await {
+                form.update(cx, |f, _| f.known_password = Some(p));
+            }
+        })
+        .detach();
+    }
+
+    fn on_form(
+        &mut self,
+        _: &Entity<ConnectionForm>,
+        event: &FormEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let FormEvent::Saved {
+            config,
+            password,
+            ssh_secret,
+        } = event
+        {
+            let (config, password, ssh_secret) =
+                ((**config).clone(), password.clone(), ssh_secret.clone());
+            return self.save_edit(config, password, ssh_secret, window, cx);
+        }
         if let FormEvent::Connected {
             config,
             password,
@@ -397,12 +595,16 @@ impl Shell {
             }
             self.conns
                 .insert(id.clone(), Conn::Connected(Arc::clone(driver)));
-            self.active = Some(id.clone());
+            self.follow_link(&id, cx);
             self.tree_connections();
             self.tree.expanded.insert(vec![id.clone()]);
             self.selected = Some(vec![id.clone()]);
             self.reload(&id, cx);
         }
+        self.close_form(cx);
+    }
+
+    fn close_form(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         if self.front == Front::Form {
             self.front = match self.tabs.len() {
@@ -413,10 +615,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// Makes `id` the active connection, connecting it when it is not connected. The
-    /// front file tab moves to it, once its open transaction is dealt with.
-    fn activate(&mut self, id: &str, connect_now: bool, cx: &mut Context<Self>) {
-        self.switcher_open = false;
+    /// Moves the front file tab to connection `id`, once its open transaction is dealt
+    /// with.
+    fn activate(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(tab) = self.moving_front(id, cx) {
             let question = format!(
                 "Commit or roll back before moving {} to another connection?",
@@ -424,25 +625,13 @@ impl Shell {
             );
             let id = id.to_owned();
             self.settle(vec![tab], question, cx, move |this, _, cx| {
-                this.activate_now(&id, connect_now, cx);
+                this.rebind_front(&id, cx);
+                cx.notify();
             });
             cx.notify();
             return;
         }
-        self.activate_now(id, connect_now, cx);
-    }
-
-    fn activate_now(&mut self, id: &str, connect_now: bool, cx: &mut Context<Self>) {
-        self.active = Some(id.to_owned());
         self.rebind_front(id, cx);
-        if connect_now
-            && !matches!(
-                self.conns.get(id),
-                Some(Conn::Connecting | Conn::Connected(_))
-            )
-        {
-            self.connect(id, cx);
-        }
         cx.notify();
     }
 
@@ -570,6 +759,7 @@ impl Shell {
                 // Kept for the editor tabs' own sessions.
                 self.passwords.insert(id.clone(), password);
                 self.conns.insert(id.clone(), Conn::Connected(driver));
+                self.follow_link(&id, cx);
                 self.resume_tabs(&id, None, cx);
                 self.tree.status.remove(&vec![id.clone()]);
                 if let Some(keep) = keep {
@@ -588,6 +778,56 @@ impl Shell {
                 self.resume_tabs(&id, Some(&e), cx);
                 self.conns.insert(id, Conn::Failed(e));
             }
+        }
+        // Search everywhere may be waiting for this server.
+        self.run_everywhere(cx);
+        self.rebuild(cx);
+    }
+
+    /// Follows connection `id`'s reconnects: the dot and status bar show them, and one
+    /// that failed for good turns the connection failed, so connecting again works.
+    fn follow_link(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(Conn::Connected(d)) = self.conns.get(id) else {
+            return;
+        };
+        let Some(mut rx) = d.link() else {
+            return;
+        };
+        let id = id.to_owned();
+        cx.spawn(async move |this, cx| {
+            while rx.changed().await.is_ok() {
+                let link = rx.borrow_and_update().clone();
+                let current = this.update(cx, |this, cx| {
+                    // Only while this driver is still the connection's.
+                    let current = matches!(
+                        this.conns.get(&id),
+                        Some(Conn::Connected(d)) if d.link().is_some_and(|l| l.same_channel(&rx))
+                    );
+                    if current {
+                        this.link_changed(&id, link, cx);
+                    }
+                    current
+                });
+                if !matches!(current, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn link_changed(&mut self, id: &str, link: Link, cx: &mut Context<Self>) {
+        let Link::Lost(e) = link else {
+            cx.notify();
+            return;
+        };
+        let e = format!("the connection was lost, and reconnecting failed: {e}");
+        self.tree
+            .status
+            .insert(vec![id.to_owned()], Load::Failed(e.clone()));
+        if let Some(Conn::Connected(d)) = self.conns.insert(id.to_owned(), Conn::Failed(e)) {
+            // The driver closes its socket on the runtime, not the UI thread.
+            drop(cx.global::<Db>().0.spawn(async move { drop(d) }));
         }
         self.rebuild(cx);
     }
@@ -688,6 +928,7 @@ impl Shell {
     /// `MySQL 8.4`, `connecting…` or `not connected`, as the sidebar shows it.
     fn state_label(&self, id: &str) -> String {
         match self.conns.get(id) {
+            Some(Conn::Connected(d)) if reconnecting(d) => "reconnecting…".into(),
             Some(Conn::Connected(d)) => short_version(d.server_version()),
             Some(Conn::Connecting) => "connecting…".into(),
             Some(Conn::Failed(_)) => "failed".into(),
@@ -721,18 +962,29 @@ impl Render for Shell {
         }
         let history = self.project.state.history_open.then(|| {
             let panel = self.history_panel(window, cx);
-            let current = self
-                .front_tab()
-                .and_then(|t| t.read(cx).connection.as_ref().map(|c| c.id.clone()))
-                .or_else(|| self.active.clone());
+            let current = self.active(cx);
             panel.update(cx, |p, cx| p.set_current(current, cx));
             panel
         });
         let history_width = px(self.project.state.history_width.unwrap_or(history::WIDTH));
+        self.focus_rename(window, cx);
+        let files_open = self.project.state.files_open;
+        let files_panel = files_open.then(|| files::panel(self, cx));
+        let files_width = px(self.project.state.files_width.unwrap_or(files::WIDTH));
         let shell = cx.entity().downgrade();
         div()
             .key_context("Shell")
             .track_focus(&self.focus)
+            .on_modifiers_changed(cx.listener(Self::on_modifiers))
+            .capture_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, _, _| {
+                if !e.keystroke.is_modifier_key() {
+                    this.shift.interrupt();
+                }
+            }))
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.shift.interrupt()))
+            .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| {
+                this.open_everywhere(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(
                 cx.listener(|this, _: &SearchObjects, window, cx| this.open_search(window, cx)),
@@ -750,7 +1002,16 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &NewQuery, window, cx| this.new_query(window, cx)))
             .on_action(cx.listener(|this, _: &OpenFile, window, cx| this.open_file(window, cx)))
-            .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save_front(cx)))
+            .on_action(cx.listener(|this, _: &SaveFile, window, cx| {
+                // In an object editor, Save applies.
+                if let Front::Object(i) = this.front
+                    && let Some((tab, _)) = this.objects.get(i)
+                {
+                    tab.clone().update(cx, |t, cx| t.apply(window, cx));
+                } else {
+                    this.save_front(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &RunStatement, _, cx| {
                 this.run_front(crate::query::Scope::Caret, cx)
             }))
@@ -770,6 +1031,12 @@ impl Render for Shell {
             )
             .on_action(
                 cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleFiles, window, cx| this.toggle_files(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FilterFiles, window, cx| this.filter_files(window, cx)),
             )
             .relative()
             .size_full()
@@ -797,20 +1064,35 @@ impl Render for Shell {
                                 .fixed()
                                 .children(history),
                         )
+                        .child(
+                            resizable_panel()
+                                .visible(files_open)
+                                .size(files_width)
+                                .size_range(px(200.)..px(480.))
+                                .fixed()
+                                .children(files_panel),
+                        )
                         .on_resize(move |state, _, cx| {
-                            let Some(&w) = state.read(cx).sizes().get(2) else {
-                                return;
-                            };
+                            let sizes = state.read(cx).sizes().clone();
                             let _ = shell.update(cx, |this, cx| {
-                                if this.project.state.history_open {
-                                    this.project.state.history_width = Some(f32::from(w));
-                                    this.schedule_save(cx);
+                                let s = &mut this.project.state;
+                                if s.history_open
+                                    && let Some(&w) = sizes.get(2)
+                                {
+                                    s.history_width = Some(f32::from(w));
                                 }
+                                if s.files_open
+                                    && let Some(&w) = sizes.get(3)
+                                {
+                                    s.files_width = Some(f32::from(w));
+                                }
+                                this.schedule_save(cx);
                             });
                         }),
                 ),
             )
             .child(status_bar(self, &p, cx))
+            .children(everywhere::palette(self, cx))
             .when_some(self.prompt.as_ref(), |d, prompt| {
                 d.child(password_prompt(self, prompt, cx))
             })
@@ -898,6 +1180,7 @@ fn password_prompt(shell: &Shell, prompt: &Prompt, cx: &mut Context<Shell>) -> i
                     Checkbox::new("prompt-keychain")
                         .checked(prompt.keep)
                         .label("Keep the password in the system keychain")
+                        .cursor_pointer()
                         .on_click(cx.listener(|this, checked: &bool, _, cx| {
                             if let Some(p) = &mut this.prompt {
                                 p.keep = *checked;
@@ -913,12 +1196,12 @@ fn password_prompt(shell: &Shell, prompt: &Prompt, cx: &mut Context<Shell>) -> i
                         .child(
                             button("prompt-cancel", Kind::Outline, true, "Cancel (Esc)", cx)
                                 .child("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_prompt(cx))),
+                                .clickable(cx.listener(|this, _, _, cx| this.cancel_prompt(cx))),
                         )
                         .child(
                             button("prompt-connect", Kind::Primary, true, "Connect (Enter)", cx)
                                 .child("Connect")
-                                .on_click(cx.listener(|this, _, _, cx| this.submit_password(cx))),
+                                .clickable(cx.listener(|this, _, _, cx| this.submit_password(cx))),
                         ),
                 ),
         )
@@ -940,8 +1223,14 @@ fn short_version(full: &str) -> String {
     format!("{product} {}", short.join(".")).trim().to_owned()
 }
 
+/// The connection lost its session and is opening a new one.
+fn reconnecting(d: &Arc<dyn Driver>) -> bool {
+    d.link().is_some_and(|l| *l.borrow() == Link::Reconnecting)
+}
+
 fn state_dot(conn: Option<&Conn>, p: &Palette) -> Hsla {
     match conn {
+        Some(Conn::Connected(d)) if reconnecting(d) => p.warn,
         Some(Conn::Connected(_)) => p.ok,
         Some(Conn::Failed(_)) => p.danger,
         Some(Conn::Connecting) | None => p.tx3,
@@ -980,54 +1269,40 @@ impl RenderOnce for Trigger {
     }
 }
 
-/// Active connection with its state dot and default schema; opens the list.
+/// The project's name; opens the list of recent projects. A pick switches this window
+/// to it; Ctrl+click (Cmd+click) or the row's button opens it in a new window.
 fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
     let p = *cx.global::<Palette>();
-    let active = shell.active.as_deref().and_then(|id| shell.config(id));
-    let color = state_dot(active.and_then(|c| shell.conns.get(&c.id)), &p);
-    let trigger = button("connection", Kind::Outline, true, "", cx)
-        .child(dot(color))
+    let trigger = button("project", Kind::Outline, true, "", cx)
         .child(
             div()
                 .font_weight(FontWeight::MEDIUM)
-                .child(SharedString::from(
-                    active.map_or("No connection".into(), |c| c.name.clone()),
-                )),
+                .child(SharedString::from(shell.project.name())),
         )
-        .when(
-            active.is_some_and(|c| c.environment == Environment::Production),
-            |b| b.child(production_marker(&p)),
-        )
-        .when_some(active.filter(|c| !c.database.is_empty()), |b, c| {
-            b.child(
-                div()
-                    .text_color(p.tx3)
-                    .child(SharedString::from(c.database.clone())),
-            )
-        })
         .child(button_icon(
-            "connection",
+            "project",
             Icon::ChevronDown,
             Kind::Outline,
             true,
             cx,
         ));
 
-    let items: Vec<(String, String, Hsla, String, bool)> = shell
-        .project
-        .config
-        .connections
+    let root = shell.project.root();
+    let items: Vec<(PathBuf, bool)> = cx
+        .global::<crate::app::Registry>()
+        .recent
+        .entries()
         .iter()
-        .map(|c| {
-            (
-                c.id.clone(),
-                c.name.clone(),
-                state_dot(shell.conns.get(&c.id), &p),
-                shell.state_label(&c.id),
-                c.environment == Environment::Production,
-            )
-        })
+        .map(|e| (e.path.clone(), e.path == root))
         .collect();
+    let new_window = format!(
+        "Open in a new window ({}+click)",
+        if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        }
+    );
     let this = cx.entity().downgrade();
     Popover::new("switcher")
         .p(px(4.))
@@ -1037,36 +1312,49 @@ fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> 
             this.switcher_open = *open;
             cx.notify();
         }))
-        .trigger(Trigger(
-            trigger,
-            shell.switcher_open,
-            "Switch connection or schema",
-        ))
-        .content(move |_, _, _| {
-            let rows =
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, (id, name, color, label, production))| {
-                        let (this, id) = (this.clone(), id.clone());
-                        div()
-                            .id(("switch", ix))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .h(row_height())
-                            .px(px(8.))
-                            .rounded(RADIUS)
-                            .whitespace_nowrap()
-                            .hover(|s| s.bg(p.hover))
-                            .on_click(move |_, _, cx| {
-                                let _ = this.update(cx, |this, cx| this.activate(&id, true, cx));
-                            })
-                            .child(dot(*color))
-                            .child(SharedString::from(name.clone()))
-                            .when(*production, |d| d.child(production_marker(&p)))
-                            .child(type_label(label, &p))
+        .trigger(Trigger(trigger, shell.switcher_open, "Switch project"))
+        .content(move |_, _, cx| {
+            let rows = items.iter().enumerate().map(|(ix, (path, current))| {
+                let name = deadlock_core::project::folder_name(path);
+                let place = crate::welcome::tilde(path);
+                let (this, pick) = (this.clone(), path.clone());
+                let (that, path) = (this.clone(), path.clone());
+                let open_new = icon_button(
+                    "new-window",
+                    Icon::Export,
+                    None,
+                    Kind::Ghost,
+                    true,
+                    new_window.clone(),
+                    cx,
+                )
+                .clickable(move |_, window, cx| {
+                    cx.stop_propagation();
+                    let _ = that.update(cx, |this, cx| {
+                        this.pick_project(path.clone(), true, window, cx);
                     });
+                });
+                div()
+                    .id(("switch", ix))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(row_height())
+                    .pl(px(8.))
+                    .rounded(RADIUS)
+                    .whitespace_nowrap()
+                    .when(*current, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
+                    .when(!*current, |d| d.hover(|s| s.bg(p.hover)))
+                    .clickable(move |e, window, cx| {
+                        let new = e.modifiers().control || e.modifiers().platform;
+                        let _ = this.update(cx, |this, cx| {
+                            this.pick_project(pick.clone(), new, window, cx);
+                        });
+                    })
+                    .child(SharedString::from(name))
+                    .child(type_label(&place, &p))
+                    .child(open_new)
+            });
             div()
                 .flex()
                 .flex_col()
@@ -1076,7 +1364,7 @@ fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> 
                         div()
                             .p(px(8.))
                             .text_color(p.tx3)
-                            .child("No connections yet."),
+                            .child("No recent projects."),
                     )
                 })
                 .children(rows)
@@ -1184,6 +1472,7 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
     });
     let import = shell.import_target(cx);
     let k = |id: &str| crate::keymap::label(id, cx);
+    let settings_tip = SharedString::from(format!("Settings ({})", k("settings")));
     let items = [
         tool(
             "new-query",
@@ -1196,7 +1485,7 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
             "console",
             Icon::Console,
             Some("Console"),
-            shell.active.is_some(),
+            shell.active(cx).is_some(),
             format!("Open console ({})", k("console")),
         ),
         tool(
@@ -1299,27 +1588,19 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
             true,
             format!("Query history ({})", k("history")),
         ),
+        Item::Separator,
+        tool(
+            "files",
+            Icon::PanelRight,
+            None,
+            true,
+            format!("Files panel ({})", k("files")),
+        ),
     ];
 
     // Widths from `.b`: 1 px border and 8 px padding a side, 16 px icon, 6 px gaps.
     let w = |text: &str, weight| text_width(window, text, weight);
-    let active = shell.active.as_deref().and_then(|id| shell.config(id));
-    let marker_w = |c: &ConnectionConfig| {
-        if c.environment == Environment::Production {
-            px(6. + 14.) + w("Production", FontWeight::MEDIUM)
-        } else {
-            px(0.)
-        }
-    };
-    let switcher_w = px(2. + 16. + 8. + 6. + 6. + 16.)
-        + active.map_or(px(0.), marker_w)
-        + w(
-            active.map_or("No connection", |c| c.name.as_str()),
-            FontWeight::MEDIUM,
-        )
-        + active
-            .filter(|c| !c.database.is_empty())
-            .map_or(px(0.), |c| px(6.) + w(&c.database, FontWeight::NORMAL));
+    let switcher_w = px(2. + 16. + 6. + 16.) + w(&shell.project.name(), FontWeight::MEDIUM);
     let mut total = px(24. + 32. + 9.) + switcher_w + px(4. * (items.len() + 2) as f32);
     let mut labels: Vec<(&str, Pixels)> = Vec::new();
     for item in &items {
@@ -1377,42 +1658,53 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
             } else {
                 tip
             };
-            let b = icon_button(id, icon, label, kind, enabled, tip, cx);
+            // `.b.pr`: the Files toggle is pressed while the panel is open.
+            let b = if id == "files" && shell.project.state.files_open {
+                button(id, kind, enabled, tip, cx)
+                    .bg(p.sel)
+                    .text_color(p.tx)
+                    .child(crate::assets::icon(icon, p.tx))
+            } else {
+                icon_button(id, icon, label, kind, enabled, tip, cx)
+            };
             let b = match id {
                 _ if !enabled => b,
-                "refresh" => b.on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                "refresh" => b.clickable(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 "new-query" => {
-                    b.on_click(cx.listener(|this, _, window, cx| this.new_query(window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.new_query(window, cx)))
                 }
                 "console" => {
-                    b.on_click(cx.listener(|this, _, window, cx| this.open_console(window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.open_console(window, cx)))
                 }
                 "open-file" => {
-                    b.on_click(cx.listener(|this, _, window, cx| this.open_file(window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.open_file(window, cx)))
                 }
-                "save" => b.on_click(cx.listener(|this, _, _, cx| this.save_front(cx))),
-                "run" => b.on_click(
+                "save" => b.clickable(cx.listener(|this, _, _, cx| this.save_front(cx))),
+                "run" => b.clickable(
                     cx.listener(|this, _, _, cx| this.run_front(crate::query::Scope::Caret, cx)),
                 ),
-                "stop" => b.on_click(cx.listener(|this, _, _, cx| this.stop_front(cx))),
+                "stop" => b.clickable(cx.listener(|this, _, _, cx| this.stop_front(cx))),
                 "explain" => {
-                    b.on_click(cx.listener(|this, _, _, cx| this.explain_front(false, cx)))
+                    b.clickable(cx.listener(|this, _, _, cx| this.explain_front(false, cx)))
                 }
-                "commit" => b.on_click(cx.listener(|this, _, _, cx| this.end_front_tx(true, cx))),
+                "commit" => b.clickable(cx.listener(|this, _, _, cx| this.end_front_tx(true, cx))),
                 "rollback" => {
-                    b.on_click(cx.listener(|this, _, _, cx| this.end_front_tx(false, cx)))
+                    b.clickable(cx.listener(|this, _, _, cx| this.end_front_tx(false, cx)))
                 }
                 "format" => {
-                    b.on_click(cx.listener(|this, _, window, cx| this.format_front(window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.format_front(window, cx)))
                 }
                 "export" => return export_menu(shell, b, cx),
-                "import" => b.on_click(cx.listener(|this, _, window, cx| {
+                "import" => b.clickable(cx.listener(|this, _, window, cx| {
                     if let Ok((id, table)) = this.import_target(cx) {
                         this.open_import(&id, table, window, cx);
                     }
                 })),
                 "history" => {
-                    b.on_click(cx.listener(|this, _, window, cx| this.toggle_history(window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.toggle_history(window, cx)))
+                }
+                "files" => {
+                    b.clickable(cx.listener(|this, _, window, cx| this.toggle_files(window, cx)))
                 }
                 _ => b,
             };
@@ -1434,7 +1726,18 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
         .bg(p.panel)
         .border_b_1()
         .border_color(p.line)
-        .child(img(APP_LOGO).size(px(24.)).flex_none().mr(px(8.)))
+        .child(
+            div()
+                .id("app-logo")
+                .flex_none()
+                .mr(px(8.))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(settings_tip.clone())
+                        .build(window, cx)
+                })
+                .child(img(APP_LOGO).size(px(24.)))
+                .clickable(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+        )
         .child(switcher(shell, cx))
         .child(separator(&p))
         .children(children)
@@ -1548,7 +1851,7 @@ fn tx_menu(
                     .whitespace_nowrap()
                     .when(m == mode, |d| d.bg(p.sel))
                     .hover(|s| s.bg(p.hover))
-                    .on_click(move |_, _, cx| {
+                    .clickable(move |_, _, cx| {
                         let _ = this.update(cx, |this, cx| this.set_front_tx_mode(m, cx));
                     })
                     .child(div().font_weight(FontWeight::MEDIUM).child(m.label()))
@@ -1559,19 +1862,32 @@ fn tx_menu(
         .into_any_element()
 }
 
-/// The warn-colored environment marker on production connections.
-pub(crate) fn production_marker(p: &Palette) -> Div {
-    div()
-        .flex_none()
-        .px(px(6.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(p.warn_line)
-        .bg(p.warn_bg)
-        .text_color(p.warn)
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
-        .child("Production")
+/// A tab's short environment badge text; Development shows none.
+fn env_tag(env: Environment) -> Option<&'static str> {
+    match env {
+        Environment::Production => Some("PROD"),
+        Environment::Staging => Some("STAGE"),
+        Environment::Development => None,
+    }
+}
+
+/// The environment marker on a tab: warn-colored PROD, neutral STAGE, nothing for dev.
+pub(crate) fn env_marker(env: Environment, p: &Palette) -> Option<Div> {
+    let tag = env_tag(env)?;
+    let prod = env == Environment::Production;
+    Some(
+        div()
+            .flex_none()
+            .px(px(6.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if prod { p.warn_line } else { p.line2 })
+            .when(prod, |d| d.bg(p.warn_bg))
+            .text_color(if prod { p.warn } else { p.tx2 })
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .child(tag),
+    )
 }
 
 fn main_area(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
@@ -1602,6 +1918,10 @@ fn main_area(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
             .diagrams
             .get(i)
             .map(|(t, _)| t.clone().into_any_element()),
+        Front::Object(i) => shell
+            .objects
+            .get(i)
+            .map(|(t, _)| t.clone().into_any_element()),
         Front::None => None,
     };
     let body = body.unwrap_or_else(|| {
@@ -1628,7 +1948,7 @@ fn main_area(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
                         "Settings ({})",
                         crate::keymap::label("settings", cx)
                     ))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+                    .clickable(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
             )
             .into_any_element()
     });
@@ -1642,9 +1962,14 @@ fn main_area(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement {
 }
 
 fn status_bar(shell: &Shell, p: &Palette, cx: &mut Context<Shell>) -> impl IntoElement {
-    let active = shell.active.as_deref().and_then(|id| shell.config(id));
+    let active = shell.active(cx);
+    let active = active.as_deref().and_then(|id| shell.config(id));
     let conn = active.and_then(|c| shell.conns.get(&c.id));
     let (label, version): (SharedString, Option<SharedString>) = match (active, conn) {
+        (Some(c), Some(Conn::Connected(d))) if reconnecting(d) => (
+            format!("Connection to {} was lost: reconnecting…", c.name).into(),
+            None,
+        ),
         (Some(c), Some(Conn::Connected(d))) => (
             format!("Connected to {}", c.name).into(),
             Some(d.server_version().to_owned().into()),
@@ -1712,7 +2037,7 @@ fn status_bar(shell: &Shell, p: &Palette, cx: &mut Context<Shell>) -> impl IntoE
                         .hover(|s| s.bg(p.hover))
                         .child(crate::assets::icon(Icon::Lock, p.warn))
                         .child(label)
-                        .on_click(cx.listener(move |this, _, window, cx| {
+                        .clickable(cx.listener(move |this, _, window, cx| {
                             this.open_sessions(&id, window, cx);
                         })),
                 )
@@ -1725,7 +2050,14 @@ fn status_bar(shell: &Shell, p: &Palette, cx: &mut Context<Shell>) -> impl IntoE
                 return d.children(t.rows_status(cx).map(|s| st().child(s)));
             }
             let (line, col) = t.position(cx);
-            d.child(st().child(format!("Line {line}, column {col}")))
+            let file = match &t.kind {
+                crate::query::Kind::File(Some(path)) => {
+                    Some(crate::files::shown_path(shell.project.root(), path))
+                }
+                _ => None,
+            };
+            d.children(file.map(|f| st().child(f)))
+                .child(st().child(format!("Line {line}, column {col}")))
                 .child(st().child("UTF-8"))
         })
 }

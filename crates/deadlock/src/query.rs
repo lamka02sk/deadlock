@@ -16,17 +16,17 @@ use deadlock_core::history::{self, Outcome};
 use deadlock_core::split;
 use gpui_kit::base::input::BlockId;
 use gpui_kit::component::input::{
-    Editor, EditorState, GutterDecorationCollection, InputEvent, RangeDecoration,
-    RangeDecorationCollection, RangeDecorationStyle, RopeExt as _,
+    Editor, EditorState, Enter, GutterDecorationCollection, IndentInline, InputEvent,
+    RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, RopeExt as _,
 };
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, ClipboardItem, Context, Entity,
-    EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
-    actions, canvas, div, px,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Context, Entity, EventEmitter,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, canvas,
+    div, px,
 };
 
 mod binds;
@@ -40,13 +40,15 @@ pub(crate) mod table;
 use inline::{BlockEvent, Body, ResultBlock};
 
 pub use table::{
-    AddRow, DeleteRows, EditCell, NextCell, PrevCell, SetDefault, SetNull, UndoChange, View,
+    AddRow, DeleteRows, EditCell, NextCell, PasteCells, PickDate, PrevCell, SetDefault, SetNull,
+    UndoChange, View,
 };
 
 use crate::app::{Db, HistoryDb};
 use crate::assets::{Icon, icon};
-use crate::results::{Grid, NextSet, duration, grid_text};
+use crate::results::{Grid, GridEvent, NextSet, duration, grid_actions, grid_text};
 use crate::theme::{MONO_FONT, Palette, editor_size, small_size, tab_height};
+use crate::ui::Clickable as _;
 
 actions!(query, [CopySelection]);
 
@@ -910,6 +912,8 @@ impl QueryTab {
                         "The server rolled back the open transaction: its changes are gone.".into(),
                         true,
                     );
+                    // A data view shows the rows as they are now.
+                    self.table_tx_ended(cx);
                 }
             }
             Err(e) => {
@@ -1063,20 +1067,18 @@ impl QueryTab {
                 .col_movable(false)
                 .sortable(true)
         });
-        self.grid_subs.push(
-            cx.subscribe(&table, |_, table, e: &TableEvent, cx| match e {
+        table.update(cx, |_, cx| Grid::track(cx));
+        self.grid_subs
+            .push(cx.subscribe(&table, |_, table, e: &TableEvent, cx| {
                 // The row number selects the whole row.
-                TableEvent::SelectCell(r, 0) => {
+                if let TableEvent::SelectCell(r, 0) = e {
                     let r = *r;
                     table.update(cx, |t, cx| t.set_selected_row(r, cx));
                 }
-                TableEvent::RightClickedCell(r, c) => {
-                    let cell = Some((*r, *c));
-                    table.update(cx, |t, _| t.delegate_mut().menu_cell = cell);
-                }
-                _ => {}
-            }),
-        );
+            }));
+        // The selection's count shows in the result header.
+        self.grid_subs
+            .push(cx.subscribe(&table, |_, _, _: &GridEvent, cx| cx.notify()));
         self.grid_subs.push(
             cx.subscribe(&table, |this, table, _: &crate::results::Ended, cx| {
                 if let Some(next) = table.update(cx, |t, _| t.delegate_mut().close()) {
@@ -1189,7 +1191,7 @@ impl QueryTab {
                 .px(px(8.))
                 .when(on, |d| d.bg(p.hover).text_color(p.tx))
                 .child(label)
-                .on_click(cx.listener(move |_, _, _, cx| cx.emit(TabEvent::ResultsInline(inline))))
+                .clickable(cx.listener(move |_, _, _, cx| cx.emit(TabEvent::ResultsInline(inline))))
         };
         div()
             .flex()
@@ -1482,17 +1484,6 @@ impl QueryTab {
                     cx.notify();
                 });
             }
-        }
-    }
-
-    fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        let Panel::Result(i) = self.panel else { return };
-        let Some(table) = self.results.get(i) else {
-            return;
-        };
-        let t = table.read(cx);
-        if let Some(text) = t.delegate().copy_text(t.selection()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 }
@@ -1910,17 +1901,33 @@ impl QueryTab {
                 .flex()
                 .items_center()
                 .justify_center()
-                .cursor_pointer()
                 .child(icon(Icon::Play, p.ok).size(px(12.)))
                 .tooltip(|window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new("Run this statement")
                         .build(window, cx)
                 })
-                .on_click(cx.listener(move |this, _, _, cx| this.run(Scope::At(start), cx)))
+                .clickable(cx.listener(move |this, _, _, cx| this.run(Scope::At(start), cx)))
         });
         let editor_area = div()
             .relative()
             .size_full()
+            // Tab accepts an open completion, like Enter; otherwise it indents.
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                let accepted = this.editor.update(cx, |e, cx| {
+                    e.completion_menu_state().open
+                        && e.route_overlay_action(
+                            Box::new(Enter {
+                                secondary: false,
+                                shift: false,
+                            }),
+                            window,
+                            cx,
+                        )
+                });
+                if accepted {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 Editor::new(&self.editor)
                     .bordered(false)
@@ -1953,7 +1960,7 @@ impl QueryTab {
                 true,
                 &p,
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .clickable(cx.listener(move |this, _, _, cx| {
                 this.toggle_panel(Panel::Result(i));
                 cx.notify();
             }))
@@ -1967,7 +1974,7 @@ impl QueryTab {
                     true,
                     &p,
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
+                .clickable(cx.listener(|this, _, _, cx| {
                     this.toggle_panel(Panel::Result(0));
                     cx.notify();
                 })),
@@ -1976,7 +1983,13 @@ impl QueryTab {
             tabs.collect()
         };
         let summary: Option<String> = match self.panel {
-            Panel::Result(i) => self.results.get(i).map(|t| t.read(cx).delegate().summary()),
+            Panel::Result(i) => self.results.get(i).map(|t| {
+                let g = t.read(cx).delegate();
+                match g.sel_status() {
+                    Some(s) => format!("{s} · {}", g.summary()),
+                    None => g.summary(),
+                }
+            }),
             Panel::Messages => self.took.map(|t| {
                 let n = self.messages.len();
                 let noun = if n == 1 { "statement" } else { "statements" };
@@ -2010,7 +2023,7 @@ impl QueryTab {
                             true,
                             &p,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .clickable(cx.listener(|this, _, _, cx| {
                             this.toggle_panel(Panel::Messages);
                             cx.notify();
                         })),
@@ -2024,7 +2037,7 @@ impl QueryTab {
                             &p,
                         )
                         .when(self.explained.is_some(), |d| {
-                            d.on_click(cx.listener(|this, _, _, cx| {
+                            d.clickable(cx.listener(|this, _, _, cx| {
                                 this.toggle_panel(Panel::Plan);
                                 cx.notify();
                             }))
@@ -2046,11 +2059,7 @@ impl QueryTab {
             Panel::Plan => plan::render(self, cx),
             Panel::Result(i) => match self.results.get(i) {
                 Some(table) => grid_text(
-                    div()
-                        .key_context("Results")
-                        .on_action(
-                            cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)),
-                        )
+                    grid_actions(div().key_context("Results"), table)
                         .size_full()
                         .text_color(p.tx)
                         .child(DataTable::new(table).bordered(false)),

@@ -1,5 +1,5 @@
 //! The New connection tab: database type list, the form, the address preview and
-//! Test connection / Save and connect.
+//! Test connection / Save and connect. Also edits a saved connection (Save).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,18 +9,20 @@ use deadlock_core::driver::{Driver, DriverError, connect};
 use deadlock_core::ssh::{self, HostKey, KnownHosts, SshAuth, SshConfig, TunnelError};
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::color_picker::{ColorPickerEvent, ColorPickerState, ColorSelect};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight,
     InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px, relative,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px, relative, white,
 };
 
 use crate::app::Db;
 use crate::assets::{Icon, icon};
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
 /// Sent to the shell, which owns the project's connections.
@@ -34,6 +36,18 @@ pub enum FormEvent {
         ssh_secret: Option<String>,
         driver: Arc<dyn Driver>,
     },
+    /// An edited connection, same id, not connected: the shell decides on reconnecting.
+    Saved {
+        config: Box<ConnectionConfig>,
+        /// `None`: the password field was left empty, so the stored one stays.
+        password: Option<String>,
+        ssh_secret: Option<String>,
+    },
+}
+
+/// A secret field's value: in an edit an empty field means "keep the stored one".
+fn typed_secret(value: &str, editing: bool) -> Option<String> {
+    (!(editing && value.is_empty())).then(|| value.to_owned())
 }
 
 /// A failed connect: an SSH host key to decide on, or the error text.
@@ -99,6 +113,10 @@ enum Status {
 type Choice = Entity<SelectState<Vec<&'static str>>>;
 
 pub struct ConnectionForm {
+    /// The saved connection being edited; `None` for a new one.
+    editing: Option<ConnectionConfig>,
+    /// The stored password, for Test connection while the field is left empty.
+    pub known_password: Option<String>,
     engine: Engine,
     name: Entity<InputState>,
     host: Entity<InputState>,
@@ -107,6 +125,10 @@ pub struct ConnectionForm {
     user: Entity<InputState>,
     password: Entity<InputState>,
     environment: Choice,
+    /// The tint as `#rrggbb`; `None` for no colour.
+    color: Option<String>,
+    /// The custom colour field; kept in step with `color`.
+    color_picker: Entity<ColorPickerState>,
     encryption: Choice,
     /// Oracle: whether the database field is a service name or a SID.
     connect_by: Choice,
@@ -129,8 +151,22 @@ pub struct ConnectionForm {
 impl EventEmitter<FormEvent> for ConnectionForm {}
 
 impl ConnectionForm {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let defaults = ConnectionConfig::new(Engine::Mysql);
+    /// A form prefilled from `source` (a duplicate when `editing` is off), or empty.
+    pub fn new(
+        source: Option<&ConnectionConfig>,
+        editing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let defaults = source
+            .cloned()
+            .unwrap_or_else(|| ConnectionConfig::new(Engine::Mysql));
+        let ssh = &defaults.ssh;
+        let unchanged = if editing {
+            "Unchanged (type to replace)"
+        } else {
+            ""
+        };
         let mut input = |value: &str, placeholder: &str, masked: bool| {
             let (value, placeholder) = (value.to_owned(), placeholder.to_owned());
             cx.new(|cx| {
@@ -140,27 +176,57 @@ impl ConnectionForm {
                     .masked(masked)
             })
         };
-        let name = input("", "e.g. shop_prod", false);
+        let name = match (source, editing) {
+            (Some(c), false) => format!("{} copy", c.name),
+            _ => defaults.name.clone(),
+        };
+        let name = input(&name, "e.g. shop_prod", false);
         let host = input(&defaults.host, "", false);
         let port = input(&defaults.port.to_string(), "", false);
-        let database = input("", "", false);
-        let user = input("", "", false);
-        let password = input("", "Enter password", true);
-        let ssh_host = input("", "e.g. bastion.example.com", false);
-        let ssh_port = input("22", "", false);
-        let ssh_user = input("", "", false);
-        let ssh_key = input("~/.ssh/id_ed25519", "", false);
-        let ssh_secret = input("", "", true);
+        let database = input(&defaults.database, "", false);
+        let user = input(&defaults.user, "", false);
+        let password = input("", if editing { unchanged } else { "Enter password" }, true);
+        let ssh_host = input(&ssh.host, "e.g. bastion.example.com", false);
+        let ssh_port = input(&ssh.port.to_string(), "", false);
+        let ssh_user = input(&ssh.user, "", false);
+        let key_file = if ssh.key_file.is_empty() {
+            "~/.ssh/id_ed25519"
+        } else {
+            &ssh.key_file
+        };
+        let ssh_key = input(key_file, "", false);
+        let ssh_secret = input("", unchanged, true);
         let mut choice = |labels: Vec<&'static str>, selected: usize| {
             cx.new(|cx| {
                 SelectState::new(labels, Some(IndexPath::default().row(selected)), window, cx)
             })
         };
-        let environment = choice(Environment::ALL.map(Environment::label).to_vec(), 0);
-        let encryption = choice(Encryption::ALL.map(Encryption::label).to_vec(), 1);
-        let connect_by = choice(vec!["Service name", "SID"], 0);
-        let driver = choice(vec!["Thin (built in)", "Thick (Oracle Instant Client)"], 0);
-        let ssh_auth = choice(SshAuth::ALL.map(SshAuth::label).to_vec(), 0);
+        let environment = choice(
+            Environment::ALL.map(Environment::label).to_vec(),
+            Environment::ALL
+                .iter()
+                .position(|e| *e == defaults.environment)
+                .unwrap_or(0),
+        );
+        let encryption = choice(
+            Encryption::ALL.map(Encryption::label).to_vec(),
+            Encryption::ALL
+                .iter()
+                .position(|e| *e == defaults.encryption)
+                .unwrap_or(1),
+        );
+        let connect_by = choice(vec!["Service name", "SID"], usize::from(defaults.sid));
+        let driver = choice(
+            vec!["Thin (built in)", "Thick (Oracle Instant Client)"],
+            usize::from(defaults.thick),
+        );
+        let ssh_auth = choice(
+            SshAuth::ALL.map(SshAuth::label).to_vec(),
+            SshAuth::ALL
+                .iter()
+                .position(|a| *a == ssh.auth)
+                .unwrap_or(0),
+        );
         // The address preview and the status line follow every keystroke.
         let mut _subscriptions: Vec<Subscription> = [
             &name,
@@ -185,6 +251,25 @@ impl ConnectionForm {
             })
         })
         .collect();
+        let color = defaults
+            .color
+            .clone()
+            .filter(|c| crate::color::parse_hex(c).is_some());
+        let color_picker = cx.new(|cx| {
+            let state = ColorPickerState::new(window, cx);
+            match color.as_deref().and_then(crate::color::parse_hex) {
+                Some(c) => state.default_value(c),
+                None => state,
+            }
+        });
+        _subscriptions.push(cx.subscribe(
+            &color_picker,
+            |this: &mut Self, _, e: &ColorPickerEvent, cx| {
+                let ColorPickerEvent::Change(c) = e;
+                this.color = c.map(crate::color::to_hex);
+                cx.notify();
+            },
+        ));
         for s in [&environment, &encryption, &connect_by, &ssh_auth] {
             _subscriptions.push(cx.observe(s, |_, _, cx| cx.notify()));
         }
@@ -193,7 +278,9 @@ impl ConnectionForm {
             cx.notify();
         }));
         Self {
-            engine: Engine::Mysql,
+            editing: source.filter(|_| editing).cloned(),
+            known_password: None,
+            engine: defaults.engine,
             name,
             host,
             port,
@@ -201,12 +288,14 @@ impl ConnectionForm {
             user,
             password,
             environment,
+            color,
+            color_picker,
             encryption,
             connect_by,
             driver,
-            keychain: true,
-            read_only: false,
-            tunnel: false,
+            keychain: source.is_none_or(|c| c.keychain),
+            read_only: defaults.read_only,
+            tunnel: defaults.ssh_tunnel,
             ssh_host,
             ssh_port,
             ssh_user,
@@ -216,6 +305,51 @@ impl ConnectionForm {
             status: Status::Idle,
             _subscriptions,
         }
+    }
+
+    /// The None swatch and the palette; the chosen one carries a ring and a check.
+    fn swatches(&self, p: &Palette, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let all = std::iter::once(("None", None)).chain(
+            crate::color::PALETTE
+                .iter()
+                .map(|(name, hex)| (*name, Some(*hex))),
+        );
+        all.map(|(name, hex)| {
+            let on = self.color.as_deref().map(str::to_lowercase).as_deref() == hex;
+            let fill = hex.and_then(crate::color::parse_hex);
+            div()
+                .id(SharedString::from(format!("swatch-{name}")))
+                .size(px(24.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_2()
+                .border_color(if on { p.tx } else { p.line2 })
+                .when(hex.is_none(), |d| {
+                    d.child(icon(Icon::Close, p.tx3).size(px(12.)))
+                })
+                .when_some(fill, |d, c| {
+                    d.bg(c)
+                        .when(on, |d| d.child(icon(Icon::Commit, white()).size(px(12.))))
+                })
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(name).build(window, cx)
+                })
+                .clickable(cx.listener(move |this, _, window, cx| {
+                    this.color = hex.map(str::to_owned);
+                    this.color_picker.update(cx, |s, cx| {
+                        match hex.and_then(crate::color::parse_hex) {
+                            Some(c) => s.set_value(c, window, cx),
+                            None => s.clear_value(window, cx),
+                        }
+                    });
+                    cx.notify();
+                }))
+                .into_any_element()
+        })
+        .collect()
     }
 
     fn set_engine(&mut self, engine: Engine, window: &mut Window, cx: &mut Context<Self>) {
@@ -243,7 +377,13 @@ impl ConnectionForm {
             .and_then(|ix| all.get(ix.row).copied())
     }
 
-    /// The form as a connection. The id is assigned by the shell when saving.
+    /// The connection being edited, if any.
+    pub fn editing(&self) -> Option<&ConnectionConfig> {
+        self.editing.as_ref()
+    }
+
+    /// The form as a connection. A new one's id is assigned by the shell when saving;
+    /// an edit keeps the id.
     fn config(&self, cx: &App) -> ConnectionConfig {
         let host = Self::text(&self.host, cx);
         let name = Self::text(&self.name, cx);
@@ -255,6 +395,7 @@ impl ConnectionForm {
             user: Self::text(&self.user, cx),
             environment: Self::selected(&self.environment, &Environment::ALL, cx)
                 .unwrap_or_default(),
+            color: self.color.clone(),
             encryption: Self::selected(&self.encryption, &Encryption::ALL, cx).unwrap_or_default(),
             read_only: self.read_only,
             keychain: self.keychain,
@@ -276,6 +417,16 @@ impl ConnectionForm {
             } else {
                 SshConfig::default()
             },
+            id: self
+                .editing
+                .as_ref()
+                .map(|c| c.id.clone())
+                .unwrap_or_default(),
+            hidden_schemas: self
+                .editing
+                .as_ref()
+                .map(|c| c.hidden_schemas.clone())
+                .unwrap_or_default(),
             ..ConnectionConfig::new(self.engine)
         }
     }
@@ -289,7 +440,7 @@ impl ConnectionForm {
         if !config.ssh_tunnel || config.ssh.auth == SshAuth::Agent {
             return None;
         }
-        let secret = self.ssh_secret.read(cx).value().to_string();
+        let secret = typed_secret(&self.ssh_secret.read(cx).value(), self.editing.is_some())?;
         ssh::remember(&config.ssh, secret.clone());
         Some(secret)
     }
@@ -350,8 +501,19 @@ impl ConnectionForm {
             Ok(c) => c,
             Err(e) => return self.fail(e, cx),
         };
-        let password = self.password.read(cx).value().to_string();
+        let typed = typed_secret(&self.password.read(cx).value(), self.editing.is_some());
         let ssh_secret = self.ssh_secret(&config, cx);
+        if save && self.editing.is_some() {
+            cx.emit(FormEvent::Saved {
+                config: Box::new(config),
+                password: typed,
+                ssh_secret,
+            });
+            return;
+        }
+        let password = typed
+            .or_else(|| self.known_password.clone())
+            .unwrap_or_default();
         let (c, p) = (config.clone(), password.clone());
         let rx = cx.global::<Db>().0.spawn(async move {
             let started = Instant::now();
@@ -473,6 +635,7 @@ fn section(legend: &'static str, children: Vec<AnyElement>) -> gpui_kit::Div {
 impl Render for ConnectionForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.global::<Palette>();
+        let swatches = self.swatches(&p, cx);
         let engine = self.engine;
 
         let types = div()
@@ -506,7 +669,7 @@ impl Render for ConnectionForm {
                     .whitespace_nowrap()
                     .when(on, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
                     .when(!on, |d| d.hover(|s| s.bg(p.hover)))
-                    .on_click(
+                    .clickable(
                         cx.listener(move |this, _, window, cx| this.set_engine(e, window, cx)),
                     )
                     .child(e.label())
@@ -591,6 +754,7 @@ impl Render for ConnectionForm {
                 Checkbox::new("keychain")
                     .checked(keychain)
                     .label("Keep the password in the system keychain")
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         this.keychain = *checked;
                         cx.notify();
@@ -612,9 +776,25 @@ impl Render for ConnectionForm {
                         .flex_basis(px(200.)),
                 )
                 .into_any_element(),
+                field(
+                    "Color",
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .children(swatches)
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .child(ColorSelect::new(&self.color_picker).placeholder("Custom")),
+                        ),
+                )
+                .into_any_element(),
                 Checkbox::new("read-only")
                     .checked(read_only)
                     .label("Open read-only, so statements that change data are refused")
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         this.read_only = *checked;
                         cx.notify();
@@ -623,6 +803,7 @@ impl Render for ConnectionForm {
                 Checkbox::new("ssh")
                     .checked(self.tunnel)
                     .label("Connect through an SSH tunnel")
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         this.tunnel = *checked;
                         this.status = Status::Idle;
@@ -756,13 +937,18 @@ impl Render for ConnectionForm {
                             cx,
                         )
                         .child("Switch this connection to the Thick driver")
-                        .on_click(cx.listener(|this, _, window, cx| {
+                        .clickable(cx.listener(|this, _, window, cx| {
                             this.switch_to_thick(window, cx);
                         })),
                     ),
             ),
         };
         let big = |b: gpui_kit::Stateful<gpui_kit::Div>| b.h(px(32.)).px(px(12.));
+        let save_label = if self.editing.is_some() {
+            "Save"
+        } else {
+            "Save and connect"
+        };
         let actions = div()
             .flex()
             .flex_wrap()
@@ -776,7 +962,7 @@ impl Render for ConnectionForm {
                 big(button("test", Kind::Outline, !busy, "Test connection", cx))
                     .child("Test connection")
                     .when(!busy, |b| {
-                        b.on_click(
+                        b.clickable(
                             cx.listener(|this, _, window, cx| this.attempt(false, window, cx)),
                         )
                     }),
@@ -792,13 +978,13 @@ impl Render for ConnectionForm {
                     cx,
                 ))
                 .child("Cancel")
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(FormEvent::Cancel))),
+                .clickable(cx.listener(|_, _, _, cx| cx.emit(FormEvent::Cancel))),
             )
             .child(
-                big(button("save", Kind::Primary, !busy, "Save and connect", cx))
-                    .child("Save and connect")
+                big(button("save", Kind::Primary, !busy, save_label, cx))
+                    .child(save_label)
                     .when(!busy, |b| {
-                        b.on_click(
+                        b.clickable(
                             cx.listener(|this, _, window, cx| this.attempt(true, window, cx)),
                         )
                     }),
@@ -823,13 +1009,14 @@ impl Render for ConnectionForm {
                             .text_size(px(20.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .line_height(relative(1.2))
-                            .child(SharedString::from(format!("New {engine} connection"))),
+                            .child(SharedString::from(match &self.editing {
+                                Some(c) => format!("Edit {}", c.name),
+                                None => format!("New {engine} connection"),
+                            })),
                     )
-                    .child(
-                        div()
-                            .text_color(p.tx2)
-                            .child("Nothing is saved until you choose Save and connect."),
-                    ),
+                    .child(div().text_color(p.tx2).child(SharedString::from(format!(
+                        "Nothing is saved until you choose {save_label}."
+                    )))),
             )
             .child(
                 div()
@@ -855,5 +1042,18 @@ impl Render for ConnectionForm {
                 .overflow_y_scroll()
                 .child(form),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::typed_secret;
+
+    #[test]
+    fn empty_secret_keeps_the_stored_one_only_when_editing() {
+        assert_eq!(typed_secret("", true), None);
+        assert_eq!(typed_secret("s3cret", true), Some("s3cret".into()));
+        // A new connection may have an empty password.
+        assert_eq!(typed_secret("", false), Some(String::new()));
     }
 }

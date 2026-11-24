@@ -174,6 +174,7 @@ pub(super) async fn snapshot(conn: &mut Conn, mariadb: bool, own: u32) -> Result
                 })
                 .unwrap_or_default(),
             deadlock: application.as_deref() == Some(super::PROGRAM_NAME),
+            this_app: false,
             age: None,
             application,
             database: db,

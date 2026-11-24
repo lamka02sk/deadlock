@@ -26,6 +26,7 @@ use crate::app::Db;
 use crate::assets::{Icon, icon};
 use crate::query::table::highlighted;
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
 /// `.pr`: 34 px rows.
@@ -835,7 +836,7 @@ fn header(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                                             .tooltip(|window, cx| {
                                                 Tooltip::new("Copy the path").build(window, cx)
                                             })
-                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                            .clickable(cx.listener(move |_, _, _, cx| {
                                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                                     copy.clone(),
                                                 ));
@@ -856,7 +857,7 @@ fn header(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                             cx,
                         )
                         .child(SharedString::from(format!("Open {name}")))
-                        .on_click(cx.listener(move |_, _, _, cx| {
+                        .clickable(cx.listener(move |_, _, _, cx| {
                             cx.open_with_system(std::path::Path::new(&f));
                         })),
                     )
@@ -870,7 +871,7 @@ fn header(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                         cx,
                     )
                     .child("Reload from server")
-                    .on_click(cx.listener(|t, _, _, cx| t.reload(cx))),
+                    .clickable(cx.listener(|t, _, _, cx| t.reload(cx))),
                 ),
         )
         .when_some(t.error.as_ref().filter(|_| t.config.is_some()), |d, e| {
@@ -920,7 +921,7 @@ fn filters(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
             .when(on, |b| b.bg(p.tx).border_color(p.tx).text_color(p.bg))
             .child(f.label())
             .children(count)
-            .on_click(cx.listener(move |t, _, _, cx| t.set_filter(f, cx)))
+            .clickable(cx.listener(move |t, _, _, cx| t.set_filter(f, cx)))
     });
     div()
         .flex()
@@ -1018,7 +1019,7 @@ fn categories(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                 t.category == Some(c),
                 &p,
             )
-            .on_click(cx.listener(move |t, _, _, cx| t.set_category(Some(c), cx))),
+            .clickable(cx.listener(move |t, _, _, cx| t.set_category(Some(c), cx))),
         )
     });
     div()
@@ -1041,7 +1042,7 @@ fn categories(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                 t.category.is_none(),
                 &p,
             )
-            .on_click(cx.listener(|t, _, _, cx| t.set_category(None, cx))),
+            .clickable(cx.listener(|t, _, _, cx| t.set_category(None, cx))),
         )
         .children(rows)
 }
@@ -1084,7 +1085,7 @@ fn grid(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                 ))
             })
             .id(("config-head", i))
-            .on_click(cx.listener(move |t, _, _, cx| t.set_sort(col, cx)))
+            .clickable(cx.listener(move |t, _, _, cx| t.set_sort(col, cx)))
     });
     let empty = t.lines.is_empty();
     div()
@@ -1202,7 +1203,7 @@ fn line(t: &ConfigTab, l: Line, cx: &mut Context<ConfigTab>) -> AnyElement {
         .when(!selected && pending.is_none(), |d| {
             d.hover(|s| s.bg(p.panel))
         })
-        .on_click(cx.listener(move |t, _, window, cx| t.select(name.clone(), window, cx)))
+        .clickable(cx.listener(move |t, _, window, cx| t.select(name.clone(), window, cx)))
         .child(cell(widths(0)).child(SharedString::from(x.name.clone())))
         .child(value)
         .child(
@@ -1287,6 +1288,7 @@ fn editor(t: &ConfigTab, x: &ConfigParam, cx: &mut Context<ConfigTab>) -> AnyEle
                     Switch::new("config-switch")
                         .checked(on)
                         .color(p.blue)
+                        .cursor_pointer()
                         .on_change(cx.listener(|t, v: &bool, window, cx| {
                             let v = if *v { "ON" } else { "OFF" };
                             t.pick(NewValue::Set(v.into()), window, cx);
@@ -1326,7 +1328,7 @@ fn editor(t: &ConfigTab, x: &ConfigParam, cx: &mut Context<ConfigTab>) -> AnyEle
                             .when(on, |d| d.child(icon(Icon::Commit, p.link))),
                     )
                     .child(SharedString::from(v.clone()))
-                    .on_click(cx.listener(move |t, _, window, cx| {
+                    .clickable(cx.listener(move |t, _, window, cx| {
                         let next = if set {
                             list.iter()
                                 .filter(|o| {
@@ -1400,7 +1402,7 @@ fn editor(t: &ConfigTab, x: &ConfigParam, cx: &mut Context<ConfigTab>) -> AnyEle
                         .when(!ok, |d| d.opacity(0.38))
                         .child(*label)
                         .when(ok && !on, |d| {
-                            d.on_click(cx.listener(move |t, _, window, cx| {
+                            d.clickable(cx.listener(move |t, _, window, cx| {
                                 t.set_unit(i, window, cx);
                             }))
                         })
@@ -1494,7 +1496,7 @@ fn detail(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                     .when(on, |b| b.bg(p.tx).border_color(p.tx).text_color(p.bg))
                     .child(label)
                     .when(enabled, |b| {
-                        b.on_click(cx.listener(move |t, _, _, cx| t.set_mode(m, cx)))
+                        b.clickable(cx.listener(move |t, _, _, cx| t.set_mode(m, cx)))
                     })
             };
             div()
@@ -1601,7 +1603,7 @@ fn detail(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                             cx,
                         )
                         .child(text(label))
-                        .on_click(cx.listener(|t, _, window, cx| {
+                        .clickable(cx.listener(|t, _, window, cx| {
                             t.pick(NewValue::Default, window, cx);
                         })),
                     )
@@ -1617,7 +1619,7 @@ fn detail(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                             cx,
                         )
                         .child("Keep current value")
-                        .on_click(cx.listener(move |t, _, window, cx| {
+                        .clickable(cx.listener(move |t, _, window, cx| {
                             t.drop_pending(&name);
                             t.arrange();
                             t.sync_editor(window, cx);
@@ -1645,7 +1647,7 @@ fn detail(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                             .text_color(p.link)
                             .hover(|s| s.text_color(p.tx))
                             .child(text(label))
-                            .on_click(cx.listener(move |t, _, window, cx| {
+                            .clickable(cx.listener(move |t, _, window, cx| {
                                 t.show(target.clone(), window, cx);
                             })),
                     ),
@@ -1751,6 +1753,7 @@ fn pending_panel(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> Option<impl Into
                             gpui_kit::component::checkbox::Checkbox::new("config-rewrite")
                                 .checked(t.rewrite)
                                 .label("Also rewrite the config file (CONFIG REWRITE)")
+                                .cursor_pointer()
                                 .on_click(
                                     cx.listener(|t, on: &bool, _, cx| t.set_rewrite(*on, cx)),
                                 ),
@@ -1803,7 +1806,7 @@ fn pending_panel(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> Option<impl Into
                                         cx,
                                     )
                                     .child("Copy")
-                                    .on_click(cx.listener(
+                                    .clickable(cx.listener(
                                         move |_, _, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 copy.clone(),
@@ -1850,7 +1853,7 @@ fn pending_panel(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> Option<impl Into
                         )
                         .child("Discard changes")
                         .when(!t.busy, |b| {
-                            b.on_click(cx.listener(|t, _, window, cx| t.discard(window, cx)))
+                            b.clickable(cx.listener(|t, _, window, cx| t.discard(window, cx)))
                         }),
                     )
                     .child(
@@ -1867,7 +1870,9 @@ fn pending_panel(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> Option<impl Into
                             format!("Apply {n} {}", noun(n))
                         })
                         .when(can_apply, |b| {
-                            b.on_click(cx.listener(|t, _, window, cx| t.apply(window, cx).detach()))
+                            b.clickable(
+                                cx.listener(|t, _, window, cx| t.apply(window, cx).detach()),
+                            )
                         }),
                     ),
             ),

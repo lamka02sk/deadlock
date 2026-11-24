@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::{AssetSource, Hsla, SharedString, Styled, Svg, svg};
+use gpui_kit::{AssetSource, Hsla, ParentElement as _, SharedString, Styled, Svg, svg};
 
 /// The design's icons, served as `deadlock/icons/<name>.svg` so they never shadow
 /// gpui-component's `icons/` set.
@@ -69,6 +69,25 @@ pub enum Icon {
     Config,
     ArrowRight,
     Diagram,
+    File,
+    NewFile,
+    NewFolder,
+    Rename,
+    Trash,
+    Reveal,
+    PanelRight,
+    Calendar,
+    Copy,
+    Duplicate,
+    Paste,
+    SetNull,
+    SetDefault,
+    Json,
+    Eye,
+    EyeOff,
+    Open,
+    SelectAll,
+    Color,
 }
 
 impl Icon {
@@ -107,6 +126,25 @@ impl Icon {
             Self::Config => "deadlock/icons/config.svg",
             Self::ArrowRight => "deadlock/icons/arrow-right.svg",
             Self::Diagram => "deadlock/icons/diagram.svg",
+            Self::File => "deadlock/icons/file.svg",
+            Self::NewFile => "deadlock/icons/new-file.svg",
+            Self::NewFolder => "deadlock/icons/new-folder.svg",
+            Self::Rename => "deadlock/icons/rename.svg",
+            Self::Trash => "deadlock/icons/trash.svg",
+            Self::Reveal => "deadlock/icons/reveal.svg",
+            Self::PanelRight => "deadlock/icons/panel-right.svg",
+            Self::Calendar => "deadlock/icons/calendar.svg",
+            Self::Copy => "deadlock/icons/copy.svg",
+            Self::Duplicate => "deadlock/icons/duplicate.svg",
+            Self::Paste => "deadlock/icons/paste.svg",
+            Self::SetNull => "deadlock/icons/null.svg",
+            Self::SetDefault => "deadlock/icons/default.svg",
+            Self::Json => "deadlock/icons/json.svg",
+            Self::Eye => "deadlock/icons/eye.svg",
+            Self::EyeOff => "deadlock/icons/eye-off.svg",
+            Self::Open => "deadlock/icons/open.svg",
+            Self::SelectAll => "deadlock/icons/select-all.svg",
+            Self::Color => "deadlock/icons/color.svg",
         }
     }
 }
@@ -122,6 +160,32 @@ pub fn icon(icon: Icon, color: Hsla) -> Svg {
         .size_4()
         .flex_none()
         .text_color(color)
+}
+
+/// A context-menu item with a 16 px icon in the text color (so it follows the hover and
+/// disabled states). Items without an icon still get the column: see `popup_menu.rs`.
+pub fn menu_item(
+    label: impl Into<SharedString>,
+    i: Icon,
+) -> gpui_kit::component::menu::PopupMenuItem {
+    gpui_kit::component::menu::PopupMenuItem::new(label).icon(menu_icon(i))
+}
+
+pub fn menu_icon(i: Icon) -> gpui_kit::component::Icon {
+    gpui_kit::component::Icon::empty().path(i.path())
+}
+
+/// A destructive context-menu item: label and icon in the danger color.
+pub fn menu_item_danger(
+    label: impl Into<SharedString>,
+    i: Icon,
+    cx: &gpui_kit::App,
+) -> gpui_kit::component::menu::PopupMenuItem {
+    let (label, danger) = (label.into(), cx.global::<crate::theme::Palette>().danger);
+    gpui_kit::component::menu::PopupMenuItem::element(move |_, _| {
+        gpui_kit::div().text_color(danger).child(label.clone())
+    })
+    .icon(menu_icon(i).text_color(danger))
 }
 
 #[cfg(test)]
@@ -164,6 +228,25 @@ mod tests {
             Icon::Config,
             Icon::ArrowRight,
             Icon::Diagram,
+            Icon::File,
+            Icon::NewFile,
+            Icon::NewFolder,
+            Icon::Rename,
+            Icon::Trash,
+            Icon::Reveal,
+            Icon::PanelRight,
+            Icon::Calendar,
+            Icon::Copy,
+            Icon::Duplicate,
+            Icon::Paste,
+            Icon::SetNull,
+            Icon::SetDefault,
+            Icon::Json,
+            Icon::Eye,
+            Icon::EyeOff,
+            Icon::Open,
+            Icon::SelectAll,
+            Icon::Color,
         ];
         for path in all.iter().map(|i| i.path()).chain([APP_LOGO]) {
             assert!(Assets.load(path).unwrap().is_some(), "{path}");

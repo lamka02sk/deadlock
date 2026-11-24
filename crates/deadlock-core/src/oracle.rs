@@ -18,8 +18,10 @@ use crate::driver::{
 
 mod config;
 pub(crate) mod conn;
+mod objects;
 mod plan;
 mod schema;
+mod search;
 mod sessions;
 mod structure;
 mod table;
@@ -267,6 +269,10 @@ impl Driver for Oracle {
         Capabilities::SQL
     }
 
+    fn session_id(&self) -> Option<u64> {
+        u64::try_from(self.session.0).ok()
+    }
+
     fn server_version(&self) -> &str {
         &self.version
     }
@@ -460,11 +466,79 @@ impl Driver for Oracle {
         self.call(move |conn| schema::diagram(conn, &schema))
     }
 
+    fn search_everywhere<'a>(
+        &'a self,
+        text: &'a str,
+        hidden: &'a [String],
+        stop: &'a AtomicBool,
+    ) -> BoxFuture<'a, Result<Vec<crate::search::Hit>>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for step in search::STEPS {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (text, hidden) = (text.to_owned(), hidden.to_vec());
+                out.extend(self.call(move |conn| step(conn, &text, &hidden)).await?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn definition<'a>(
+        &'a self,
+        schema: &'a str,
+        name: &'a str,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<String>> {
+        let (schema, name, kind) = (schema.to_owned(), name.to_owned(), kind.to_owned());
+        self.call(move |conn| search::definition(conn, &schema, &name, &kind))
+    }
+
+    fn object_flavor(&self) -> Option<crate::objects::Flavor> {
+        Some(crate::objects::Flavor::Oracle)
+    }
+
+    fn object<'a>(
+        &'a self,
+        o: &'a crate::objects::ObjectRef,
+    ) -> BoxFuture<'a, Result<crate::objects::ObjectDefinition>> {
+        let (o, read_only) = (o.clone(), self.read_only);
+        self.call(move |conn| objects::load(conn, read_only, &o))
+    }
+
+    fn apply_object<'a>(
+        &'a self,
+        plan: &'a crate::objects::ChangePlan,
+        backup: Option<&'a crate::objects::Backup>,
+    ) -> BoxFuture<'a, Result<crate::objects::ApplyOutcome>> {
+        if self.read_only {
+            let verb = plan.verb().to_owned();
+            return Box::pin(async move { Err(DriverError::ReadOnly(verb)) });
+        }
+        let (plan, backup) = (plan.clone(), backup.cloned());
+        self.call(move |conn| {
+            if transaction_open(conn)? {
+                return Err(DriverError::Invalid(
+                    "not applied: the session has an open transaction, and Oracle would \
+                     commit it before the DDL. Commit or roll back first."
+                        .into(),
+                ));
+            }
+            objects::apply(conn, &plan, backup.as_ref())
+        })
+    }
+
     fn children<'a>(&'a self, node: &'a ObjectPath) -> BoxFuture<'a, Result<Vec<ObjectNode>>> {
         let path = node.0.clone();
         self.call(move |conn| schema::children(conn, &path))
     }
 }
+
+/// Run after a query: `DISABLE` drops what it wrote to `DBMS_OUTPUT`, then output is
+/// back on as [`SESSION_SETUP`] left it.
+const QUERY_END: &str = "BEGIN DBMS_OUTPUT.DISABLE; DBMS_OUTPUT.ENABLE(NULL); END;";
+const QUERY_END_COMMIT: &str = "BEGIN DBMS_OUTPUT.DISABLE; DBMS_OUTPUT.ENABLE(NULL); COMMIT; END;";
 
 /// Runs `text` and sends its result on `head`. `auto`: commits before the answer goes
 /// out (after the last row, for a query), so other sessions see the change by then.
@@ -532,10 +606,13 @@ fn run(
                     Ok(_) => Ok(()),
                 };
             }
-            // shortcut: a query's DBMS_OUTPUT (from functions it calls) is read and
-            // dropped, so it does not show under the next statement.
-            let _ = conn.output();
-            commit();
+            // shortcut: a query's DBMS_OUTPUT (from functions it calls) is dropped, so
+            // it does not show under the next statement. One round trip clears it and
+            // commits.
+            let sql = if auto { QUERY_END_COMMIT } else { QUERY_END };
+            if let Err(e) = conn.execute(sql, &[]) {
+                eprintln!("deadlock: oracle: after query: {e}");
+            }
         }
     }
 }

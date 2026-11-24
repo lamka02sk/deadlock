@@ -298,7 +298,49 @@ pub(crate) fn open_project(path: &Path, forwarded: bool, cx: &mut App) -> anyhow
         window.set_window_title(&title);
         cx.new(|cx| shell::Shell::new(project, window, cx))
     })?;
+    register(root, handle, &shell, cx);
+    Ok(())
+}
 
+/// Switches window `handle` to the project at `path`; a project open in another window
+/// is focused there instead.
+///
+/// # Errors
+/// Fails when the folder cannot be opened as a project or the window is gone.
+pub(crate) fn switch_project(
+    handle: AnyWindowHandle,
+    path: &Path,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(path)?;
+    if cx.global::<Registry>().projects.contains_key(&root) {
+        return open_project(&root, false, cx);
+    }
+    let project = Project::open(&root)?;
+    let title = format!("{} — Deadlock", project.name());
+    let shell = handle.update(cx, |_, window, cx| {
+        window.set_window_title(&title);
+        let shell = cx.new(|cx| shell::Shell::new(project, window, cx));
+        // Dropping the old root releases the old shell, which saves its state.
+        window.replace_root(cx, |window, cx| {
+            gpui_kit::base::Root::new(shell.clone(), window, cx)
+        });
+        shell
+    })?;
+    let r = cx.global_mut::<Registry>();
+    r.projects.retain(|_, h| *h != handle);
+    r.shells.retain(|(h, _)| *h != handle);
+    register(root, handle, &shell, cx);
+    Ok(())
+}
+
+/// Records a project window and moves the project to the top of the recent list.
+fn register(
+    root: PathBuf,
+    handle: AnyWindowHandle,
+    shell: &gpui_kit::Entity<shell::Shell>,
+    cx: &mut App,
+) {
     let r = cx.global_mut::<Registry>();
     r.projects.insert(root.clone(), handle);
     r.shells.push((handle, shell.downgrade()));
@@ -312,7 +354,6 @@ pub(crate) fn open_project(path: &Path, forwarded: bool, cx: &mut App) -> anyhow
         eprintln!("deadlock: recent projects: {e}");
     }
     log(&format!("opened {}", root.display()), cx);
-    Ok(())
 }
 
 /// Closes every window the way its close button does: each project window asks about
@@ -324,7 +365,7 @@ fn quit(cx: &mut App) {
     for (handle, shell) in shells {
         let _ = handle.update(cx, |_, window, cx| {
             let close = shell
-                .update(cx, |s, cx| s.should_close(window, cx))
+                .update(cx, |s, cx| s.close(window, cx))
                 .unwrap_or(true);
             if close {
                 window.remove_window();
@@ -364,9 +405,13 @@ pub(crate) fn open_from_welcome(path: &Path, cx: &mut App) {
         eprintln!("deadlock: cannot open {}: {e:#}", path.display());
         return;
     }
-    if let Some(h) = cx.global::<Registry>().welcome {
-        let _ = h.update(cx, |_, window, _| window.remove_window());
-    }
+    // Deferred: a click on a recent project runs inside the open-project window's own
+    // update, where updating that window again fails.
+    cx.defer(|cx| {
+        if let Some(h) = cx.global::<Registry>().welcome {
+            let _ = h.update(cx, |_, window, _| window.remove_window());
+        }
+    });
 }
 
 pub(crate) fn to_state(bounds: WindowBounds) -> WindowState {

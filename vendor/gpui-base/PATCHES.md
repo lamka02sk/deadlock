@@ -74,3 +74,11 @@ block contents were not checked with an accessibility client; IME candidate plac
 near blocks is untested. The block map's tests run from the
 Deadlock workspace (`cargo test -p deadlock --test editor_blocks`), because this
 crate's own test suite needs GPUI's git test-support build.
+
+## 3. Roomier context menus (`vendor/gpui-component`, not gpui-base)
+
+`vendor/gpui-component` is `crates/component` from the same rev, wired in by the
+workspace `[patch]`; only `src/menu/popup_menu.rs` differs (grep `Deadlock patch`, plus
+the container `p_1p5`/`min_w(px(180.))`, separator `my_1`, and `gap_2` after icons): 6 px
+container padding, 30 px items with 12 px side padding, 180 px minimum width, 16 px
+item icons. Its `Cargo.toml` has the workspace-inherited fields written out.

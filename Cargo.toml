@@ -36,3 +36,4 @@ strip = true
 # gpui-base with Deadlock's patches (vendor/gpui-base/PATCHES.md).
 [patch."https://github.com/longbridge/gpui-component"]
 gpui-base = { path = "vendor/gpui-base" }
+gpui-component = { path = "vendor/gpui-component" }

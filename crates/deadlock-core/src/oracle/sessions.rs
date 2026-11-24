@@ -102,6 +102,7 @@ pub(super) fn snapshot(conn: &Connection, own: SessionId) -> Result<Snapshot> {
             holds: Vec::new(),
             own: id == own,
             deadlock: col(r, 17) == MODULE,
+            this_app: false,
             age: None,
         });
     }
@@ -178,6 +179,7 @@ fn own_session(conn: &Connection, own: SessionId) -> Result<Snapshot> {
             holds: Vec::new(),
             own: true,
             deadlock: true,
+            this_app: true,
             age: None,
         }],
         waits: Vec::new(),

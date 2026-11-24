@@ -12,17 +12,18 @@ use deadlock_core::redis::{self as rk, Command, KeyType};
 use deadlock_core::redis_driver::SearchEnd;
 use deadlock_core::schema::{NodeId, Row, RowKind};
 use gpui_kit::component::input::{self, Input, InputEvent, InputState};
-use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
+    ParentElement, Styled, Subscription, Window, div, px,
 };
 
 use super::{Conn, Shell};
 use crate::app::Db;
+use crate::assets::{Icon, menu_item, menu_item_danger};
 use crate::query::View;
 use crate::theme::{MONO_FONT, Palette, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button, labelled, modal};
 
 /// Keys per `UNLINK` when deleting many.
@@ -44,7 +45,7 @@ pub(super) struct Keys {
 type Found = (String, Vec<u8>, KeyType);
 
 /// A context-menu action.
-type MenuAction = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
+pub(super) type MenuAction = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
 
 pub(super) struct Scan {
     text: String,
@@ -244,6 +245,7 @@ impl Shell {
                 .unwrap_or_default()
                 .iter()
                 .filter(|n| n.kind == NodeKind::Database)
+                .filter(|n| !self.config(&conn).is_some_and(|c| c.is_hidden(&n.name)))
                 .map(|n| n.name.clone())
                 .collect();
             self.run_search(conn, text.to_owned(), dbs, stop, cx);
@@ -413,11 +415,17 @@ impl Shell {
         row: &Row,
         menu: gpui_kit::component::menu::PopupMenu,
         shell: Entity<Shell>,
+        cx: &gpui_kit::App,
     ) -> gpui_kit::component::menu::PopupMenu {
         let read_only = self.config(&row.id[0]).is_some_and(|c| c.read_only);
-        let item = |label: String, f: MenuAction| {
+        let item = |label: String, ic: Icon, danger: bool, f: MenuAction| {
             let shell = shell.clone();
-            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            let it = if danger {
+                menu_item_danger(label, ic, cx)
+            } else {
+                menu_item(label, ic)
+            };
+            it.on_click(move |_, window, cx| {
                 shell.update(cx, |s, cx| f(s, window, cx));
             })
         };
@@ -437,6 +445,8 @@ impl Shell {
                 let (i, p) = (id.clone(), prefix.clone());
                 let menu = menu.item(item(
                     new_label,
+                    Icon::NewFile,
+                    false,
                     Box::new(move |s, w, cx| s.new_key(&i[..2], &p, w, cx)),
                 ));
                 if prefix.is_empty() {
@@ -444,6 +454,8 @@ impl Shell {
                 } else {
                     menu.item(item(
                         format!("Delete namespace {prefix}…"),
+                        Icon::Trash,
+                        true,
                         Box::new(move |s, _, cx| s.delete_namespace(id.clone(), cx)),
                     ))
                 }
@@ -453,10 +465,14 @@ impl Shell {
                 let menu = menu
                     .item(item(
                         "Open".into(),
+                        Icon::Open,
+                        false,
                         Box::new(move |s, w, cx| s.open_key(&i, w, cx)),
                     ))
                     .item(item(
                         "Copy name".into(),
+                        Icon::Copy,
+                        false,
                         Box::new(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(label.clone()));
                         }),
@@ -476,6 +492,8 @@ impl Shell {
                 };
                 menu.separator().item(item(
                     label,
+                    Icon::Trash,
+                    true,
                     Box::new(move |s, _, cx| s.delete_keys(picked.clone(), cx)),
                 ))
             }
@@ -926,7 +944,7 @@ pub(super) fn search_status(shell: &Shell, cx: &mut Context<Shell>) -> Option<im
                     )
                     .h(px(22.))
                     .child("Stop")
-                    .on_click(cx.listener(|this, _, _, cx| this.stop_searches(cx))),
+                    .clickable(cx.listener(|this, _, _, cx| this.stop_searches(cx))),
                 )
             })
             .children(note.map(|n| div().w_full().child(n))),
@@ -970,7 +988,7 @@ pub(super) fn job_status(shell: &Shell, cx: &mut Context<Shell>) -> Option<impl 
                 )
                 .h(px(22.))
                 .child("Cancel")
-                .on_click(move |_, _, _| stop.store(true, Ordering::Relaxed)),
+                .clickable(move |_, _, _| stop.store(true, Ordering::Relaxed)),
             ),
     )
 }
@@ -1018,7 +1036,7 @@ pub(super) fn new_key_dialog(
                     .font_family(MONO_FONT)
                     .text_size(small_size())
                     .child(t.label().to_owned())
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .clickable(cx.listener(move |this, _, _, cx| {
                         if let Some(n) = &mut this.keys.new_key {
                             n.kind = t.clone();
                             n.error = None;
@@ -1067,7 +1085,7 @@ pub(super) fn new_key_dialog(
             .child(
                 button("new-key-cancel", Kind::Outline, true, "Cancel (Esc)", cx)
                     .child("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .clickable(cx.listener(|this, _, _, cx| {
                         this.keys.new_key = None;
                         cx.notify();
                     })),
@@ -1081,7 +1099,7 @@ pub(super) fn new_key_dialog(
                     cx,
                 )
                 .child("Create key")
-                .on_click(cx.listener(|this, _, window, cx| this.create_key(window, cx))),
+                .clickable(cx.listener(|this, _, window, cx| this.create_key(window, cx))),
             )
             .into_any_element(),
     );

@@ -19,6 +19,7 @@ use gpui_kit::{
 };
 
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size};
+use crate::ui::Clickable as _;
 
 actions!(dialog, [Cancel, Confirm, Press, NextButton, PrevButton]);
 
@@ -294,7 +295,7 @@ impl Render for Dialog {
                     ])
                 })
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.answer(i, cx)))
+                .clickable(cx.listener(move |this, _, _, cx| this.answer(i, cx)))
         });
         div()
             .key_context(CONTEXT)

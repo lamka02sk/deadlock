@@ -70,6 +70,8 @@ pub struct Settings {
     pub indent: Indent,
     pub keyword_case: KeywordCase,
     pub wrap: bool,
+    /// Suggest names and keywords while typing SQL.
+    pub autocomplete: bool,
     /// Where results go in a project that has not chosen.
     pub results: ResultsPlace,
     pub page_size: u32,
@@ -95,6 +97,7 @@ impl Default for Settings {
             indent: Indent::Two,
             keyword_case: KeywordCase::Lower,
             wrap: false,
+            autocomplete: true,
             results: ResultsPlace::Inline,
             page_size: 500,
             null_text: "null".into(),
@@ -226,6 +229,7 @@ mod tests {
             indent: Indent::Tab,
             keyword_case: KeywordCase::Keep,
             wrap: true,
+            autocomplete: false,
             results: ResultsPlace::Panel,
             page_size: 5000,
             null_text: "∅".into(),

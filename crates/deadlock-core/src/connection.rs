@@ -120,6 +120,9 @@ pub struct ConnectionConfig {
     pub user: String,
     #[serde(default)]
     pub environment: Environment,
+    /// Tint for the sidebar row and the tabs, as `#rrggbb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     #[serde(default)]
     pub encryption: Encryption,
     /// Statements that change data are refused, client-side and (where the engine can)
@@ -135,6 +138,10 @@ pub struct ConnectionConfig {
     /// The SSH hop, used when `ssh_tunnel` is on.
     #[serde(default, skip_serializing_if = "ssh_unset")]
     pub ssh: crate::ssh::SshConfig,
+    /// Schemas (databases) the user hid from the sidebar, search and pickers, by the
+    /// exact name the tree shows. The server keeps them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_schemas: Vec<String>,
 }
 
 fn ssh_unset(s: &crate::ssh::SshConfig) -> bool {
@@ -142,6 +149,26 @@ fn ssh_unset(s: &crate::ssh::SshConfig) -> bool {
 }
 
 impl ConnectionConfig {
+    pub fn is_hidden(&self, schema: &str) -> bool {
+        self.hidden_schemas.iter().any(|s| s == schema)
+    }
+
+    /// Hides `schema`; false when it already was.
+    pub fn hide_schema(&mut self, schema: &str) -> bool {
+        let new = !self.is_hidden(schema);
+        if new {
+            self.hidden_schemas.push(schema.to_owned());
+        }
+        new
+    }
+
+    /// Shows `schema` again; false when it was not hidden.
+    pub fn unhide_schema(&mut self, schema: &str) -> bool {
+        let before = self.hidden_schemas.len();
+        self.hidden_schemas.retain(|s| s != schema);
+        self.hidden_schemas.len() != before
+    }
+
     /// A new connection for `engine` with its default port.
     pub fn new(engine: Engine) -> Self {
         Self {
@@ -155,11 +182,13 @@ impl ConnectionConfig {
             thick: false,
             user: String::new(),
             environment: Environment::default(),
+            color: None,
             encryption: Encryption::default(),
             read_only: false,
             keychain: true,
             ssh_tunnel: false,
             ssh: crate::ssh::SshConfig::default(),
+            hidden_schemas: Vec::new(),
         }
     }
 
@@ -370,5 +399,35 @@ mod tests {
         assert!(!text.contains("password"));
         assert!(text.contains("encryption = \"require\""));
         assert_eq!(toml::from_str::<File>(&text).unwrap(), file);
+    }
+
+    #[test]
+    fn color_is_optional_in_toml() {
+        let mut c = sample();
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("color"));
+        c.color = Some("#3b82f6".into());
+        let text = toml::to_string(&c).unwrap();
+        assert!(text.contains("color = \"#3b82f6\""));
+        assert_eq!(toml::from_str::<ConnectionConfig>(&text).unwrap(), c);
+        let old = text.replace("color = \"#3b82f6\"\n", "");
+        assert_eq!(
+            toml::from_str::<ConnectionConfig>(&old).unwrap().color,
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_schemas_hide_unhide_and_round_trip() {
+        let mut c = sample();
+        assert!(!toml::to_string(&c).unwrap().contains("hidden_schemas"));
+        assert!(c.hide_schema("Sys"));
+        assert!(!c.hide_schema("Sys"));
+        assert!(c.is_hidden("Sys") && !c.is_hidden("sys"));
+        let back: ConnectionConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        assert!(c.unhide_schema("Sys"));
+        assert!(!c.unhide_schema("Sys"));
+        assert!(c.hidden_schemas.is_empty());
     }
 }

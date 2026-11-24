@@ -3,13 +3,16 @@
 mod app;
 pub mod assets;
 mod config;
+mod color;
 mod connection_form;
 pub mod diagram;
 mod dialog;
 mod export;
+mod files;
 mod history;
 mod import;
 mod keymap;
+mod object;
 mod query;
 mod results;
 mod sessions;

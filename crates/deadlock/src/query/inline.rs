@@ -10,16 +10,16 @@ use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{Sizable as _, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, CursorStyle, DragMoveEvent, Empty, Entity,
-    EntityId, EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
-    Render, ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
-    Window, canvas, div, px,
+    App, AppContext as _, Context, CursorStyle, DragMoveEvent, Empty, Entity, EntityId,
+    EventEmitter, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
+    ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
+    canvas, div, px,
 };
 
-use super::CopySelection;
 use crate::assets::Icon;
-use crate::results::{Grid, duration, grid_text, shown};
+use crate::results::{Grid, duration, grid_actions, grid_text, shown};
 use crate::theme::{MONO_FONT, Palette, RADIUS, UI_FONT, ui_size};
+use crate::ui::Clickable as _;
 use crate::ui::{self, Kind};
 
 /// Card margins inside the block: `.res { margin: 4px 16px 8px }`, measured from the
@@ -175,7 +175,13 @@ impl ResultBlock {
     fn header_text(&self, cx: &App) -> String {
         match &self.body {
             Body::Running(started) => format!("Running… {}", duration(started.elapsed())),
-            Body::Rows(t) => t.read(cx).delegate().inline_summary(),
+            Body::Rows(t) => {
+                let g = t.read(cx).delegate();
+                match g.sel_status() {
+                    Some(s) => format!("{s} · {}", g.inline_summary()),
+                    None => g.inline_summary(),
+                }
+            }
             Body::Done(text) => text.clone(),
             Body::Error { .. } => String::new(),
         }
@@ -187,14 +193,6 @@ impl ResultBlock {
         match (g.columns(), g.rows()) {
             ([c], [row]) => Some(format!("{} = {}", c.name, shown(row.first()?))),
             _ => None,
-        }
-    }
-
-    fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(t) = self.grid() else { return };
-        let t = t.read(cx);
-        if let Some(text) = t.delegate().copy_text(t.selection()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 }
@@ -308,7 +306,7 @@ impl Render for ResultBlock {
                 (Icon::ChevronDown, "Collapse result")
             };
             header = header.child(
-                header_button("toggle", None, Some(i), true, tip, cx).on_click(cx.listener(
+                header_button("toggle", None, Some(i), true, tip, cx).clickable(cx.listener(
                     |this, _, _, cx| {
                         this.collapsed = !this.collapsed;
                         cx.notify();
@@ -380,7 +378,7 @@ impl Render for ResultBlock {
                     "Cancel the running statement",
                     cx,
                 )
-                .on_click(emit(BlockEvent::Stop)),
+                .clickable(emit(BlockEvent::Stop)),
             );
         }
         if expanded {
@@ -394,14 +392,14 @@ impl Render for ResultBlock {
                         "Show this result in the bottom panel",
                         cx,
                     )
-                    .on_click(emit(BlockEvent::OpenInPanel)),
+                    .clickable(emit(BlockEvent::OpenInPanel)),
                 )
                 .children(export);
         }
         if !self.is_running() {
             header = header.child(
                 header_button("close", None, Some(Icon::Close), true, "Close result", cx)
-                    .on_click(emit(BlockEvent::Close)),
+                    .clickable(emit(BlockEvent::Close)),
             );
         }
         // An edited statement's result is dimmed, not dropped.
@@ -409,10 +407,8 @@ impl Render for ResultBlock {
 
         let me = cx.entity_id();
         let grid = self.grid().filter(|_| expanded).map(|t| {
-            grid_text(div())
+            grid_actions(grid_text(div()).key_context("Results"), t)
                 .id("grid")
-                .key_context("Results")
-                .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
                 .flex_1()
                 .min_h_0()
                 .border_t_1()

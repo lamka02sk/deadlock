@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 
 use super::QueryTab;
 use crate::theme::{MONO_FONT, Palette, RADIUS, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
 /// Values by bind name; `None` binds NULL.
@@ -171,14 +172,14 @@ pub(super) fn render(
                             .child(
                                 button("binds-cancel", Kind::Outline, true, "Cancel (Esc)", cx)
                                     .child("Cancel")
-                                    .on_click(
+                                    .clickable(
                                         cx.listener(|this, _, _, cx| this.answer_binds(false, cx)),
                                     ),
                             )
                             .child(
                                 button("binds-run", Kind::Primary, true, "Run (Enter)", cx)
                                     .child("Run")
-                                    .on_click(
+                                    .clickable(
                                         cx.listener(|this, _, _, cx| this.answer_binds(true, cx)),
                                     ),
                             ),

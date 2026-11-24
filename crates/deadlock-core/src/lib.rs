@@ -2,17 +2,20 @@
 
 pub mod cache;
 pub mod classify;
+pub mod complete;
 pub mod config;
 pub mod connection;
 pub mod diagram;
 pub mod driver;
 pub mod edit;
 pub mod export;
+mod heal;
 pub mod history;
 pub mod import;
 #[cfg(unix)]
 pub mod instance;
 mod mysql;
+pub mod objects;
 mod oracle;
 pub mod plan;
 pub mod project;
@@ -21,6 +24,7 @@ pub mod redis;
 pub mod redis_driver;
 mod redis_driver_admin;
 pub mod schema;
+pub mod search;
 pub mod sessions;
 pub mod settings;
 pub mod split;

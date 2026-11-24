@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use deadlock_core::connection::Environment;
 use deadlock_core::driver::NodeKind;
 use deadlock_core::schema::{Row, RowKind};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -16,6 +15,8 @@ use super::{Conn, Front, Shell};
 use crate::assets::{Icon, icon};
 use crate::diagram::{DiagramEvent, DiagramTab};
 use crate::theme::{Palette, tab_height};
+use crate::ui::Clickable as _;
+use gpui_kit::{MouseButton, MouseUpEvent};
 
 /// The row's last id part under its database. No table name holds a NUL.
 pub(super) const ROW_NAME: &str = "\0diagram";
@@ -139,7 +140,8 @@ pub(super) fn diagram_tabs(shell: &Shell, cx: &mut Context<Shell>) -> Vec<impl I
             let on = shell.front == Front::Diagram(i);
             let t = t.read(cx);
             let tip = format!("Schema diagram · {} · {}", t.schema, t.connection.name);
-            let production = t.connection.environment == Environment::Production;
+            let env = t.connection.environment;
+            let tint = shell.color_of(&t.connection.id);
             let group: SharedString = format!("diagram-tab-{i}").into();
             div()
                 .id(group.clone())
@@ -164,12 +166,18 @@ pub(super) fn diagram_tabs(shell: &Shell, cx: &mut Context<Shell>) -> Vec<impl I
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                 })
-                .on_click(cx.listener(move |this, _, window, cx| {
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                        this.close_diagram(i, cx);
+                    }),
+                )
+                .clickable(cx.listener(move |this, _, window, cx| {
                     this.show_tab(Front::Diagram(i), window, cx)
                 }))
                 .child(icon(Icon::Diagram, if on { p.tx } else { p.tx3 }))
                 .child("Schema diagram")
-                .when(production, |d| d.child(super::production_marker(&p)))
+                .children(super::env_marker(env, &p))
                 .child(
                     div()
                         .id(("close-diagram", i))
@@ -182,11 +190,12 @@ pub(super) fn diagram_tabs(shell: &Shell, cx: &mut Context<Shell>) -> Vec<impl I
                         .group_hover(group, |s| s.opacity(1.))
                         .hover(|s| s.bg(p.hover))
                         .child(icon(Icon::Close, p.tx3).size(px(12.)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .clickable(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_diagram(i, cx);
                         })),
                 )
+                .map(|d| super::tabs::tinted(d, tint, on, &p))
         })
         .collect()
 }

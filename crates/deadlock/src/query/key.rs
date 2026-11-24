@@ -25,6 +25,7 @@ use crate::app::Db;
 use crate::assets::Icon;
 use crate::dialog::Ask;
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button, icon_button, labelled, modal};
 
 /// A key tab's Redis state.
@@ -983,7 +984,7 @@ pub(super) fn header(
             )
             .child("Set expiry")
             .when(can_act, |b| {
-                b.on_click(cx.listener(|this, _, window, cx| this.open_dialog(true, window, cx)))
+                b.clickable(cx.listener(|this, _, window, cx| this.open_dialog(true, window, cx)))
             }),
         )
         .child(
@@ -996,7 +997,7 @@ pub(super) fn header(
             )
             .child("Rename")
             .when(can_act, |b| {
-                b.on_click(cx.listener(|this, _, window, cx| this.open_dialog(false, window, cx)))
+                b.clickable(cx.listener(|this, _, window, cx| this.open_dialog(false, window, cx)))
             }),
         )
         .child(
@@ -1010,7 +1011,7 @@ pub(super) fn header(
             .text_color(p.danger)
             .child("Delete key")
             .when(can_act, |b| {
-                b.on_click(cx.listener(|this, _, _, cx| this.delete_key(cx)))
+                b.clickable(cx.listener(|this, _, _, cx| this.delete_key(cx)))
             }),
         )
         .child(
@@ -1026,7 +1027,7 @@ pub(super) fn header(
             .w(px(28.))
             .px_0()
             .justify_center()
-            .on_click(cx.listener(|this, _, window, cx| {
+            .clickable(cx.listener(|this, _, window, cx| {
                 this.after_discard(window, cx, |this, _, cx| this.reload_key(cx));
             })),
         );
@@ -1103,7 +1104,7 @@ pub(super) fn header(
                     cx,
                 )
                 .when(can_edit, |b| {
-                    b.on_click(cx.listener(|this, _, window, cx| this.push(true, window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.push(true, window, cx)))
                 }),
             )
         })
@@ -1118,7 +1119,7 @@ pub(super) fn header(
                 cx,
             )
             .when(can_edit, |b| {
-                b.on_click(cx.listener(move |this, _, window, cx| {
+                b.clickable(cx.listener(move |this, _, window, cx| {
                     if kind_is_list(this) {
                         this.push(false, window, cx);
                     } else {
@@ -1138,7 +1139,7 @@ pub(super) fn header(
                 cx,
             )
             .when(can_edit, |b| {
-                b.on_click(cx.listener(|this, _, _, cx| this.delete_rows(cx)))
+                b.clickable(cx.listener(|this, _, _, cx| this.delete_rows(cx)))
             }),
         );
     let note = (kind == KeyType::Stream).then(|| {
@@ -1333,6 +1334,7 @@ pub(super) fn dialog(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyE
                 Checkbox::new("rename-overwrite")
                     .checked(*overwrite)
                     .label("Overwrite a key with that name")
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         if let Some(k) = this.key_state_mut()
                             && let Some(Dialog::Rename {
@@ -1403,7 +1405,7 @@ pub(super) fn dialog(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyE
                     cx,
                 )
                 .child("Cancel")
-                .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+                .clickable(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
             )
             .child(
                 button(
@@ -1415,7 +1417,7 @@ pub(super) fn dialog(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyE
                 )
                 .child(go)
                 .when(ok, |b| {
-                    b.on_click(cx.listener(|this, _, window, cx| this.confirm_dialog(window, cx)))
+                    b.clickable(cx.listener(|this, _, window, cx| this.confirm_dialog(window, cx)))
                 }),
             )
             .into_any_element(),

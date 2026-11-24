@@ -35,10 +35,9 @@ impl Shell {
                 .map(|id| (id, Some(data.table.clone())));
         }
         let id = self
-            .active
-            .as_deref()
+            .active(cx)
             .ok_or("Import CSV: choose a connection first")?;
-        self.importable(id).map(|id| (id, None))
+        self.importable(&id).map(|id| (id, None))
     }
 
     fn importable(&self, id: &str) -> Result<String, &'static str> {

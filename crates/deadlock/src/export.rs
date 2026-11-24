@@ -12,12 +12,12 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Task,
-    Window, div, px,
+    IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, div, px,
 };
 use tokio::sync::oneshot;
 
 use crate::theme::{Palette, RADIUS, row_height, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
 /// A view that can show the typed-path field.
@@ -177,12 +177,12 @@ impl Render for PathField {
                     cx,
                 )
                 .child("Save")
-                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                .clickable(cx.listener(|this, _, _, cx| this.save(cx))),
             )
             .child(
                 button("path-cancel", Kind::Outline, true, "Do not save", cx)
                     .child("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .clickable(cx.listener(|this, _, _, cx| {
                         this.cancel();
                         cx.notify();
                     })),
@@ -257,7 +257,7 @@ pub fn menu(
             row(id, all == value)
                 .child(div().font_weight(FontWeight::MEDIUM).child(label))
                 .child(div().ml_auto().pl(px(8.)).text_color(p.tx3).child(what))
-                .on_click(move |_, _, cx| on_all(value, cx))
+                .clickable(move |_, _, cx| on_all(value, cx))
                 .into_any_element()
         };
         vec![
@@ -290,7 +290,7 @@ pub fn menu(
             row(f.label(), false)
                 .child(div().font_weight(FontWeight::MEDIUM).child(f.label()))
                 .child(div().ml_auto().pl(px(8.)).text_color(p.tx3).child(what))
-                .on_click(move |_, _, cx| on_pick(f, all, cx))
+                .clickable(move |_, _, cx| on_pick(f, all, cx))
         });
     let heading = |t: &'static str| {
         div()
@@ -436,11 +436,11 @@ impl Job {
             .child(if running {
                 button("export-cancel", Kind::Outline, true, "Stop the export", cx)
                     .child("Cancel")
-                    .on_click(move |_, window, cx| on_cancel(window, cx))
+                    .clickable(move |_, window, cx| on_cancel(window, cx))
             } else {
                 button("export-close", Kind::Ghost, true, "Hide", cx)
                     .child("Close")
-                    .on_click(move |_, window, cx| on_close(window, cx))
+                    .clickable(move |_, window, cx| on_close(window, cx))
             })
     }
 }

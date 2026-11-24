@@ -822,3 +822,20 @@ fn million_key_timings() {
         t.elapsed()
     );
 }
+
+/// Another client kills the app's: a read reconnects and runs again; the connection
+/// keeps working.
+#[test]
+#[ignore = "needs docker compose"]
+fn a_killed_client_reconnects() {
+    let rt = Runtime::new().unwrap();
+    let (app, screen) = (open(&rt, 10), open(&rt, 10));
+    let rows =
+        |d: &dyn Driver, line: &str| rt.block_on(async { d.execute(line).await?.collect().await });
+    rows(&*app, "SET heal:k v").unwrap();
+    let id = rows(&*app, "CLIENT ID").unwrap()[0][0].to_string();
+    rows(&*screen, &format!("CLIENT KILL ID {id}")).unwrap();
+    assert_eq!(rows(&*app, "GET heal:k").unwrap()[0][0].to_string(), "v");
+    assert_ne!(rows(&*app, "CLIENT ID").unwrap()[0][0].to_string(), id);
+    rows(&*app, "DEL heal:k").unwrap();
+}

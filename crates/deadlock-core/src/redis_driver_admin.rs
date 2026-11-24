@@ -59,6 +59,7 @@ pub(crate) async fn sessions(r: &Redis) -> Result<Snapshot> {
             holds: Vec::new(),
             own: c.id == own,
             deadlock: c.lib_name == "deadlock",
+            this_app: c.id == own,
             age: Some(c.age),
         })
         .collect();

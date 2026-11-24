@@ -236,7 +236,18 @@ fn browses_schema(engine: Engine, port: u16) {
 
     let groups = rt.block_on(driver.children(&path(&["deadlock"]))).unwrap();
     let names: Vec<_> = groups.iter().map(|g| g.name.as_str()).collect();
-    assert_eq!(names, ["Tables", "Views", "Routines"]);
+    let mut want = vec![
+        "Tables",
+        "Views",
+        "Procedures",
+        "Functions",
+        "Triggers",
+        "Events",
+    ];
+    if engine == Engine::Mariadb {
+        want.push("Sequences");
+    }
+    assert_eq!(names, want);
     let find = |g: usize, name: &str| {
         groups[g]
             .children
@@ -256,7 +267,7 @@ fn browses_schema(engine: Engine, port: u16) {
     assert!(col("customer_id").foreign_key && !col("customer_id").primary_key);
     assert_eq!(col("total").detail, "decimal(12,2)");
     assert_eq!(find(1, "p3_totals").kind, NodeKind::View);
-    assert_eq!(find(2, "p3_noop").detail, "procedure");
+    assert_eq!(find(2, "p3_noop").kind, NodeKind::Routine);
 
     let direct = rt
         .block_on(driver.children(&path(&["deadlock", "Tables", "p3_orders"])))
@@ -311,6 +322,7 @@ fn mysql_big_schema_timings() {
         id: "c".into(),
         name: "c".into(),
         nodes: Some(dbs),
+        hidden: Vec::new(),
     });
     assert!(tree.set_children(&["c".into(), "big".into()], groups));
     for id in [vec!["c"], vec!["c", "big"], vec!["c", "big", "Tables"]] {
@@ -439,6 +451,9 @@ fn manual_transactions(engine: Engine, port: u16, database: &str) {
     }
     rt.block_on(a.set_auto_commit(false)).unwrap();
     assert!(!open(&rt, &*a));
+    // Reads leave nothing to commit, though MySQL opens a transaction for them.
+    assert_eq!(count(&rt, &*a, "p5_tx"), "0");
+    assert!(!open(&rt, &*a));
     run(&rt, &*a, "INSERT INTO p5_tx VALUES (1)").unwrap();
     assert!(open(&rt, &*a));
     run(&rt, &*a, "INSERT INTO p5_tx VALUES (2)").unwrap();
@@ -449,6 +464,7 @@ fn manual_transactions(engine: Engine, port: u16, database: &str) {
     rt.block_on(a.end_transaction(false)).unwrap();
     assert!(!open(&rt, &*a));
     assert_eq!(count(&rt, &*a, "p5_tx"), "0");
+    assert!(!open(&rt, &*a));
 
     run(&rt, &*a, "INSERT INTO p5_tx VALUES (3)").unwrap();
     assert_eq!(count(&rt, &*b, "p5_tx"), "0");
@@ -462,6 +478,14 @@ fn manual_transactions(engine: Engine, port: u16, database: &str) {
     run(&rt, &*a, "INSERT INTO p5_tx VALUES (4)").unwrap();
     assert!(!open(&rt, &*a));
     assert_eq!(count(&rt, &*b, "p5_tx"), "2");
+    // A transaction started by hand counts as open before any write.
+    if engine != Engine::Oracle {
+        run(&rt, &*a, "START TRANSACTION").unwrap();
+        assert_eq!(count(&rt, &*a, "p5_tx"), "2");
+        assert!(open(&rt, &*a));
+        rt.block_on(a.end_transaction(false)).unwrap();
+        assert!(!open(&rt, &*a));
+    }
     run(&rt, &*a, "DROP TABLE p5_tx").unwrap();
 }
 
@@ -553,8 +577,10 @@ fn implicit_commits(engine: Engine, port: u16) {
     run(&rt, &*a, "INSERT INTO p5_ic VALUES (100)").unwrap();
     assert!(open(&rt, &*a));
     run(&rt, &*b, &format!("KILL {conn_id}")).unwrap();
-    assert!(run(&rt, &*a, "SELECT 1").is_err());
-    assert!(rt.block_on(a.transaction_open()).is_err());
+    // Said so, and not run again on the new session; that one holds nothing.
+    let e = run(&rt, &*a, "SELECT 1").unwrap_err();
+    assert!(e.contains("transaction was rolled back"), "{e}");
+    assert!(!open(&rt, &*a));
     assert_eq!(count(&rt, &*b, "p5_ic"), committed);
     run(&rt, &*b, "DROP TABLE p5_ic").unwrap();
 }
@@ -734,7 +760,7 @@ mod table_edits {
     use std::collections::BTreeMap;
 
     use deadlock_core::edit::{
-        self, Change, ChangeKind, Edit, Pending, RowId, TableInfo, TableRef, browse, parse_input,
+        self, Change, ChangeKind, Edit, Pending, RowId, TableInfo, TableRef, page_sql, parse_input,
     };
 
     use super::*;
@@ -1025,22 +1051,18 @@ mod table_edits {
         .unwrap();
         let i = info(&rt, &*d, &t);
         let sql = edit::select_sql(&t, &i, "id > 100", "id desc").unwrap();
-        let sizes: Vec<usize> = rt.block_on(async {
-            let mut s = browse(std::sync::Arc::clone(&d), sql, false).await.unwrap();
-            let mut out = Vec::new();
-            while let Some(page) = s.next_page().await {
-                out.push(page.unwrap().len());
-            }
-            out
-        });
+        let sizes: Vec<usize> = [0, 500, 1000]
+            .map(|o| rows(&rt, &*d, &page_sql(&sql, false, 500, o)).len())
+            .into();
         assert_eq!(sizes, [500, 500, 100]);
         let bad = edit::select_sql(&t, &i, "nope = 1", "").unwrap();
         let e = rt
-            .block_on(browse(std::sync::Arc::clone(&d), bad, false))
-            .unwrap_err();
+            .block_on(d.execute(&page_sql(&bad, false, 500, 0)))
+            .err()
+            .unwrap();
         assert!(e.to_string().contains("nope"), "{e}");
         assert_eq!(
-            rows(&rt, &*d, &edit::count_sql(&t, &i, "id <= 7").unwrap())[0][0].to_string(),
+            rows(&rt, &*d, &edit::count_sql(&t, &i, "id <= 7", None).unwrap())[0][0].to_string(),
             "7"
         );
 
@@ -2114,7 +2136,8 @@ mod oracle {
                 "Functions",
                 "Packages",
                 "Triggers",
-                "Synonyms"
+                "Synonyms",
+                "Types"
             ]
         );
         let find = |g: usize, name: &str| {
@@ -2281,7 +2304,7 @@ mod oracle {
         use std::collections::BTreeMap;
 
         use deadlock_core::edit::{
-            self, Change, ChangeKind, Edit, Pending, RowId, TableInfo, TableRef, browse,
+            self, Change, ChangeKind, Edit, Pending, RowId, TableInfo, TableRef, page_sql,
             parse_input,
         };
 
@@ -2538,17 +2561,13 @@ mod oracle {
             );
             let i = info(&rt, &*d, &t);
             let sql = edit::select_sql(&t, &i, "id > 100", "\"ID\" desc").unwrap();
-            let sizes: Vec<usize> = rt.block_on(async {
-                let mut s = browse(std::sync::Arc::clone(&d), sql, true).await.unwrap();
-                let mut out = Vec::new();
-                while let Some(page) = s.next_page().await {
-                    out.push(page.unwrap().len());
-                }
-                out
-            });
+            let sizes: Vec<usize> = [0, 500, 1000]
+                .map(|o| rows(&rt, &*d, &page_sql(&sql, true, 500, o)).len())
+                .into();
             assert_eq!(sizes, [500, 500, 100]);
             assert_eq!(
-                rows(&rt, &*d, &edit::count_sql(&t, &i, "id <= 7").unwrap())[0][0].to_string(),
+                rows(&rt, &*d, &edit::count_sql(&t, &i, "id <= 7", None).unwrap())[0][0]
+                    .to_string(),
                 "7"
             );
             let ro = connect_as(
@@ -3999,4 +4018,1170 @@ fn oracle_imports_its_own_export() {
         },
         &drop,
     );
+}
+
+/// Search everywhere finds `ps_` objects by name, a column, and source text, with a
+/// LIKE wildcard in the text matched literally.
+fn searches_everywhere(engine: Engine, port: u16) {
+    use deadlock_core::search::Group;
+    use std::sync::atomic::AtomicBool;
+    let rt = Runtime::new().unwrap();
+    let driver = rt
+        .block_on(connect(&config(engine, port, "deadlock"), PASSWORD))
+        .unwrap();
+    for sql in [
+        "DROP VIEW IF EXISTS ps_view",
+        "DROP PROCEDURE IF EXISTS ps_proc",
+        "DROP TABLE IF EXISTS ps_stock",
+        "CREATE TABLE ps_stock (id INT PRIMARY KEY, ps_qty_left INT)",
+        "CREATE VIEW ps_view AS SELECT id AS ps_view_marker FROM ps_stock",
+        "CREATE PROCEDURE ps_proc() BEGIN\n  SELECT 1;\n  UPDATE ps_stock SET ps_qty_left = 0 WHERE id = 42;\nEND",
+    ] {
+        rows(&rt, &*driver, sql);
+    }
+    // MySQL with its binary log needs SUPER for triggers; MariaDB lets the owner.
+    let trigger = run(
+        &rt,
+        &*driver,
+        "CREATE TRIGGER ps_trig BEFORE INSERT ON ps_stock FOR EACH ROW SET NEW.ps_qty_left = 7",
+    )
+    .is_ok();
+    let stop = AtomicBool::new(false);
+    let search = |text: &str| {
+        rt.block_on(driver.search_everywhere(text, &[], &stop))
+            .unwrap()
+    };
+
+    let hits = search("PS_STOCK");
+    assert!(
+        hits.iter()
+            .any(|h| h.group == Group::Objects && h.name == "ps_stock" && h.kind == "table")
+    );
+    let code = hits
+        .iter()
+        .find(|h| h.group == Group::Code && h.name == "ps_proc")
+        .unwrap();
+    assert_eq!(code.kind, "procedure");
+    let line = code.line.as_ref().unwrap();
+    assert!(line.text.contains("UPDATE ps_stock"), "{line:?}");
+
+    let hits = search("qty_left");
+    let c = hits.iter().find(|h| h.group == Group::Columns).unwrap();
+    assert_eq!(
+        (c.name.as_str(), c.column.as_ref().unwrap().0.as_str()),
+        ("ps_stock", "ps_qty_left")
+    );
+    assert!(c.column.as_ref().unwrap().1.starts_with("int"));
+
+    // `_` is no wildcard: `ps_view_marker` is in the view, `psXview` matches nothing.
+    assert!(
+        search("view_marker")
+            .iter()
+            .any(|h| h.group == Group::Code && h.kind == "view")
+    );
+    assert!(search("ps%view").is_empty());
+
+    // A hidden schema is neither scanned nor listed: objects, columns and code.
+    for text in ["ps_stock", "qty_left", "ps_qty_left = 0"] {
+        let hidden = ["deadlock".to_owned()];
+        let hits = rt
+            .block_on(driver.search_everywhere(text, &hidden, &stop))
+            .unwrap();
+        assert!(hits.iter().all(|h| h.schema != "deadlock"), "{hits:?}");
+    }
+
+    let def = rt
+        .block_on(driver.definition("deadlock", "ps_proc", "procedure"))
+        .unwrap();
+    assert!(def.starts_with("CREATE") && def.contains("ps_qty_left = 0"));
+    if trigger {
+        let trig = search("ps_qty_left = 7");
+        assert!(
+            trig.iter()
+                .any(|h| h.group == Group::Code && h.kind == "trigger"),
+            "{trig:?}"
+        );
+        let def = rt
+            .block_on(driver.definition("deadlock", "ps_trig", "trigger"))
+            .unwrap();
+        assert!(
+            def.starts_with("CREATE") && def.contains("ps_qty_left = 7"),
+            "{def}"
+        );
+    }
+    let (l, _) = deadlock_core::search::locate(&def, line, "ps_stock").unwrap();
+    assert!(def.lines().nth(l).unwrap().contains("UPDATE ps_stock"));
+
+    // A newer search stops this one before its first query.
+    let stopped = AtomicBool::new(true);
+    assert!(
+        rt.block_on(driver.search_everywhere("ps_", &[], &stopped))
+            .unwrap()
+            .is_empty()
+    );
+    for sql in [
+        "DROP VIEW ps_view",
+        "DROP PROCEDURE ps_proc",
+        "DROP TABLE ps_stock",
+    ] {
+        rows(&rt, &*driver, sql);
+    }
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn mysql_searches_everywhere() {
+    searches_everywhere(Engine::Mysql, 3306);
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn mariadb_searches_everywhere() {
+    searches_everywhere(Engine::Mariadb, 3307);
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn oracle_searches_everywhere() {
+    use deadlock_core::search::Group;
+    use std::sync::atomic::AtomicBool;
+    let rt = Runtime::new().unwrap();
+    let driver = rt
+        .block_on(connect(&config(Engine::Oracle, 1521, "FREEPDB1"), PASSWORD))
+        .unwrap();
+    for sql in [
+        "BEGIN EXECUTE IMMEDIATE 'DROP TABLE ps_stock'; EXCEPTION WHEN OTHERS THEN NULL; END;",
+        "CREATE TABLE ps_stock (id NUMBER PRIMARY KEY, ps_qty_left NUMBER(10))",
+        "CREATE OR REPLACE VIEW ps_view AS SELECT id AS ps_view_marker FROM ps_stock",
+        "CREATE OR REPLACE PROCEDURE ps_proc AS\nBEGIN\n  UPDATE ps_stock SET ps_qty_left = 0;\nEND;",
+    ] {
+        rows(&rt, &*driver, sql);
+    }
+    let stop = AtomicBool::new(false);
+    let search = |text: &str| {
+        rt.block_on(driver.search_everywhere(text, &[], &stop))
+            .unwrap()
+    };
+    let hits = search("ps_stock");
+    assert!(
+        hits.iter()
+            .any(|h| h.group == Group::Objects && h.name == "PS_STOCK")
+    );
+    let code = hits
+        .iter()
+        .find(|h| h.group == Group::Code && h.name == "PS_PROC")
+        .unwrap();
+    let line = code.line.as_ref().unwrap();
+    assert_eq!(line.number, 3, "{line:?}");
+    let c = search("QTY_LEFT")
+        .into_iter()
+        .find(|h| h.group == Group::Columns)
+        .unwrap();
+    assert_eq!(
+        c.column.unwrap(),
+        ("PS_QTY_LEFT".into(), "number(10)".into())
+    );
+    assert!(
+        search("view_marker")
+            .iter()
+            .any(|h| h.group == Group::Code && h.kind == "view")
+    );
+    assert!(search("ps%view").is_empty());
+    for text in ["ps_stock", "qty_left", "view_marker", "update ps_stock"] {
+        let hidden = ["DEADLOCK".to_owned()];
+        let hits = rt
+            .block_on(driver.search_everywhere(text, &hidden, &stop))
+            .unwrap();
+        assert!(hits.iter().all(|h| h.schema != "DEADLOCK"), "{hits:?}");
+    }
+    let def = rt
+        .block_on(driver.definition("DEADLOCK", "PS_PROC", "procedure"))
+        .unwrap();
+    assert_eq!(
+        deadlock_core::search::locate(&def, line, "ps_stock"),
+        Some((2, 9))
+    );
+    for sql in [
+        "DROP VIEW ps_view",
+        "DROP PROCEDURE ps_proc",
+        "DROP TABLE ps_stock",
+    ] {
+        rows(&rt, &*driver, sql);
+    }
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn redis_searches_key_names() {
+    use std::sync::atomic::AtomicBool;
+    let rt = Runtime::new().unwrap();
+    let driver = rt
+        .block_on(connect(&config(Engine::Redis, 6379, "1"), PASSWORD))
+        .unwrap();
+    rows(&rt, &*driver, "SET ps:search:key 1");
+    let stop = AtomicBool::new(false);
+    let hits = rt
+        .block_on(driver.search_everywhere("search:k", &[], &stop))
+        .unwrap();
+    let h = hits.iter().find(|h| h.name == "ps:search:key").unwrap();
+    assert_eq!((h.schema.as_str(), h.kind.as_str()), ("db1", "string"));
+    let hidden = ["db1".to_owned()];
+    let hits = rt
+        .block_on(driver.search_everywhere("search:k", &hidden, &stop))
+        .unwrap();
+    assert!(hits.iter().all(|h| h.schema != "db1"));
+    rows(&rt, &*driver, "DEL ps:search:key");
+}
+
+mod objects {
+    //! The object editor's engine layer: load, plan, apply, restore, drop.
+
+    use deadlock_core::connection::{ConnectionConfig, Engine};
+    use deadlock_core::driver::{Driver, NodeKind, ObjectPath, Runtime, Value, connect};
+    use deadlock_core::objects::{
+        ApplyOutcome, ChangePlan, FinalState, Flavor, IntervalUnit, ObjectDefinition, ObjectKind,
+        ObjectRef, Param, Properties, Schedule, StepKind, StepStatus, Timing, TriggerEvent,
+        TriggerOrder, ViewCheck, drop_plan, plan, recompile_plan, rename_plan, revert_plan,
+        template,
+    };
+
+    use super::{PASSWORD, config, run};
+
+    fn apply(rt: &Runtime, d: &dyn Driver, p: &ChangePlan) -> ApplyOutcome {
+        rt.block_on(d.apply_object(p, None)).unwrap()
+    }
+
+    fn load(
+        rt: &Runtime,
+        d: &dyn Driver,
+        schema: &str,
+        name: &str,
+        kind: ObjectKind,
+    ) -> ObjectDefinition {
+        rt.block_on(d.object(&ObjectRef::new(schema, name, kind)))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    fn one(rt: &Runtime, d: &dyn Driver, sql: &str) -> String {
+        match &run(rt, d, sql).unwrap()[0][0] {
+            Value::Text(s) | Value::Decimal(s) => s.clone(),
+            v => v.to_string(),
+        }
+    }
+
+    fn group<'a>(
+        groups: &'a [deadlock_core::driver::ObjectNode],
+        name: &str,
+    ) -> &'a [deadlock_core::driver::ObjectNode] {
+        groups
+            .iter()
+            .find(|g| g.name == name)
+            .and_then(|g| g.children.as_deref())
+            .unwrap_or_else(|| panic!("no group {name}"))
+    }
+
+    fn manages_objects(engine: Engine, port: u16) {
+        let rt = Runtime::new().unwrap();
+        // Root: with binary logging on, MySQL wants SUPER for triggers and functions.
+        let root_cfg = ConnectionConfig {
+            user: "root".into(),
+            ..config(engine, port, "deadlock")
+        };
+        let d = rt.block_on(connect(&root_cfg, PASSWORD)).unwrap();
+        let d = &*d;
+        let user = rt
+            .block_on(connect(&config(engine, port, "deadlock"), PASSWORD))
+            .unwrap();
+        let flavor = d.object_flavor().unwrap();
+        let maria = engine == Engine::Mariadb;
+        assert_eq!(
+            flavor,
+            if maria {
+                Flavor::Mariadb
+            } else {
+                Flavor::Mysql
+            }
+        );
+        for sql in [
+            "DROP TRIGGER IF EXISTS ob_trig",
+            "DROP TABLE IF EXISTS _dl_check_ob_t",
+            "DROP TABLE IF EXISTS ob_t",
+            "DROP PROCEDURE IF EXISTS ob_proc",
+            "DROP FUNCTION IF EXISTS ob_fn",
+            "DROP EVENT IF EXISTS ob_ev",
+            "DROP EVENT IF EXISTS ob_ev2",
+            "DROP EVENT IF EXISTS ob_ev3",
+            "DROP VIEW IF EXISTS ob_v",
+            "DROP VIEW IF EXISTS ob_v2",
+            "CREATE TABLE ob_t (id INT PRIMARY KEY, n INT)",
+        ] {
+            run(&rt, d, sql).unwrap();
+        }
+        if maria {
+            run(&rt, d, "DROP SEQUENCE IF EXISTS ob_seq").unwrap();
+        }
+        let s = "deadlock";
+
+        // Trigger: create from the template, see it in the tree, change it.
+        let mut t = template(flavor, ObjectKind::Trigger, s);
+        t.object.name = "ob_trig".into();
+        let Properties::Trigger(tp) = &mut t.props else {
+            panic!()
+        };
+        tp.table = "ob_t".into();
+        tp.timing = Timing::Before;
+        tp.events = vec![TriggerEvent::Insert];
+        tp.body = "BEGIN\n  SET NEW.n = 1;\nEND".into();
+        let out = apply(&rt, d, &plan(flavor, None, &t).unwrap());
+        assert_eq!(out.state, FinalState::Changed, "{out:?}");
+        let groups = rt
+            .block_on(d.children(&ObjectPath(vec![s.into()])))
+            .unwrap();
+        let trig = group(&groups, "Triggers")
+            .iter()
+            .find(|n| n.name == "ob_trig")
+            .unwrap();
+        assert_eq!(
+            (trig.kind, trig.detail.as_str()),
+            (NodeKind::Routine, "ob_t")
+        );
+        let table = group(&groups, "Tables")
+            .iter()
+            .find(|n| n.name == "ob_t")
+            .unwrap();
+        let under = table.children.as_ref().unwrap().last().unwrap();
+        assert_eq!(under.name, "Triggers");
+        assert_eq!(under.children.as_ref().unwrap()[0].detail, "before insert");
+        assert!(group(&groups, "Events").iter().all(|n| n.name != "ob_ev"));
+
+        let def = load(&rt, d, s, "ob_trig", ObjectKind::Trigger);
+        let Properties::Trigger(tp) = &def.props else {
+            panic!()
+        };
+        assert_eq!(
+            (tp.table.as_str(), tp.timing, &tp.events),
+            ("ob_t", Timing::Before, &vec![TriggerEvent::Insert])
+        );
+        assert!(tp.body.contains("SET NEW.n = 1"), "{}", tp.body);
+        assert_eq!(def.siblings, ["ob_trig"]);
+        let mut draft = def.draft();
+        let Properties::Trigger(tp) = &mut draft.props else {
+            panic!()
+        };
+        tp.body = "BEGIN\n  SET NEW.n = 2;\nEND".into();
+        let p = plan(flavor, Some(&def), &draft).unwrap();
+        let kinds: Vec<_> = p.steps.iter().map(|s| s.kind).collect();
+        if maria {
+            assert_eq!(kinds, [StepKind::Replace]);
+        } else {
+            assert_eq!(kinds, [StepKind::Check, StepKind::Swap, StepKind::Restore]);
+        }
+        let out = apply(&rt, d, &p);
+        assert_eq!(out.state, FinalState::Changed, "{out:?}");
+        run(&rt, d, "INSERT INTO ob_t (id) VALUES (1)").unwrap();
+        assert_eq!(one(&rt, d, "SELECT n FROM ob_t WHERE id = 1"), "2");
+        assert_eq!(
+            one(
+                &rt,
+                d,
+                "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'deadlock' AND TABLE_NAME = '_dl_check_ob_t'"
+            ),
+            "0"
+        );
+
+        // A syntax error: the check (MySQL) or the replace (MariaDB) fails, nothing changes.
+        let def = load(&rt, d, s, "ob_trig", ObjectKind::Trigger);
+        let mut bad = def.draft();
+        let Properties::Trigger(tp) = &mut bad.props else {
+            panic!()
+        };
+        tp.body = "BEGIN\n  SET NEW.n = ;\nEND".into();
+        let out = apply(&rt, d, &plan(flavor, Some(&def), &bad).unwrap());
+        assert_eq!(out.state, FinalState::Unchanged, "{out:?}");
+        assert!(out.errors[0].code.starts_with("1064"), "{:?}", out.errors);
+        assert_eq!(out.errors[0].body_line, Some(2), "{:?}", out.errors);
+
+        // MySQL: the check passes but the CREATE fails (FOLLOWS a trigger that is not
+        // there, which the check leaves out): the original comes back.
+        let mut follows = def.draft();
+        let Properties::Trigger(tp) = &mut follows.props else {
+            panic!()
+        };
+        tp.body = "BEGIN\n  SET NEW.n = 3;\nEND".into();
+        tp.order = Some((TriggerOrder::Follows, "ob_nope".into()));
+        let out = apply(&rt, d, &plan(flavor, Some(&def), &follows).unwrap());
+        if maria {
+            assert_eq!(out.state, FinalState::Unchanged, "{out:?}");
+        } else {
+            assert_eq!(out.state, FinalState::Restored, "{out:?}");
+            let st: Vec<_> = out.steps.iter().map(|s| s.status).collect();
+            assert_eq!(st, [StepStatus::Done, StepStatus::Failed, StepStatus::Done]);
+        }
+        run(&rt, d, "INSERT INTO ob_t (id) VALUES (2)").unwrap();
+        assert_eq!(one(&rt, d, "SELECT n FROM ob_t WHERE id = 2"), "2");
+
+        // Procedure and function.
+        let mut pr = template(flavor, ObjectKind::Procedure, s);
+        pr.object.name = "ob_proc".into();
+        let Properties::Routine(r) = &mut pr.props else {
+            panic!()
+        };
+        r.params = vec![Param {
+            name: "a".into(),
+            data_type: "INT".into(),
+            ..Param::default()
+        }];
+        r.body = "BEGIN\n  SELECT a + 1 AS v;\nEND".into();
+        assert_eq!(
+            apply(&rt, d, &plan(flavor, None, &pr).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "ob_proc", ObjectKind::Procedure);
+        let Properties::Routine(r) = &def.props else {
+            panic!()
+        };
+        assert!(
+            r.params[0].name == "a" && r.params[0].data_type.starts_with("int"),
+            "{:?}",
+            r.params
+        );
+        let as_user = load(&rt, &*user, s, "ob_proc", ObjectKind::Procedure);
+        assert!(
+            !as_user.notices.is_empty(),
+            "grants are not readable as deadlock"
+        );
+        let mut draft = def.draft();
+        let Properties::Routine(r) = &mut draft.props else {
+            panic!()
+        };
+        r.body = "BEGIN\n  SELECT a + 10 AS v;\nEND".into();
+        let out = apply(&rt, d, &plan(flavor, Some(&def), &draft).unwrap());
+        assert_eq!(out.state, FinalState::Changed, "{out:?}");
+        assert_eq!(one(&rt, d, "CALL ob_proc(1)"), "11");
+        let def = load(&rt, d, s, "ob_proc", ObjectKind::Procedure);
+        let mut draft = def.draft();
+        let Properties::Routine(r) = &mut draft.props else {
+            panic!()
+        };
+        r.comment = "it's a comment".into();
+        let p = plan(flavor, Some(&def), &draft).unwrap();
+        assert_eq!(p.verb(), "ALTER");
+        apply(&rt, d, &p);
+        let Properties::Routine(r) = &load(&rt, d, s, "ob_proc", ObjectKind::Procedure).props
+        else {
+            panic!()
+        };
+        assert_eq!(r.comment, "it's a comment");
+
+        let mut f = template(flavor, ObjectKind::Function, s);
+        f.object.name = "ob_fn".into();
+        let Properties::Routine(r) = &mut f.props else {
+            panic!()
+        };
+        r.params = vec![Param {
+            name: "x".into(),
+            data_type: "INT".into(),
+            ..Param::default()
+        }];
+        r.body = "BEGIN\n  RETURN x + 1;\nEND".into();
+        assert_eq!(
+            apply(&rt, d, &plan(flavor, None, &f).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(one(&rt, d, "SELECT ob_fn(1)"), "2");
+        let def = load(&rt, d, s, "ob_fn", ObjectKind::Function);
+        let mut draft = def.draft();
+        let Properties::Routine(r) = &mut draft.props else {
+            panic!()
+        };
+        r.body = "BEGIN\n  RETURN x + 2;\nEND".into();
+        assert_eq!(
+            apply(&rt, d, &plan(flavor, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(one(&rt, d, "SELECT ob_fn(1)"), "3");
+
+        // Grants survive the replace (MySQL re-runs them; MariaDB keeps them).
+        let root = d;
+        for sql in [
+            "DROP USER IF EXISTS 'ob_user'@'%'",
+            "CREATE USER 'ob_user'@'%' IDENTIFIED BY 'x'",
+            "GRANT EXECUTE ON PROCEDURE deadlock.ob_proc TO 'ob_user'@'%'",
+        ] {
+            run(&rt, root, sql).unwrap();
+        }
+        let def = load(&rt, root, s, "ob_proc", ObjectKind::Procedure);
+        assert!(
+            def.grants
+                .iter()
+                .any(|g| g.user == "ob_user" && g.privileges == ["EXECUTE"]),
+            "{:?}",
+            def.grants
+        );
+        let mut draft = def.draft();
+        let Properties::Routine(r) = &mut draft.props else {
+            panic!()
+        };
+        r.body = "BEGIN\n  SELECT a + 20 AS v;\nEND".into();
+        let p = plan(flavor, Some(&def), &draft).unwrap();
+        assert_eq!(p.steps.iter().any(|s| s.kind == StepKind::Grants), !maria);
+        assert_eq!(apply(&rt, root, &p).state, FinalState::Changed);
+        let grants: Vec<String> = run(&rt, root, "SHOW GRANTS FOR 'ob_user'@'%'")
+            .unwrap()
+            .into_iter()
+            .map(|r| r[0].to_string())
+            .collect();
+        assert!(
+            grants
+                .iter()
+                .any(|g| g.contains("EXECUTE ON PROCEDURE `deadlock`.`ob_proc`")),
+            "{grants:?}"
+        );
+        run(&rt, root, "DROP USER 'ob_user'@'%'").unwrap();
+
+        // Event: create, alter every field, rename.
+        let mut e = template(flavor, ObjectKind::Event, s);
+        e.object.name = "ob_ev".into();
+        let Properties::Event(ep) = &mut e.props else {
+            panic!()
+        };
+        ep.body = "UPDATE ob_t SET n = n".into();
+        assert_eq!(
+            apply(&rt, d, &plan(flavor, None, &e).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "ob_ev", ObjectKind::Event);
+        let mut draft = def.draft();
+        draft.object.name = "ob_ev2".into();
+        let Properties::Event(ep) = &mut draft.props else {
+            panic!()
+        };
+        let Schedule::Every { value, unit, .. } = &mut ep.schedule else {
+            panic!()
+        };
+        (*value, *unit) = ("2".into(), IntervalUnit::Hour);
+        ep.comment = "every two hours".into();
+        let p = plan(flavor, Some(&def), &draft).unwrap();
+        assert_eq!(p.steps.len(), 1);
+        assert_eq!(apply(&rt, d, &p).state, FinalState::Changed);
+        let def = load(&rt, d, s, "ob_ev2", ObjectKind::Event);
+        let Properties::Event(ep) = &def.props else {
+            panic!()
+        };
+        assert_eq!(ep.comment, "every two hours");
+        assert!(
+            matches!(&ep.schedule, Schedule::Every { value, unit: IntervalUnit::Hour, .. } if value == "2")
+        );
+        assert_eq!(
+            apply(&rt, d, &rename_plan(&def, "ob_ev3").unwrap()).state,
+            FinalState::Changed
+        );
+        let ev3 = load(&rt, d, s, "ob_ev3", ObjectKind::Event);
+
+        // View: create, replace, rename.
+        let mut v = template(flavor, ObjectKind::View, s);
+        v.object.name = "ob_v".into();
+        let Properties::View(vp) = &mut v.props else {
+            panic!()
+        };
+        vp.query = "SELECT id FROM ob_t".into();
+        assert_eq!(
+            apply(&rt, d, &plan(flavor, None, &v).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "ob_v", ObjectKind::View);
+        let mut draft = def.draft();
+        let Properties::View(vp) = &mut draft.props else {
+            panic!()
+        };
+        vp.query = "SELECT id, n FROM ob_t WHERE n > 0".into();
+        vp.check = ViewCheck::Cascaded;
+        assert_eq!(
+            apply(&rt, d, &plan(flavor, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "ob_v", ObjectKind::View);
+        let Properties::View(vp) = &def.props else {
+            panic!()
+        };
+        assert_eq!(vp.check, ViewCheck::Cascaded);
+        assert!(vp.query.contains("`n` > 0"), "{}", vp.query);
+        assert_eq!(
+            apply(&rt, d, &rename_plan(&def, "ob_v2").unwrap()).state,
+            FinalState::Changed
+        );
+        let v2 = load(&rt, d, s, "ob_v2", ObjectKind::View);
+
+        // MariaDB sequence.
+        let mut dropped = vec![ev3.object, v2.object];
+        if maria {
+            let mut q = template(flavor, ObjectKind::Sequence, s);
+            q.object.name = "ob_seq".into();
+            assert_eq!(
+                apply(&rt, d, &plan(flavor, None, &q).unwrap()).state,
+                FinalState::Changed
+            );
+            let def = load(&rt, d, s, "ob_seq", ObjectKind::Sequence);
+            let mut draft = def.draft();
+            let Properties::Sequence(sq) = &mut draft.props else {
+                panic!()
+            };
+            sq.increment = "5".into();
+            sq.cache = "0".into();
+            sq.restart_with = "100".into();
+            assert_eq!(
+                apply(&rt, d, &plan(flavor, Some(&def), &draft).unwrap()).state,
+                FinalState::Changed
+            );
+            assert_eq!(one(&rt, d, "SELECT NEXTVAL(ob_seq)"), "100");
+            let def = load(&rt, d, s, "ob_seq", ObjectKind::Sequence);
+            let Properties::Sequence(sq) = &def.props else {
+                panic!()
+            };
+            assert_eq!((sq.increment.as_str(), sq.cache.as_str()), ("5", "0"));
+            let groups = rt
+                .block_on(d.children(&ObjectPath(vec![s.into()])))
+                .unwrap();
+            assert!(
+                group(&groups, "Sequences")
+                    .iter()
+                    .any(|n| n.name == "ob_seq")
+            );
+            assert!(group(&groups, "Tables").iter().all(|n| n.name != "ob_seq"));
+            dropped.push(def.object);
+        }
+
+        // A read-only connection refuses, then drop everything.
+        let ro = rt
+            .block_on(connect(
+                &ConnectionConfig {
+                    read_only: true,
+                    ..config(engine, port, "deadlock")
+                },
+                PASSWORD,
+            ))
+            .unwrap();
+        let p = drop_plan(flavor, &ObjectRef::new(s, "ob_trig", ObjectKind::Trigger));
+        assert!(rt.block_on(ro.apply_object(&p, None)).is_err());
+        assert!(
+            load(&rt, &*ro, s, "ob_proc", ObjectKind::Procedure)
+                .read_only
+                .is_some()
+        );
+        dropped.extend([
+            ObjectRef::new(s, "ob_trig", ObjectKind::Trigger),
+            ObjectRef::new(s, "ob_proc", ObjectKind::Procedure),
+            ObjectRef::new(s, "ob_fn", ObjectKind::Function),
+        ]);
+        for o in &dropped {
+            let out = apply(&rt, d, &drop_plan(flavor, o));
+            assert_eq!(out.state, FinalState::Changed, "{o:?} {out:?}");
+        }
+        assert!(rt.block_on(d.object(&dropped[0])).is_err());
+        run(&rt, d, "DROP TABLE ob_t").unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mysql_manages_objects() {
+        manages_objects(Engine::Mysql, 3306);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mariadb_manages_objects() {
+        manages_objects(Engine::Mariadb, 3307);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn oracle_manages_objects() {
+        let rt = Runtime::new().unwrap();
+        let d = rt
+            .block_on(connect(&config(Engine::Oracle, 1521, "FREEPDB1"), PASSWORD))
+            .unwrap();
+        let d = &*d;
+        let f = Flavor::Oracle;
+        assert_eq!(d.object_flavor(), Some(f));
+        for sql in [
+            "DROP TRIGGER OB_T_BIU",
+            "DROP TRIGGER OB_T_BIU2",
+            "DROP TABLE OB_T PURGE",
+            "DROP FUNCTION OB_FN",
+            "DROP PACKAGE OB_PKG",
+            "DROP SEQUENCE OB_SEQ",
+            "DROP SEQUENCE OB_SEQ2",
+            "DROP VIEW OB_V",
+            "DROP VIEW OB_V2",
+            "DROP SYNONYM OB_SYN",
+            "DROP MATERIALIZED VIEW OB_MV",
+            "DROP TYPE OB_ADDR_T",
+        ] {
+            let _ = run(&rt, d, sql);
+        }
+        run(
+            &rt,
+            d,
+            "CREATE TABLE OB_T (id NUMBER PRIMARY KEY, n NUMBER, status VARCHAR2(10))",
+        )
+        .unwrap();
+        let s = "DEADLOCK";
+
+        // Trigger: create, read back, disable, rename, a failed compile and revert.
+        let mut t = template(f, ObjectKind::Trigger, s);
+        t.object.name = "ob_t_biu".into();
+        let Properties::Trigger(tp) = &mut t.props else {
+            panic!()
+        };
+        tp.table = "OB_T".into();
+        tp.events = vec![TriggerEvent::Insert, TriggerEvent::Update];
+        tp.update_columns = vec!["STATUS".into()];
+        tp.when = "new.n IS NULL".into();
+        tp.body = "BEGIN\n  :NEW.n := 1;\nEND;".into();
+        let out = apply(&rt, d, &plan(f, None, &t).unwrap());
+        assert_eq!(out.state, FinalState::Changed, "{out:?}");
+        let def = load(&rt, d, s, "OB_T_BIU", ObjectKind::Trigger);
+        let Properties::Trigger(tp) = &def.props else {
+            panic!("{:?}", def.props)
+        };
+        assert_eq!(tp.events, [TriggerEvent::Insert, TriggerEvent::Update]);
+        assert_eq!(
+            (tp.update_columns.as_slice(), tp.when.as_str()),
+            (&["STATUS".to_owned()][..], "new.n IS NULL")
+        );
+        assert!(tp.enabled && tp.for_each_row && tp.body.starts_with("BEGIN"));
+        assert_eq!(def.valid(), Some(true));
+        let groups = rt
+            .block_on(d.children(&ObjectPath(vec![s.into()])))
+            .unwrap();
+        assert_eq!(
+            group(&groups, "Triggers")
+                .iter()
+                .find(|n| n.name == "OB_T_BIU")
+                .unwrap()
+                .detail,
+            "OB_T"
+        );
+        let table = group(&groups, "Tables")
+            .iter()
+            .find(|n| n.name == "OB_T")
+            .unwrap();
+        assert_eq!(
+            table.children.as_ref().unwrap().last().unwrap().name,
+            "Triggers"
+        );
+
+        let mut off = def.draft();
+        let Properties::Trigger(tp) = &mut off.props else {
+            panic!()
+        };
+        tp.enabled = false;
+        let p = plan(f, Some(&def), &off).unwrap();
+        assert_eq!(p.verb(), "ALTER");
+        assert_eq!(apply(&rt, d, &p).state, FinalState::Changed);
+        let def = load(&rt, d, s, "OB_T_BIU", ObjectKind::Trigger);
+        let Properties::Trigger(tp) = &def.props else {
+            panic!()
+        };
+        assert!(!tp.enabled);
+        assert_eq!(
+            apply(&rt, d, &rename_plan(&def, "ob_t_biu2").unwrap()).state,
+            FinalState::Changed
+        );
+        let good = load(&rt, d, s, "OB_T_BIU2", ObjectKind::Trigger);
+        let mut broken = good.draft();
+        let Properties::Trigger(tp) = &mut broken.props else {
+            panic!()
+        };
+        tp.body = "BEGIN\n  :NEW.n := ob_undefined_x;\nEND;".into();
+        let out = apply(&rt, d, &plan(f, Some(&good), &broken).unwrap());
+        assert_eq!(out.state, FinalState::Invalid, "{out:?}");
+        let e = out.errors.iter().find(|e| !e.warning).unwrap();
+        assert!(
+            e.code.starts_with("PLS-") && e.body_line == Some(2),
+            "{:?}",
+            out.errors
+        );
+        let now = load(&rt, d, s, "OB_T_BIU2", ObjectKind::Trigger);
+        assert_eq!(now.valid(), Some(false));
+        assert!(!now.errors.is_empty());
+        let out = apply(&rt, d, &revert_plan(&now, &good).unwrap());
+        assert_eq!(out.state, FinalState::Changed, "{out:?}");
+        assert_eq!(
+            load(&rt, d, s, "OB_T_BIU2", ObjectKind::Trigger).valid(),
+            Some(true)
+        );
+
+        // Function.
+        let mut fun = template(f, ObjectKind::Function, s);
+        fun.object.name = "ob_fn".into();
+        let Properties::Routine(r) = &mut fun.props else {
+            panic!()
+        };
+        r.params = vec![Param {
+            name: "p_x".into(),
+            data_type: "NUMBER".into(),
+            default: "0".into(),
+            ..Param::default()
+        }];
+        r.body = "BEGIN\n  RETURN p_x + 1;\nEND;".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &fun).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(one(&rt, d, "SELECT OB_FN(1) FROM dual"), "2");
+        let def = load(&rt, d, s, "OB_FN", ObjectKind::Function);
+        let Properties::Routine(r) = &def.props else {
+            panic!("{:?}", def.props)
+        };
+        assert_eq!(
+            (
+                r.params[0].name.as_str(),
+                r.params[0].default.as_str(),
+                r.returns.as_str()
+            ),
+            ("P_X", "0", "NUMBER")
+        );
+        let mut draft = def.draft();
+        let Properties::Routine(r) = &mut draft.props else {
+            panic!()
+        };
+        r.body = "BEGIN\n  RETURN p_x + 2;\nEND;".into();
+        r.deterministic = true;
+        assert_eq!(
+            apply(&rt, d, &plan(f, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(one(&rt, d, "SELECT OB_FN(1) FROM dual"), "3");
+
+        // Package: spec change recompiles the body, which then fails; fix the body.
+        let mut pk = template(f, ObjectKind::Package, s);
+        let Properties::Source(src) = &mut pk.props else {
+            panic!()
+        };
+        src.spec = src.spec.replace("NEW_PACKAGE", "OB_PKG");
+        src.body = src.body.replace("NEW_PACKAGE", "OB_PKG");
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &pk).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_PKG", ObjectKind::Package);
+        assert_eq!(def.status.len(), 2);
+        let mut draft = def.draft();
+        let Properties::Source(src) = &mut draft.props else {
+            panic!()
+        };
+        src.spec = "PACKAGE OB_PKG AS\n  PROCEDURE run;\n  PROCEDURE stop;\nEND OB_PKG;".into();
+        let p = plan(f, Some(&def), &draft).unwrap();
+        assert_eq!(
+            p.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            [StepKind::Replace, StepKind::Compile]
+        );
+        let out = apply(&rt, d, &p);
+        assert_eq!(out.state, FinalState::Invalid, "{out:?}");
+        assert!(
+            out.errors.iter().any(|e| e.part == "PACKAGE BODY"),
+            "{:?}",
+            out.errors
+        );
+        let def = load(&rt, d, s, "OB_PKG", ObjectKind::Package);
+        let mut draft = def.draft();
+        let Properties::Source(src) = &mut draft.props else {
+            panic!()
+        };
+        src.body = "PACKAGE BODY OB_PKG AS\n  PROCEDURE run IS BEGIN NULL; END run;\n  PROCEDURE stop IS BEGIN NULL; END stop;\nEND OB_PKG;".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(
+            apply(&rt, d, &recompile_plan(f, &def.object).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(
+            load(&rt, d, s, "OB_PKG", ObjectKind::Package).valid(),
+            Some(true)
+        );
+
+        // Sequence.
+        let mut q = template(f, ObjectKind::Sequence, s);
+        q.object.name = "ob_seq".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &q).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_SEQ", ObjectKind::Sequence);
+        let mut draft = def.draft();
+        let Properties::Sequence(sq) = &mut draft.props else {
+            panic!()
+        };
+        sq.cache = "100".into();
+        sq.restart_with = "50".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+        assert_eq!(one(&rt, d, "SELECT OB_SEQ.NEXTVAL FROM dual"), "50");
+        let def = load(&rt, d, s, "OB_SEQ", ObjectKind::Sequence);
+        let Properties::Sequence(sq) = &def.props else {
+            panic!()
+        };
+        assert_eq!(sq.cache, "100");
+        assert_eq!(
+            apply(&rt, d, &rename_plan(&def, "ob_seq2").unwrap()).state,
+            FinalState::Changed
+        );
+
+        // View.
+        let mut v = template(f, ObjectKind::View, s);
+        v.object.name = "ob_v".into();
+        let Properties::View(vp) = &mut v.props else {
+            panic!()
+        };
+        vp.query = "SELECT id FROM ob_t".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &v).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_V", ObjectKind::View);
+        let mut draft = def.draft();
+        let Properties::View(vp) = &mut draft.props else {
+            panic!("{:?}", def.props)
+        };
+        assert!(
+            vp.query.to_ascii_uppercase().contains("FROM OB_T"),
+            "{}",
+            vp.query
+        );
+        vp.query = "SELECT id, n FROM ob_t".into();
+        vp.columns = String::new();
+        vp.check = ViewCheck::ReadOnly;
+        assert_eq!(
+            apply(&rt, d, &plan(f, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_V", ObjectKind::View);
+        let Properties::View(vp) = &def.props else {
+            panic!()
+        };
+        assert_eq!(vp.check, ViewCheck::ReadOnly);
+        assert_eq!(
+            apply(&rt, d, &rename_plan(&def, "ob_v2").unwrap()).state,
+            FinalState::Changed
+        );
+
+        // Synonym.
+        let mut sy = template(f, ObjectKind::Synonym, s);
+        sy.object.name = "ob_syn".into();
+        let Properties::Synonym(sp) = &mut sy.props else {
+            panic!()
+        };
+        (sp.target_schema, sp.target) = (s.into(), "ob_t".into());
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &sy).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_SYN", ObjectKind::Synonym);
+        assert!(
+            def.facts
+                .iter()
+                .any(|(k, v)| k == "resolves to" && v == "TABLE DEADLOCK.OB_T"),
+            "{:?}",
+            def.facts
+        );
+        let mut draft = def.draft();
+        let Properties::Synonym(sp) = &mut draft.props else {
+            panic!()
+        };
+        sp.target = "OB_V2".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, Some(&def), &draft).unwrap()).state,
+            FinalState::Changed
+        );
+
+        // Materialized view: refresh options, then a new query (drop and create).
+        let mut mv = template(f, ObjectKind::MaterializedView, s);
+        mv.object.name = "ob_mv".into();
+        let Properties::MaterializedView(m) = &mut mv.props else {
+            panic!()
+        };
+        m.query = "SELECT COUNT(*) n FROM ob_t".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &mv).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_MV", ObjectKind::MaterializedView);
+        let mut draft = def.draft();
+        let Properties::MaterializedView(m) = &mut draft.props else {
+            panic!()
+        };
+        assert!(
+            m.query.to_ascii_uppercase().contains("COUNT(*)"),
+            "{}",
+            m.query
+        );
+        m.method = deadlock_core::objects::RefreshMethod::Complete;
+        let p = plan(f, Some(&def), &draft).unwrap();
+        assert_eq!(p.verb(), "ALTER");
+        assert_eq!(apply(&rt, d, &p).state, FinalState::Changed);
+        let def = load(&rt, d, s, "OB_MV", ObjectKind::MaterializedView);
+        let mut draft = def.draft();
+        let Properties::MaterializedView(m) = &mut draft.props else {
+            panic!()
+        };
+        m.query = "SELECT COUNT(*) n, MAX(id) top FROM ob_t".into();
+        let p = plan(f, Some(&def), &draft).unwrap();
+        assert!(!p.atomic);
+        let out = apply(&rt, d, &p);
+        assert_eq!(out.state, FinalState::Changed, "{out:?}");
+        assert_eq!(
+            one(
+                &rt,
+                d,
+                "SELECT COUNT(*) FROM all_tab_columns WHERE owner = 'DEADLOCK' AND table_name = 'OB_MV'"
+            ),
+            "2"
+        );
+
+        // Type.
+        let mut ty = template(f, ObjectKind::Type, s);
+        let Properties::Source(src) = &mut ty.props else {
+            panic!()
+        };
+        src.spec =
+            "TYPE OB_ADDR_T AS OBJECT (\n  street VARCHAR2(80),\n  city VARCHAR2(40)\n);".into();
+        assert_eq!(
+            apply(&rt, d, &plan(f, None, &ty).unwrap()).state,
+            FinalState::Changed
+        );
+        let def = load(&rt, d, s, "OB_ADDR_T", ObjectKind::Type);
+        assert!(
+            def.facts
+                .iter()
+                .any(|(k, v)| k == "attribute STREET" && v == "VARCHAR2(80)"),
+            "{:?}",
+            def.facts
+        );
+
+        // Read-only refuses; then drop everything.
+        let ro = rt
+            .block_on(connect(
+                &ConnectionConfig {
+                    read_only: true,
+                    ..config(Engine::Oracle, 1521, "FREEPDB1")
+                },
+                PASSWORD,
+            ))
+            .unwrap();
+        let p = drop_plan(f, &def.object);
+        assert!(rt.block_on(ro.apply_object(&p, None)).is_err());
+        for (name, kind) in [
+            ("OB_ADDR_T", ObjectKind::Type),
+            ("OB_MV", ObjectKind::MaterializedView),
+            ("OB_SYN", ObjectKind::Synonym),
+            ("OB_V2", ObjectKind::View),
+            ("OB_SEQ2", ObjectKind::Sequence),
+            ("OB_PKG", ObjectKind::Package),
+            ("OB_FN", ObjectKind::Function),
+            ("OB_T_BIU2", ObjectKind::Trigger),
+        ] {
+            let out = apply(&rt, d, &drop_plan(f, &ObjectRef::new(s, name, kind)));
+            assert_eq!(out.state, FinalState::Changed, "{name} {out:?}");
+        }
+        run(&rt, d, "DROP TABLE OB_T PURGE").unwrap();
+    }
+}
+
+/// Another session kills the app's own: a read reconnects and runs again; a write, and
+/// a read inside an open transaction, fail plainly without running again; the call
+/// after each runs on the new session, in the same transaction mode.
+fn heals_after_its_session_is_killed(engine: Engine, port: u16, database: &str, admin: &str) {
+    let rt = Runtime::new().unwrap();
+    let cfg = ConnectionConfig {
+        encryption: Encryption::Off,
+        ..config(engine, port, database)
+    };
+    let admin = connect_as(
+        &rt,
+        &ConnectionConfig {
+            user: admin.into(),
+            ..cfg.clone()
+        },
+    );
+    let app = connect_as(&rt, &cfg);
+    let one = if engine == Engine::Oracle {
+        "SELECT 1 FROM dual"
+    } else {
+        "SELECT 1"
+    };
+    let count = |d: &dyn Driver| count(&rt, d, "deadlock.p_heal");
+    let kill = || {
+        let id = app.session_id().unwrap();
+        let snap = rt.block_on(admin.sessions()).unwrap();
+        let s = snap.session(id).unwrap();
+        assert!(s.this_app && !s.own, "{s:?}");
+        rt.block_on(admin.end_session(id)).unwrap();
+        // Oracle marks the session killed at once but ends it a moment later.
+        std::thread::sleep(Duration::from_millis(500));
+        id
+    };
+    run(&rt, &*app, "DROP TABLE IF EXISTS deadlock.p_heal").unwrap();
+    run(
+        &rt,
+        &*app,
+        "CREATE TABLE deadlock.p_heal (id INT PRIMARY KEY)",
+    )
+    .unwrap();
+
+    let before = kill();
+    assert_eq!(count(&*app), "0", "a read heals");
+    // Oracle may give the new session the old SID.
+    if engine != Engine::Oracle {
+        assert_ne!(app.session_id(), Some(before));
+    }
+
+    kill();
+    let e = run(&rt, &*app, "INSERT INTO deadlock.p_heal VALUES (1)").unwrap_err();
+    assert!(e.contains("did not run it again"), "{e}");
+    assert_eq!(count(&*admin), "0", "the write did not run again");
+    run(&rt, &*app, "INSERT INTO deadlock.p_heal VALUES (2)").unwrap();
+
+    rt.block_on(app.set_auto_commit(false)).unwrap();
+    run(&rt, &*app, "INSERT INTO deadlock.p_heal VALUES (3)").unwrap();
+    assert!(open(&rt, &*app));
+    kill();
+    let e = run(&rt, &*app, one).unwrap_err();
+    assert!(e.contains("transaction was rolled back"), "{e}");
+    assert!(!open(&rt, &*app));
+    assert_eq!(count(&*app), "1", "the insert was rolled back");
+    // Still manual: an insert stays uncommitted until rolled back.
+    run(&rt, &*app, "INSERT INTO deadlock.p_heal VALUES (4)").unwrap();
+    assert!(open(&rt, &*app));
+    rt.block_on(app.end_transaction(false)).unwrap();
+    assert_eq!(count(&*admin), "1");
+    rt.block_on(app.set_auto_commit(true)).unwrap();
+    // A killed Oracle session keeps its locks until the server has cleaned it up.
+    let until = Instant::now() + Duration::from_secs(30);
+    while let Err(e) = run(&rt, &*admin, "DROP TABLE deadlock.p_heal") {
+        assert!(Instant::now() < until && e.contains("ORA-00054"), "{e}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn mysql_heals_after_its_session_is_killed() {
+    heals_after_its_session_is_killed(Engine::Mysql, 3306, "deadlock", "root");
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn mariadb_heals_after_its_session_is_killed() {
+    heals_after_its_session_is_killed(Engine::Mariadb, 3307, "deadlock", "root");
+}
+
+#[test]
+#[ignore = "needs docker compose"]
+fn oracle_heals_after_its_session_is_killed() {
+    heals_after_its_session_is_killed(Engine::Oracle, 1521, "FREEPDB1", "system");
 }

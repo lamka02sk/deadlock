@@ -18,6 +18,7 @@ use gpui_kit::{
 use crate::app::{Db, HistoryDb};
 use crate::assets::{Icon, icon};
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind, button, square_button};
 
 actions!(history, [Up, Down, InsertSelected]);
@@ -359,7 +360,7 @@ impl HistoryPanel {
                                 .build(window, cx)
                         })
                     })
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    .clickable(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                         window.focus(&this.focus, cx);
                         this.select(i, cx);
                         if ev.click_count() >= 2 {
@@ -410,7 +411,7 @@ impl Render for HistoryPanel {
                 .whitespace_nowrap()
                 .hover(move |s| s.bg(hover))
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_scope(scope, cx)))
+                .clickable(cx.listener(move |this, _, _, cx| this.set_scope(scope, cx)))
         };
         let picked = self.selected.is_some();
         let action = |id: &'static str, label: &'static str, tip: &'static str, cx: &App| {
@@ -454,7 +455,7 @@ impl Render for HistoryPanel {
                             format!("Close ({})", crate::keymap::label("history", cx)),
                             cx,
                         )
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(HistoryEvent::Close))),
+                        .clickable(cx.listener(|_, _, _, cx| cx.emit(HistoryEvent::Close))),
                     ),
             )
             .child(
@@ -539,7 +540,9 @@ impl Render for HistoryPanel {
                     )
                     .child(
                         action("history-copy", "Copy", "Copy the statement", cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
+                            .when(picked, |b| {
+                                b.clickable(cx.listener(|this, _, _, cx| this.copy(cx)))
+                            }),
                     )
                     .child(
                         action(
@@ -548,7 +551,9 @@ impl Render for HistoryPanel {
                             "Insert into the query in front (Enter, double-click)",
                             cx,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.insert(cx))),
+                        .when(picked, |b| {
+                            b.clickable(cx.listener(|this, _, _, cx| this.insert(cx)))
+                        }),
                     )
                     .child(
                         action(
@@ -557,7 +562,9 @@ impl Render for HistoryPanel {
                             "Open in a new query tab on its connection",
                             cx,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.open(cx))),
+                        .when(picked, |b| {
+                            b.clickable(cx.listener(|this, _, _, cx| this.open(cx)))
+                        }),
                     ),
             )
     }

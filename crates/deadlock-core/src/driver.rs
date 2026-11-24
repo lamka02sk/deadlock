@@ -51,6 +51,91 @@ pub enum DriverError {
     /// Refused before sending: the connection is read-only.
     #[error("not run: the connection is read-only, and {0} changes data or schema")]
     ReadOnly(String),
+    /// The session died under a statement that is not safe to run twice.
+    #[error(
+        "The connection to the server was lost while this ran, so it may or may not have \
+         taken effect. Deadlock reconnected and did not run it again: check, then run it again \
+         if needed."
+    )]
+    NotRetried,
+    /// The session died with a transaction open; the server rolled it back.
+    #[error(
+        "The connection to the server was lost, so the open transaction was rolled back: its \
+         uncommitted changes are gone. Deadlock reconnected; the next statement starts fresh."
+    )]
+    TransactionLost,
+    /// The session died and opening a new one failed too.
+    #[error("The connection to the server was lost, and reconnecting failed: {0}")]
+    ReconnectFailed(String),
+}
+
+impl DriverError {
+    /// Whether the server session behind the connection is gone (killed, timed out, the
+    /// socket closed), so only a new connection helps. A cancelled statement is not:
+    /// MySQL's 1317 (query interrupted) is what `KILL QUERY` sends to a live session.
+    pub fn is_connection_lost(&self) -> bool {
+        match self {
+            Self::Mysql(e) => {
+                use mysql_async::{DriverError as D, Error as E};
+                match e {
+                    E::Io(_) | E::Driver(D::ConnectionClosed | D::PoolDisconnected) => true,
+                    // Gone away, lost during query, shutdown, killed, idle timeout.
+                    E::Server(s) => matches!(s.code, 2006 | 2013 | 1053 | 1927 | 4031),
+                    _ => false,
+                }
+            }
+            Self::Oracle(e) => {
+                use oracledb::ErrorKind as K;
+                matches!(
+                    e.kind(),
+                    K::DeadConnection | K::NotConnected | K::StreamOperation
+                ) || e.db_error_code().is_some_and(ora_lost)
+                    || lost_text(&e.to_string())
+            }
+            Self::OracleThick(e) => {
+                e.db_error()
+                    .and_then(|d| usize::try_from(d.code()).ok())
+                    .is_some_and(ora_lost)
+                    || lost_text(&e.to_string())
+            }
+            Self::Redis(e) => e.is_io_error() || e.is_connection_dropped(),
+            _ => false,
+        }
+    }
+}
+
+/// ORA- codes of a session that is gone: killed (28), not logged on (1012), idle limit
+/// (2396), end of file on the channel (3113, 3114, 3135), TNS lost contact (12537, 12547).
+fn ora_lost(code: usize) -> bool {
+    matches!(code, 28 | 1012 | 2396 | 3113 | 3114 | 3135 | 12537 | 12547)
+}
+
+/// The same in an error's text, and ODPI-C's "not connected" / "connection closed".
+fn lost_text(text: &str) -> bool {
+    [
+        "ORA-00028",
+        "ORA-01012",
+        "ORA-02396",
+        "ORA-03113",
+        "ORA-03114",
+        "ORA-03135",
+        "ORA-12537",
+        "ORA-12547",
+        "DPI-1010",
+        "DPI-1080",
+    ]
+    .iter()
+    .any(|c| text.contains(c))
+}
+
+/// The state of a self-healing connection ([`Driver::link`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    Up,
+    /// The session was lost; a new one is being opened.
+    Reconnecting,
+    /// Reconnecting failed; what failed.
+    Lost(String),
 }
 
 pub type Result<T, E = DriverError> = std::result::Result<T, E>;
@@ -232,7 +317,8 @@ pub struct ObjectPath(pub Vec<String>);
 #[serde(rename_all = "lowercase")]
 pub enum NodeKind {
     Database,
-    /// Tables, Views or Routines under a database.
+    /// A group under a database (Tables, Views, Procedures, Triggers…; see
+    /// [`crate::objects::ObjectKind::group`]), or Triggers under a table.
     Group,
     Table,
     View,
@@ -470,20 +556,104 @@ pub trait Driver: Send + Sync {
         Box::pin(async { Err(DriverError::Unsupported("no schema diagram on this engine")) })
     }
 
+    /// Search everywhere: object names, columns and source text containing `text`,
+    /// ignoring case, read from the server's metadata with `text` bound, never written
+    /// into the SQL. At most [`crate::search::LIMIT`] rows per query; system schemas
+    /// are left out, and so are the schemas named in `hidden` (exact names, bound, so
+    /// they never count toward the limit; Redis: `db<n>`). `stop` is checked between queries: a newer search sets it.
+    fn search_everywhere<'a>(
+        &'a self,
+        _text: &'a str,
+        _hidden: &'a [String],
+        _stop: &'a std::sync::atomic::AtomicBool,
+    ) -> BoxFuture<'a, Result<Vec<crate::search::Hit>>> {
+        Box::pin(async { Err(DriverError::Unsupported("no search on this engine")) })
+    }
+
+    /// The `CREATE` statement of routine, trigger or event `name` in `schema`; `kind`
+    /// as [`crate::search::Hit::kind`] names it.
+    fn definition<'a>(
+        &'a self,
+        _schema: &'a str,
+        _name: &'a str,
+        _kind: &'a str,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async { Err(DriverError::Unsupported("no definitions on this engine")) })
+    }
+
+    /// The flavor objects are managed in ([`crate::objects`]); `None` on engines
+    /// without schema objects (Redis). MySQL and MariaDB are told apart from the
+    /// server's version.
+    fn object_flavor(&self) -> Option<crate::objects::Flavor> {
+        None
+    }
+
+    /// One object for the object editor: typed properties, the server's source,
+    /// status, compile errors, grants and facts. A body the account may not see
+    /// comes back with [`crate::objects::ObjectDefinition::read_only`] set.
+    fn object<'a>(
+        &'a self,
+        _object: &'a crate::objects::ObjectRef,
+    ) -> BoxFuture<'a, Result<crate::objects::ObjectDefinition>> {
+        Box::pin(async { Err(DriverError::Unsupported("no object editor on this engine")) })
+    }
+
+    /// Runs a plan from [`crate::objects::plan`] (or `drop_plan`, `rename_plan`,
+    /// `recompile_plan`, `revert_plan`) as its steps say, and reports each step. The
+    /// error is only for what stops it before the first statement (read-only
+    /// connection, an open transaction DDL would commit, a lost connection); a
+    /// failed statement is in the outcome. When the object ends up missing, the
+    /// original is written to `backup` when given. Oracle: compile errors are read
+    /// after, and the state is `Invalid` when there are any.
+    fn apply_object<'a>(
+        &'a self,
+        _plan: &'a crate::objects::ChangePlan,
+        _backup: Option<&'a crate::objects::Backup>,
+    ) -> BoxFuture<'a, Result<crate::objects::ApplyOutcome>> {
+        Box::pin(async { Err(DriverError::Unsupported("no object editor on this engine")) })
+    }
+
     /// The children of `node` in the sidebar tree. A node may come with its own
     /// children already loaded (MySQL loads a whole database at once).
     fn children<'a>(&'a self, _node: &'a ObjectPath) -> BoxFuture<'a, Result<Vec<ObjectNode>>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// The server's id of this connection's session (MySQL `CONNECTION_ID()`, Oracle
+    /// SID), where the engine has one.
+    fn session_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Follows reconnects, for connections that heal themselves after a lost session.
+    fn link(&self) -> Option<tokio::sync::watch::Receiver<Link>> {
+        None
     }
 }
 
 /// Opens a connection, through its SSH tunnel when it has one (with the secret given
 /// to [`crate::ssh::remember`]). Call on the core runtime.
 ///
+/// SQL connections heal themselves: a lost session is replaced ([`crate::heal`]).
+///
 /// # Errors
 /// Fails when the SSH server or the database cannot be reached or refuses the
 /// sign-in; the text says which hop failed.
 pub async fn connect(config: &ConnectionConfig, password: &str) -> Result<Arc<dyn Driver>> {
+    let driver = dial(config, password).await?;
+    // Redis heals in its connection manager.
+    if config.engine == Engine::Redis {
+        return Ok(driver);
+    }
+    Ok(Arc::new(crate::heal::Healing::new(
+        config.clone(),
+        password.to_owned(),
+        driver,
+    )))
+}
+
+/// One connection, without healing: the first one, and each reconnect.
+pub(crate) async fn dial(config: &ConnectionConfig, password: &str) -> Result<Arc<dyn Driver>> {
     if !config.ssh_tunnel {
         return open(config, password, None).await;
     }
@@ -593,6 +763,61 @@ mod tests {
         assert_eq!(Value::Time(t).to_string(), "-838:59:59");
         let t = TimeDelta::seconds(61) + TimeDelta::microseconds(5);
         assert_eq!(Value::Time(t).to_string(), "00:01:01.000005");
+    }
+
+    #[test]
+    fn lost_connections_are_told_from_other_errors() {
+        use std::io::{Error as Io, ErrorKind as K};
+        let my = |e: mysql_async::Error| DriverError::Mysql(e).is_connection_lost();
+        let server = |code| {
+            mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: String::new(),
+                state: String::new(),
+            })
+        };
+        for kind in [K::BrokenPipe, K::ConnectionReset, K::UnexpectedEof] {
+            assert!(my(mysql_async::Error::from(Io::from(kind))), "{kind:?}");
+        }
+        // EIO, what the user saw as "Input/output error".
+        assert!(my(mysql_async::Error::from(Io::from_raw_os_error(5))));
+        assert!(my(mysql_async::DriverError::ConnectionClosed.into()));
+        assert!(my(mysql_async::DriverError::PoolDisconnected.into()));
+        for code in [2006, 2013, 1053, 1927, 4031] {
+            assert!(my(server(code)), "{code}");
+        }
+        // A cancelled statement, a syntax error, a duplicate key: the session lives.
+        for code in [1317, 1064, 1062] {
+            assert!(!my(server(code)), "{code}");
+        }
+
+        let thin = DriverError::Oracle(oracledb::Error::from(Io::from(K::ConnectionReset)));
+        assert!(thin.is_connection_lost());
+        let thick = |m: &'static str| {
+            DriverError::OracleThick(oracle::Error::new(oracle::ErrorKind::OciError, m))
+                .is_connection_lost()
+        };
+        assert!(thick("ORA-00028: your session has been killed"));
+        assert!(thick("ORA-03113: end-of-file on communication channel"));
+        assert!(thick("ORA-03135: connection lost contact"));
+        assert!(thick("ORA-12547: TNS:lost contact"));
+        assert!(thick("DPI-1010: not connected"));
+        assert!(thick("DPI-1080: connection was closed by ORA-3113"));
+        assert!(!thick("ORA-00942: table or view does not exist"));
+
+        let redis = |e: redis::RedisError| DriverError::Redis(e).is_connection_lost();
+        assert!(redis(Io::from(K::BrokenPipe).into()));
+        assert!(redis(Io::from(K::ConnectionReset).into()));
+        assert!(!redis((redis::ErrorKind::Parse, "WRONGTYPE").into()));
+
+        for e in [
+            DriverError::Invalid("Input/output error".into()),
+            DriverError::Gone,
+            DriverError::NotRetried,
+            DriverError::ReadOnly("UPDATE".into()),
+        ] {
+            assert!(!e.is_connection_lost(), "{e}");
+        }
     }
 
     #[test]

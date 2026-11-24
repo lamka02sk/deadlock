@@ -9,7 +9,7 @@ use super::{col, texts};
 use crate::driver::{DriverError, NodeKind, ObjectNode, Result};
 
 /// The groups under a schema, in order, with the `ALL_OBJECTS` type each lists.
-const GROUPS: [(&str, &str); 9] = [
+const GROUPS: [(&str, &str); 10] = [
     ("Tables", "TABLE"),
     ("Views", "VIEW"),
     ("Materialized views", "MATERIALIZED VIEW"),
@@ -19,6 +19,7 @@ const GROUPS: [(&str, &str); 9] = [
     ("Packages", "PACKAGE"),
     ("Triggers", "TRIGGER"),
     ("Synonyms", "SYNONYM"),
+    ("Types", "TYPE"),
 ];
 
 pub(super) fn children(conn: &Connection, path: &[String]) -> Result<Vec<ObjectNode>> {
@@ -50,7 +51,7 @@ pub(super) fn children(conn: &Connection, path: &[String]) -> Result<Vec<ObjectN
         conn,
         "SELECT OBJECT_NAME, OBJECT_TYPE, STATUS FROM ALL_OBJECTS WHERE OWNER = :1 \
          AND SUBOBJECT_NAME IS NULL AND GENERATED = 'N' AND OBJECT_TYPE IN ('VIEW', 'MATERIALIZED VIEW', \
-         'SEQUENCE', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'TRIGGER', 'SYNONYM') \
+         'SEQUENCE', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'TRIGGER', 'SYNONYM', 'TYPE') \
          ORDER BY OBJECT_NAME",
         &[schema],
     )?;
@@ -69,7 +70,12 @@ pub(super) fn children(conn: &Connection, path: &[String]) -> Result<Vec<ObjectN
          WHERE c.OWNER = :1 AND c.CONSTRAINT_TYPE IN ('P', 'R')",
         &[schema],
     )?;
-    let mut nodes = schema_children(&tables, &objects, &columns, &keys);
+    let triggers = texts(
+        conn,
+        "SELECT TRIGGER_NAME, TABLE_OWNER, TABLE_NAME, STATUS FROM ALL_TRIGGERS WHERE OWNER = :1",
+        &[schema],
+    )?;
+    let mut nodes = schema_children(&tables, &objects, &columns, &keys, (schema, &triggers));
     for name in rest {
         nodes = nodes
             .into_iter()
@@ -131,15 +137,40 @@ pub(super) fn type_label(r: &[Option<String>], at: usize) -> String {
     label.to_ascii_lowercase()
 }
 
-/// The groups of one schema with every column inside. Rows are `(table)`,
-/// `(object, type, status)`, columns as [`type_label`] reads them after
-/// `(table, column)`, and `(table, column, P|R)`.
+/// The groups of one schema with every column inside, empty ones included. Rows are
+/// `(table)`, `(object, type, status)`, columns as [`type_label`] reads them after
+/// `(table, column)`, `(table, column, P|R)`, and the schema with its triggers'
+/// `(trigger, table owner, table, status)`. A trigger shows its table (or
+/// `invalid`, `disabled`); a table with triggers also lists them in a Triggers
+/// group after its columns.
 fn schema_children(
     tables: &[Vec<Option<String>>],
     objects: &[Vec<Option<String>>],
     columns: &[Vec<Option<String>>],
     keys: &[Vec<Option<String>>],
+    (schema, triggers): (&str, &[Vec<Option<String>>]),
 ) -> Vec<ObjectNode> {
+    let mut trigger_detail: HashMap<String, String> = HashMap::new();
+    let mut on_table: HashMap<String, Vec<ObjectNode>> = HashMap::new();
+    for r in triggers {
+        let (name, owner, table) = (col(r, 0), col(r, 1), col(r, 2));
+        let detail = if col(r, 3) == "DISABLED" {
+            "disabled".to_owned()
+        } else {
+            table.clone()
+        };
+        if owner == schema && !table.is_empty() {
+            on_table.entry(table).or_default().push(ObjectNode {
+                detail: if detail == "disabled" {
+                    detail.clone()
+                } else {
+                    String::new()
+                },
+                ..ObjectNode::new(name.clone(), NodeKind::Routine)
+            });
+        }
+        trigger_detail.insert(name, detail);
+    }
     let key: HashSet<(String, String, String)> = keys
         .iter()
         .map(|r| (col(r, 0), col(r, 1), col(r, 2)))
@@ -168,8 +199,15 @@ fn schema_children(
         if views.contains(&name) {
             continue;
         }
+        let mut children = by_table.remove(&name).unwrap_or_default();
+        if let Some(t) = on_table.remove(&name) {
+            children.push(ObjectNode {
+                children: Some(t),
+                ..ObjectNode::new("Triggers", NodeKind::Group)
+            });
+        }
         groups[0].push(ObjectNode {
-            children: Some(by_table.remove(&name).unwrap_or_default()),
+            children: Some(children),
             ..ObjectNode::new(name, NodeKind::Table)
         });
     }
@@ -187,6 +225,8 @@ fn schema_children(
             ObjectNode {
                 detail: if col(r, 2) == "INVALID" {
                     "invalid".into()
+                } else if ty == "TRIGGER" {
+                    trigger_detail.get(&name).cloned().unwrap_or_default()
                 } else {
                     String::new()
                 },
@@ -242,6 +282,8 @@ mod tests {
                 r(&["MV_TOTALS", "MATERIALIZED VIEW", "VALID"]),
                 r(&["ORDERS_SEQ", "SEQUENCE", "VALID"]),
                 r(&["BAD_PROC", "PROCEDURE", "INVALID"]),
+                r(&["ORDERS_BIU", "TRIGGER", "VALID"]),
+                r(&["OFF_T", "TRIGGER", "VALID"]),
                 r(&["V_ORDERS", "VIEW", "VALID"]),
             ],
             &[
@@ -254,6 +296,13 @@ mod tests {
                 r(&["ORDERS", "ID", "P"]),
                 r(&["ORDERS", "CUSTOMER_ID", "R"]),
             ],
+            (
+                "APP",
+                &[
+                    r(&["ORDERS_BIU", "APP", "ORDERS", "ENABLED"]),
+                    r(&["OFF_T", "APP", "ORDERS", "DISABLED"]),
+                ],
+            ),
         );
         let names: Vec<_> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, GROUPS.map(|g| g.0));
@@ -264,6 +313,20 @@ mod tests {
         );
         let orders = &groups[0].children.as_ref().unwrap()[0];
         let cols = orders.children.as_ref().unwrap();
+        let on = cols.last().unwrap();
+        assert_eq!(
+            (on.name.as_str(), on.children.as_ref().unwrap().len()),
+            ("Triggers", 2)
+        );
+        assert_eq!(groups[9].name, "Types");
+        let trig: Vec<_> = groups[7]
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| (t.name.as_str(), t.detail.as_str()))
+            .collect();
+        assert_eq!(trig, [("ORDERS_BIU", "ORDERS"), ("OFF_T", "disabled")]);
         assert!(cols[0].primary_key && !cols[0].foreign_key);
         assert!(cols[1].foreign_key);
         assert_eq!(cols[0].detail, "number(*,0)");

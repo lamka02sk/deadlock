@@ -1,6 +1,7 @@
 //! MySQL and MariaDB on `mysql_async`. One driver; the flavor comes from `VERSION()`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use mysql_async::consts::{ColumnFlags, ColumnType, StatusFlags};
@@ -8,7 +9,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::classify::{Statement, classify};
+use crate::classify::{Kind, Statement, classify};
 use crate::connection::{ConnectionConfig, Encryption, Engine};
 use crate::diagram::Diagram;
 use crate::edit::{Change, ChangeKind, ColumnInfo, TableInfo, TableRef, pick_key, quote_ident};
@@ -24,20 +25,14 @@ use crate::driver::{
 };
 
 mod config;
+mod objects;
+mod search;
 mod sessions;
 
 /// The `program_name` connection attribute: marks Deadlock's sessions to the server.
-/// mysql_async drops it on TLS connections, so [`OURS`] marks them in this process.
+/// mysql_async drops it on TLS connections, so [`crate::sessions::Mark`] marks them in
+/// this process.
 const PROGRAM_NAME: &str = "Deadlock";
-
-/// Session ids this process has open, by server address.
-static OURS: std::sync::Mutex<std::collections::BTreeSet<(String, u16, u32)>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-fn ours() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<(String, u16, u32)>> {
-    OURS.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// MySQL's binary collation: byte strings, not text.
 const BINARY_CHARSET: u16 = 63;
@@ -53,14 +48,9 @@ pub struct Mysql {
     /// Writes are refused before sending; the session is also read-only on the server.
     read_only: bool,
     mariadb: bool,
-    /// Host and port, for [`OURS`].
-    server: (String, u16),
-}
-
-impl Drop for Mysql {
-    fn drop(&mut self) {
-        ours().remove(&(self.server.0.clone(), self.server.1, self.id));
-    }
+    /// The open transaction ran more than reads. With autocommit off the server opens
+    /// one on any read too, and that one has nothing to commit.
+    wrote: Arc<AtomicBool>,
 }
 
 fn opts(config: &ConnectionConfig, password: &str, ssl: Option<SslOpts>) -> Opts {
@@ -97,12 +87,11 @@ pub async fn connect(config: &ConnectionConfig, password: &str) -> Result<Mysql>
     if config.read_only {
         conn.query_drop("SET SESSION TRANSACTION READ ONLY").await?;
     }
-    ours().insert((config.host.clone(), config.port, conn.id()));
     Ok(Mysql {
         tunnel: None,
-        server: (config.host.clone(), config.port),
         read_only: config.read_only,
         mariadb: raw.contains("MariaDB"),
+        wrote: Arc::default(),
         id: conn.id(),
         conn: Arc::new(Mutex::new(conn)),
         opts,
@@ -130,20 +119,26 @@ impl Driver for Mysql {
         Capabilities::SQL
     }
 
+    fn session_id(&self) -> Option<u64> {
+        Some(u64::from(self.id))
+    }
+
     fn server_version(&self) -> &str {
         &self.version
     }
 
     fn execute<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<ResultStream>> {
         let conn = Arc::clone(&self.conn);
-        let refused = self.read_only.then(|| classify(text, Engine::Mysql));
+        let statement = classify(text, Engine::Mysql);
+        let wrote = Arc::clone(&self.wrote);
         let text = text.to_owned();
         Box::pin(async move {
-            if let Some(s) = refused.filter(Statement::changes) {
-                return Err(DriverError::ReadOnly(s.verb));
+            if self.read_only && statement.changes() {
+                return Err(DriverError::ReadOnly(statement.verb));
             }
+            let writes = statement.kind != Kind::Read;
             let (head_tx, head) = oneshot::channel();
-            tokio::spawn(run(conn, text, head_tx));
+            tokio::spawn(run(conn, text, writes, wrote, head_tx));
             head.await.map_err(|_| DriverError::Gone)?
         })
     }
@@ -180,15 +175,13 @@ impl Driver for Mysql {
     }
 
     /// From the status flags of a ping's OK packet: fresh even after an error, and the
-    /// ping fails when the connection is gone.
+    /// ping fails when the connection is gone. A transaction that only read (autocommit
+    /// off opens one on the first SELECT) does not count.
     fn transaction_open(&self) -> BoxFuture<'_, Result<bool>> {
         Box::pin(async move {
             let mut conn = self.conn.lock().await;
             conn.ping().await?;
-            let flags = conn
-                .last_ok_packet()
-                .map_or(StatusFlags::empty(), |ok| ok.status_flags());
-            Ok(flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS))
+            Ok(track(&conn, &self.wrote, false))
         })
     }
 
@@ -388,6 +381,8 @@ impl Driver for Mysql {
             };
             let mut conn = self.conn.lock().await;
             conn.query_drop(begin).await?;
+            // Manual mode: the changes stay in the session's transaction.
+            self.wrote.store(!auto, Ordering::Relaxed);
             for (i, c) in changes.iter().enumerate() {
                 let outcome = match conn.query_drop(c.sql.as_str()).await {
                     Ok(()) => {
@@ -448,14 +443,7 @@ impl Driver for Mysql {
     fn sessions(&self) -> BoxFuture<'_, Result<crate::sessions::Snapshot>> {
         Box::pin(async move {
             let mut conn = self.conn.lock().await;
-            let mut snap = sessions::snapshot(&mut conn, self.mariadb, self.id).await?;
-            drop(conn);
-            let ours = ours();
-            for s in &mut snap.sessions {
-                let id = u32::try_from(s.id).unwrap_or(0);
-                s.deadlock |= ours.contains(&(self.server.0.clone(), self.server.1, id));
-            }
-            Ok(snap)
+            sessions::snapshot(&mut conn, self.mariadb, self.id).await
         })
     }
 
@@ -527,8 +515,74 @@ impl Driver for Mysql {
         })
     }
 
+    fn search_everywhere<'a>(
+        &'a self,
+        text: &'a str,
+        hidden: &'a [String],
+        stop: &'a AtomicBool,
+    ) -> BoxFuture<'a, Result<Vec<crate::search::Hit>>> {
+        Box::pin(
+            async move { search::search(&mut *self.conn.lock().await, text, hidden, stop).await },
+        )
+    }
+
+    fn definition<'a>(
+        &'a self,
+        schema: &'a str,
+        name: &'a str,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            search::definition(&mut *self.conn.lock().await, schema, name, kind).await
+        })
+    }
+
+    fn object_flavor(&self) -> Option<crate::objects::Flavor> {
+        Some(if self.mariadb {
+            crate::objects::Flavor::Mariadb
+        } else {
+            crate::objects::Flavor::Mysql
+        })
+    }
+
+    fn object<'a>(
+        &'a self,
+        o: &'a crate::objects::ObjectRef,
+    ) -> BoxFuture<'a, Result<crate::objects::ObjectDefinition>> {
+        Box::pin(async move {
+            objects::load(
+                &mut *self.conn.lock().await,
+                self.mariadb,
+                self.read_only,
+                o,
+            )
+            .await
+        })
+    }
+
+    fn apply_object<'a>(
+        &'a self,
+        plan: &'a crate::objects::ChangePlan,
+        backup: Option<&'a crate::objects::Backup>,
+    ) -> BoxFuture<'a, Result<crate::objects::ApplyOutcome>> {
+        Box::pin(async move {
+            if self.read_only {
+                return Err(DriverError::ReadOnly(plan.verb().into()));
+            }
+            let mut conn = self.conn.lock().await;
+            if track(&conn, &self.wrote, false) {
+                return Err(DriverError::Invalid(
+                    "not applied: the session has an open transaction, and MySQL would commit \
+                     it before the DDL. Commit or roll back first."
+                        .into(),
+                ));
+            }
+            objects::apply(&mut conn, plan, backup).await
+        })
+    }
+
     /// `[]`: the databases. `[db, …]`: the database's groups, each loaded down to the
-    /// columns in four `information_schema` queries, then walked down the rest of the path.
+    /// columns in six `information_schema` queries, then walked down the rest of the path.
     fn children<'a>(&'a self, node: &'a ObjectPath) -> BoxFuture<'a, Result<Vec<ObjectNode>>> {
         Box::pin(async move {
             let mut conn = self.conn.lock().await;
@@ -570,8 +624,29 @@ impl Driver for Mysql {
                     (db,),
                 )
                 .await?;
+            let triggers: Vec<(String, String, String, String)> = conn
+                .exec(
+                    "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION \
+                     FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ? ORDER BY TRIGGER_NAME",
+                    (db,),
+                )
+                .await?;
+            let events: Vec<(String, String, Option<String>, Option<String>)> = conn
+                .exec(
+                    "SELECT EVENT_NAME, EVENT_TYPE, INTERVAL_VALUE, INTERVAL_FIELD \
+                     FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME",
+                    (db,),
+                )
+                .await?;
             drop(conn);
-            let mut nodes = database_children(tables, routines, columns, foreign);
+            let mut nodes = database_children(
+                tables,
+                routines,
+                columns,
+                foreign,
+                (triggers, events),
+                self.mariadb,
+            );
             for name in rest {
                 nodes = nodes
                     .into_iter()
@@ -848,15 +923,64 @@ fn databases(names: Vec<String>) -> Vec<ObjectNode> {
         .collect()
 }
 
-/// The Tables, Views and Routines groups of one database, with every column inside.
-/// Rows are `(table, type)`, `(routine, type)`, `(table, column, type, key)` and
-/// `(table, column)` for columns that reference another table.
+/// `(trigger, table, timing, event)` and `(event, type, interval value, interval field)`.
+type ObjectRows = (
+    Vec<(String, String, String, String)>,
+    Vec<(String, String, Option<String>, Option<String>)>,
+);
+
+/// `daily`, `every 5 minute`, `once`: an event's label in the tree.
+fn event_label(ty: &str, value: Option<&str>, field: Option<&str>) -> String {
+    if ty.eq_ignore_ascii_case("ONE TIME") {
+        return "once".into();
+    }
+    let field = field.unwrap_or_default().to_ascii_lowercase();
+    let value = value.unwrap_or_default().trim_matches('\'');
+    match (value, field.as_str()) {
+        ("1", "day") => "daily".into(),
+        ("1", "hour") => "hourly".into(),
+        ("1", "week") => "weekly".into(),
+        ("1", "month") => "monthly".into(),
+        ("1", "year") => "yearly".into(),
+        ("1", f) => format!("every {f}"),
+        (v, f) => format!("every {v} {f}"),
+    }
+}
+
+/// The groups of one database, with every column inside: Tables, Views, Procedures,
+/// Functions, Triggers, Events and on MariaDB Sequences, empty ones included. A
+/// table with triggers also lists them in a Triggers group after its columns.
+/// Rows are `(table, type)`, `(routine, type)`, `(table, column, type, key)`,
+/// `(table, column)` for columns that reference another table, and [`ObjectRows`].
 fn database_children(
     tables: Vec<(String, String)>,
     routines: Vec<(String, String)>,
     columns: Vec<(String, String, String, String)>,
     foreign: Vec<(String, String)>,
+    (triggers, events): ObjectRows,
+    mariadb: bool,
 ) -> Vec<ObjectNode> {
+    let leaf = |name: String, detail: String| ObjectNode {
+        detail,
+        ..ObjectNode::new(name, NodeKind::Routine)
+    };
+    let mut on_table: HashMap<String, Vec<ObjectNode>> = HashMap::new();
+    let mut trigger_nodes = Vec::new();
+    for (name, table, timing, event) in triggers {
+        let when = format!("{timing} {event}").to_ascii_lowercase();
+        on_table
+            .entry(table.clone())
+            .or_default()
+            .push(leaf(name.clone(), when));
+        trigger_nodes.push(leaf(name, table));
+    }
+    let event_nodes = events
+        .into_iter()
+        .map(|(name, ty, value, field)| {
+            let label = event_label(&ty, value.as_deref(), field.as_deref());
+            leaf(name, label)
+        })
+        .collect();
     let foreign: HashSet<(String, String)> = foreign.into_iter().collect();
     let mut by_table: HashMap<String, Vec<ObjectNode>> = HashMap::new();
     for (table, name, ty, key) in columns {
@@ -868,10 +992,22 @@ fn database_children(
             ..ObjectNode::new(name, NodeKind::Column)
         });
     }
-    let (mut table_nodes, mut view_nodes) = (Vec::new(), Vec::new());
+    let (mut table_nodes, mut view_nodes, mut sequence_nodes) =
+        (Vec::new(), Vec::new(), Vec::new());
     for (name, ty) in tables {
+        if ty == "SEQUENCE" {
+            sequence_nodes.push(leaf(name, String::new()));
+            continue;
+        }
         let is_view = ty.ends_with("VIEW");
-        let children = Some(by_table.remove(&name).unwrap_or_default());
+        let mut cols = by_table.remove(&name).unwrap_or_default();
+        if let Some(t) = on_table.remove(&name) {
+            cols.push(ObjectNode {
+                children: Some(t),
+                ..ObjectNode::new("Triggers", NodeKind::Group)
+            });
+        }
+        let children = Some(cols);
         let kind = if is_view {
             NodeKind::View
         } else {
@@ -887,30 +1023,58 @@ fn database_children(
             table_nodes.push(node);
         }
     }
-    let routine_nodes = routines
+    let (procedures, functions): (Vec<_>, Vec<_>) = routines
         .into_iter()
-        .map(|(name, ty)| ObjectNode {
-            detail: ty.to_ascii_lowercase(),
-            ..ObjectNode::new(name, NodeKind::Routine)
-        })
-        .collect();
-    [
+        .partition(|(_, ty)| ty.eq_ignore_ascii_case("PROCEDURE"));
+    let routine_nodes = |rows: Vec<(String, String)>| -> Vec<ObjectNode> {
+        rows.into_iter()
+            .map(|(name, _)| leaf(name, String::new()))
+            .collect()
+    };
+    let mut groups = vec![
         ("Tables", table_nodes),
         ("Views", view_nodes),
-        ("Routines", routine_nodes),
-    ]
-    .into_iter()
-    .map(|(name, children)| ObjectNode {
-        children: Some(children),
-        ..ObjectNode::new(name, NodeKind::Group)
-    })
-    .collect()
+        ("Procedures", routine_nodes(procedures)),
+        ("Functions", routine_nodes(functions)),
+        ("Triggers", trigger_nodes),
+        ("Events", event_nodes),
+    ];
+    if mariadb {
+        groups.push(("Sequences", sequence_nodes));
+    }
+    groups
+        .into_iter()
+        .map(|(name, children)| ObjectNode {
+            children: Some(children),
+            ..ObjectNode::new(name, NodeKind::Group)
+        })
+        .collect()
+}
+
+/// Whether the session's transaction is open and ran more than reads, from the status of
+/// the session's last reply; `writes` marks the statement about to run.
+fn track(conn: &Conn, wrote: &AtomicBool, writes: bool) -> bool {
+    let in_trans = conn.last_ok_packet().is_some_and(|ok| {
+        ok.status_flags()
+            .contains(StatusFlags::SERVER_STATUS_IN_TRANS)
+    });
+    let open = writes || in_trans && wrote.load(Ordering::Relaxed);
+    wrote.store(open, Ordering::Relaxed);
+    in_trans && open
 }
 
 /// Runs `text` and streams its result sets one after another: each stream carries the
 /// sender for the next. A set whose stream was dropped is read to its end and skipped.
-async fn run(conn: Arc<Mutex<Conn>>, text: String, head: oneshot::Sender<Result<ResultStream>>) {
+/// `writes`: `text` is more than a read, so the transaction it runs in counts as open.
+async fn run(
+    conn: Arc<Mutex<Conn>>,
+    text: String,
+    writes: bool,
+    wrote: Arc<AtomicBool>,
+    head: oneshot::Sender<Result<ResultStream>>,
+) {
     let mut conn = conn.lock_owned().await;
+    track(&conn, &wrote, writes);
     let mut result = match conn.query_iter(text).await {
         Ok(r) => r,
         Err(e) => {
@@ -1163,15 +1327,42 @@ mod tests {
                 (s("totals"), s("sum"), s("decimal(12,2)"), s("")),
             ],
             vec![(s("orders"), s("customer_id"))],
+            (
+                vec![(s("orders_bu"), s("orders"), s("BEFORE"), s("UPDATE"))],
+                vec![(s("nightly"), s("RECURRING"), Some(s("1")), Some(s("DAY")))],
+            ),
+            false,
         );
         let names: Vec<_> = groups.iter().map(|g| g.name.as_str()).collect();
-        assert_eq!(names, ["Tables", "Views", "Routines"]);
+        assert_eq!(
+            names,
+            [
+                "Tables",
+                "Views",
+                "Procedures",
+                "Functions",
+                "Triggers",
+                "Events"
+            ]
+        );
+        assert_eq!(groups[3].children, Some(vec![]));
+        let trigger = &groups[4].children.as_ref().unwrap()[0];
+        assert_eq!(
+            (trigger.name.as_str(), trigger.detail.as_str()),
+            ("orders_bu", "orders")
+        );
+        assert_eq!(groups[5].children.as_ref().unwrap()[0].detail, "daily");
         let tables = groups[0].children.as_ref().unwrap();
         assert_eq!(tables.len(), 2);
         let orders = &tables[0];
         assert_eq!(orders.kind, NodeKind::Table);
         let cols = orders.children.as_ref().unwrap();
-        assert_eq!(cols.len(), 3);
+        assert_eq!(cols.len(), 4);
+        assert_eq!(cols[3].name, "Triggers");
+        assert_eq!(
+            cols[3].children.as_ref().unwrap()[0].detail,
+            "before update"
+        );
         assert!(cols[0].primary_key && !cols[0].foreign_key);
         assert_eq!(cols[0].detail, "bigint unsigned");
         assert!(cols[1].foreign_key && !cols[1].primary_key);
@@ -1181,8 +1372,24 @@ mod tests {
         assert_eq!(views[0].kind, NodeKind::View);
         assert_eq!(views[0].children.as_ref().unwrap()[0].name, "sum");
         let routines = groups[2].children.as_ref().unwrap();
-        assert_eq!(routines[0].detail, "procedure");
+        assert_eq!(routines[0].name, "refund");
         assert!(!routines[0].has_children());
+        let maria = database_children(
+            vec![(s("seq"), s("SEQUENCE"))],
+            vec![],
+            vec![],
+            vec![],
+            (vec![], vec![]),
+            true,
+        );
+        assert_eq!(maria.last().unwrap().name, "Sequences");
+        assert_eq!(maria[0].children, Some(vec![]));
+        assert_eq!(maria[6].children.as_ref().unwrap()[0].name, "seq");
+        assert_eq!(
+            event_label("RECURRING", Some("5"), Some("MINUTE")),
+            "every 5 minute"
+        );
+        assert_eq!(event_label("ONE TIME", None, None), "once");
     }
 
     fn probe(mariadb: bool) -> TableStructure {

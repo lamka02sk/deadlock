@@ -14,7 +14,7 @@ use deadlock_core::structure::{
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -26,8 +26,9 @@ use gpui_kit::{
 use super::table::highlighted;
 use super::{QueryTab, Session, TabEvent};
 use crate::app::Db;
-use crate::assets::Icon;
+use crate::assets::{Icon, menu_item, menu_item_danger};
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button, icon_button};
 
 /// The four lists, for the selected row.
@@ -80,6 +81,8 @@ pub(crate) struct Structure {
     /// A load error, or the outcome of the last ALTER; `true` for an error.
     notice: Option<(String, bool)>,
     selected: Option<(Section, usize)>,
+    /// A column to select once the structure loads: Search everywhere opened it.
+    focus: Option<String>,
     form: Option<Form>,
     copied: bool,
     generation: u64,
@@ -94,6 +97,13 @@ impl Structure {
     pub(super) fn fail(&mut self, e: String) {
         self.notice = Some((e, true));
     }
+}
+
+/// The Columns row of column `name`, if it has one.
+fn column_row(data: &TableStructure, name: Option<String>) -> Option<(Section, usize)> {
+    let name = name?;
+    let i = data.columns.iter().position(|c| c.name == name)?;
+    Some((Section::Columns, i))
 }
 
 /// The column types as the form's list holds them.
@@ -154,7 +164,7 @@ impl QueryTab {
                 match result {
                     Ok(data) => {
                         // The selected row may be gone after an ALTER.
-                        s.selected = None;
+                        s.selected = column_row(&data, s.focus.take());
                         s.data = Some(data);
                     }
                     Err(e) => s.notice = Some((e, true)),
@@ -164,6 +174,17 @@ impl QueryTab {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Selects column `name` in the Structure view, now or once it loads.
+    pub(crate) fn focus_column(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(s) = self.structure_mut() {
+            match &s.data {
+                Some(data) => s.selected = column_row(data, Some(name)),
+                None => s.focus = Some(name),
+            }
+        }
         cx.notify();
     }
 
@@ -805,7 +826,7 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
                     .text_size(data_size())
                     .children(cells),
             )
-            .on_click(
+            .clickable(
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.select_row(section, i, cx)),
             )
             .on_mouse_down(
@@ -816,11 +837,15 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
             return d.into_any_element();
         }
         let entity = entity.clone();
-        d.context_menu(move |mut m, _, _| {
+        d.context_menu(move |mut m, _, cx| {
             for (label, open) in &menu {
                 let entity = entity.clone();
                 let open = open.clone();
-                m = m.item(PopupMenuItem::new(label.clone()).on_click(
+                let item = match open {
+                    Some(_) => menu_item(label.clone(), Icon::Open),
+                    None => menu_item_danger(label.clone(), Icon::Trash, cx),
+                };
+                m = m.item(item.on_click(
                     move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                         entity.update(cx, |this, cx| match &open {
                             Some(t) => cx.emit(TabEvent::OpenTable(t.clone())),
@@ -839,10 +864,9 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
             div()
                 .id((id, i))
                 .text_color(p.link)
-                .cursor_pointer()
                 .hover(|s| s.text_color(p.tx))
                 .child(text)
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                .clickable(cx.listener(move |_, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     cx.emit(TabEvent::OpenTable(target.clone()));
                 }))
@@ -910,7 +934,7 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
     };
     let add_column = (!view).then(|| {
         add("add-column", "Add column", "Add a column to the table", cx).when(!busy, |b| {
-            b.on_click(cx.listener(|this, _, window, cx| this.open_column_form(window, cx)))
+            b.clickable(cx.listener(|this, _, window, cx| this.open_column_form(window, cx)))
         })
     });
     let column_form = match (&s.form, &form_sql) {
@@ -956,7 +980,7 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
         }
         let add_index = add("add-index", "Add index", "Add an index to the table", cx)
             .when(!busy, |b| {
-                b.on_click(cx.listener(|this, _, window, cx| this.open_index_form(window, cx)))
+                b.clickable(cx.listener(|this, _, window, cx| this.open_index_form(window, cx)))
             });
         let index_form = match (&s.form, &form_sql) {
             (Some(Form::Index(f)), Some(sql)) => Some(index_form(f, sql, busy, &p, cx)),
@@ -1061,7 +1085,7 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
         cx,
     )
     .child(if s.copied { "Copied" } else { "Copy" })
-    .on_click(cx.listener(|this, _, _, cx| this.copy_definition(cx)));
+    .clickable(cx.listener(|this, _, _, cx| this.copy_definition(cx)));
     let aside = div()
         .flex_grow(1.)
         .flex_shrink(1.)
@@ -1173,7 +1197,7 @@ fn form_box(
                         cx,
                     )
                     .child("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
+                    .clickable(cx.listener(|this, _, _, cx| this.close_form(cx))),
                 )
                 .child(
                     button(
@@ -1185,7 +1209,7 @@ fn form_box(
                     )
                     .child("Apply")
                     .when(ready, |b| {
-                        b.on_click(cx.listener(|this, _, window, cx| this.apply_form(window, cx)))
+                        b.clickable(cx.listener(|this, _, window, cx| this.apply_form(window, cx)))
                     }),
                 ),
         )
@@ -1213,6 +1237,7 @@ fn column_form(
             Checkbox::new(id)
                 .checked(on)
                 .label(label)
+                .cursor_pointer()
                 .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                     if let Some(s) = this.structure_mut()
                         && let Some(Form::Column(f)) = &mut s.form
@@ -1286,7 +1311,7 @@ fn index_form(
             .child(
                 button_at("part-order", i, cx)
                     .child(if part.descending { "desc" } else { "asc" })
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .clickable(cx.listener(move |this, _, _, cx| {
                         if let Some(s) = this.structure_mut()
                             && let Some(Form::Index(f)) = &mut s.form
                             && let Some(part) = f.parts.get_mut(i)
@@ -1300,7 +1325,7 @@ fn index_form(
             .child(
                 button_at("part-remove", i, cx)
                     .child("Remove")
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .clickable(cx.listener(move |this, _, _, cx| {
                         if let Some(s) = this.structure_mut()
                             && let Some(Form::Index(f)) = &mut s.form
                             && i < f.parts.len()

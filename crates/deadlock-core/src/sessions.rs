@@ -129,8 +129,46 @@ pub struct Session {
     pub own: bool,
     /// Opened by Deadlock, in this window or another.
     pub deadlock: bool,
+    /// One of this app's own sessions (the sidebar's, a tab's): ending it makes that
+    /// connection reconnect.
+    pub this_app: bool,
     /// Seconds since the client connected, where the server reports it (Redis).
     pub age: Option<u64>,
+}
+
+/// Session ids this process has open, by server (`host:port`).
+static OURS: std::sync::Mutex<BTreeSet<(String, u64)>> = std::sync::Mutex::new(BTreeSet::new());
+
+fn ours() -> std::sync::MutexGuard<'static, BTreeSet<(String, u64)>> {
+    OURS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a session as this app's while it lives.
+#[derive(Debug)]
+pub(crate) struct Mark(String, u64);
+
+impl Mark {
+    pub(crate) fn new(server: String, id: u64) -> Self {
+        ours().insert((server.clone(), id));
+        Self(server, id)
+    }
+}
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        ours().remove(&(std::mem::take(&mut self.0), self.1));
+    }
+}
+
+/// Sets [`Session::this_app`] on the sessions of `server` this process holds.
+pub(crate) fn mark_ours(snap: &mut Snapshot, server: &str) {
+    let ours = ours();
+    for s in &mut snap.sessions {
+        s.this_app = ours.contains(&(server.to_owned(), s.id));
+        // mysql_async drops the program name on TLS connections.
+        s.deadlock |= s.this_app;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -623,6 +661,7 @@ mod tests {
             holds: Vec::new(),
             own: false,
             deadlock: false,
+            this_app: false,
             age: None,
         }
     }

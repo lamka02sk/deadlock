@@ -70,7 +70,7 @@ pub static ENTRIES: &[Entry] = &[
     entry!(
         "save",
         "Window",
-        "Save",
+        "Save (Apply in an object editor)",
         secondary!("s"),
         SHELL,
         crate::shell::SaveFile
@@ -149,6 +149,22 @@ pub static ENTRIES: &[Entry] = &[
         crate::shell::ToggleHistory
     ),
     entry!(
+        "files",
+        "Window",
+        "Files panel",
+        secondary!("alt-b"),
+        SHELL,
+        crate::shell::ToggleFiles
+    ),
+    entry!(
+        "files-filter",
+        "Window",
+        "Filter files",
+        secondary!("alt-f"),
+        SHELL,
+        crate::shell::FilterFiles
+    ),
+    entry!(
         "refresh",
         "Window",
         "Refresh schema",
@@ -163,6 +179,14 @@ pub static ENTRIES: &[Entry] = &[
         secondary!("shift-f"),
         SHELL,
         crate::shell::SearchObjects
+    ),
+    entry!(
+        "search-everywhere",
+        "Window",
+        "Search everywhere (also Shift twice)",
+        secondary!("shift-p"),
+        &[Some("Shell"), Some("Shell > Input")],
+        crate::shell::SearchEverywhere
     ),
     entry!(
         "settings",
@@ -203,6 +227,70 @@ pub static ENTRIES: &[Entry] = &[
         secondary!("c"),
         &[Some("Results")],
         crate::query::CopySelection
+    ),
+    entry!(
+        "copy-headers",
+        "Results",
+        "Copy selection with headers",
+        secondary!("shift-c"),
+        &[Some("Results")],
+        crate::results::CopyWithHeaders
+    ),
+    entry!(
+        "select-all-cells",
+        "Results",
+        "Select all cells",
+        secondary!("a"),
+        &[Some("Results")],
+        crate::results::SelectAll
+    ),
+    entry!(
+        "extend-up",
+        "Results",
+        "Extend selection up",
+        "shift-up",
+        &[Some("Results")],
+        crate::results::ExtendUp
+    ),
+    entry!(
+        "extend-down",
+        "Results",
+        "Extend selection down",
+        "shift-down",
+        &[Some("Results")],
+        crate::results::ExtendDown
+    ),
+    entry!(
+        "extend-left",
+        "Results",
+        "Extend selection left",
+        "shift-left",
+        &[Some("Results")],
+        crate::results::ExtendLeft
+    ),
+    entry!(
+        "extend-right",
+        "Results",
+        "Extend selection right",
+        "shift-right",
+        &[Some("Results")],
+        crate::results::ExtendRight
+    ),
+    entry!(
+        "paste-cells",
+        "Table data",
+        "Paste into the selection",
+        secondary!("v"),
+        &[Some("TableData > Results")],
+        crate::query::PasteCells
+    ),
+    entry!(
+        "pick-date",
+        "Cell editor",
+        "Pick date",
+        "alt-down",
+        &[Some("CellEditor > Input")],
+        crate::query::PickDate
     ),
     entry!(
         "edit-cell",
@@ -347,6 +435,46 @@ pub static ENTRIES: &[Entry] = &[
         "enter",
         &[Some("History")],
         crate::history::InsertSelected
+    ),
+    entry!(
+        "files-rename",
+        "Files panel",
+        "Rename",
+        "f2",
+        &[Some("Files")],
+        crate::shell::RenameFile
+    ),
+    entry!(
+        "files-delete",
+        "Files panel",
+        "Delete",
+        "delete",
+        &[Some("Files")],
+        crate::shell::DeleteFile
+    ),
+    entry!(
+        "everywhere-prev",
+        "Search everywhere",
+        "Previous result",
+        "up",
+        &[Some("Everywhere > Input")],
+        crate::shell::EverywherePrev
+    ),
+    entry!(
+        "everywhere-next",
+        "Search everywhere",
+        "Next result",
+        "down",
+        &[Some("Everywhere > Input")],
+        crate::shell::EverywhereNext
+    ),
+    entry!(
+        "show-completions",
+        "Editor",
+        "Show completions",
+        "ctrl-space",
+        &[Some("Input")],
+        gpui_kit::component::input::ShowCompletions
     ),
     entry!(
         "dialog-cancel",

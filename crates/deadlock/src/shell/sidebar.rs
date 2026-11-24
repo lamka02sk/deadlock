@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use deadlock_core::cache::SchemaCache;
+use deadlock_core::connection::Engine;
 use deadlock_core::driver::{NodeKind, ObjectNode, ObjectPath};
 use deadlock_core::schema::{ConnectionTree, Load, NodeId, Query, Row, RowKind};
 use gpui_kit::component::input::{self, Input, InputEvent, InputState};
@@ -23,6 +24,7 @@ use super::{Conn, Shell, type_label};
 use crate::app::Db;
 use crate::assets::{Icon, icon};
 use crate::theme::{Palette, RADIUS, row_height, small_size};
+use crate::ui::Clickable as _;
 use crate::ui::square_button;
 
 /// The schema cache shared by every window; `None` when it could not be opened.
@@ -56,8 +58,93 @@ impl Shell {
                     .iter_mut()
                     .find(|t| t.id == c.id)
                     .and_then(|t| t.nodes.take()),
+                hidden: c.hidden_schemas.clone(),
             })
             .collect();
+    }
+
+    /// Hidden schema names per connection id.
+    pub(super) fn hidden_by_conn(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.project
+            .config
+            .connections
+            .iter()
+            .map(|c| (c.id.clone(), c.hidden_schemas.clone()))
+            .collect()
+    }
+
+    /// Hides or shows a schema of `conn` for good: saved, and the tree follows at once.
+    /// The connection's tint, if it has one.
+    pub(super) fn color_of(&self, conn: &str) -> Option<gpui_kit::Hsla> {
+        self.config(conn)?
+            .color
+            .as_deref()
+            .and_then(crate::color::parse_hex)
+    }
+
+    /// Sets the connection's tint (`None` clears it): applies live and is saved.
+    pub(super) fn set_color(&mut self, conn: &str, color: Option<String>, cx: &mut Context<Self>) {
+        let Some(c) = self
+            .project
+            .config
+            .connections
+            .iter_mut()
+            .find(|c| c.id == conn)
+        else {
+            return;
+        };
+        if c.color == color {
+            return;
+        }
+        c.color = color;
+        if let Err(e) = self.project.save_config() {
+            eprintln!("deadlock: {e}");
+        }
+        cx.notify();
+    }
+
+    pub(super) fn set_schema_hidden(
+        &mut self,
+        conn: &str,
+        schema: &str,
+        hide: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(c) = self
+            .project
+            .config
+            .connections
+            .iter_mut()
+            .find(|c| c.id == conn)
+        else {
+            return;
+        };
+        let changed = if hide {
+            c.hide_schema(schema)
+        } else {
+            c.unhide_schema(schema)
+        };
+        if !changed {
+            return;
+        }
+        let hidden = c.hidden_schemas.clone();
+        if let Some(t) = self.tree.connections.iter_mut().find(|t| t.id == conn) {
+            t.hidden = hidden;
+        }
+        if hide {
+            // Selection and open state under it would point at a row that is gone.
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|s| s.len() > 1 && s[0] == conn && s[1] == schema)
+            {
+                self.selected = Some(vec![conn.to_owned()]);
+            }
+        }
+        if let Err(e) = self.project.save_config() {
+            eprintln!("deadlock: {e}");
+        }
+        self.rebuild(cx);
     }
 
     /// Paints the tree from the cache. Nodes the server already sent win.
@@ -199,7 +286,7 @@ impl Shell {
 
     /// F5 and the toolbar button: reloads the active connection, connecting it if needed.
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.active.clone() else {
+        let Some(id) = self.active(cx) else {
             return;
         };
         match self.conns.get(&id) {
@@ -277,7 +364,7 @@ impl Shell {
         self.selected = Some(row.id.clone());
         if row.kind == RowKind::Connection {
             let id = row.id[0].clone();
-            self.activate(&id, false, cx);
+            self.activate(&id, cx);
         }
         self.list.scroll_to_item(ix, ScrollStrategy::Nearest);
         cx.notify();
@@ -356,6 +443,15 @@ impl Shell {
         if row.kind == RowKind::Node(NodeKind::Key) {
             let id = row.id.clone();
             self.open_key(&id, window, cx);
+            return true;
+        }
+        // Procedures, triggers, events…: the object editor. Views keep their data tab.
+        if row.kind == RowKind::Node(NodeKind::Routine)
+            && self.flavor(&row.id[0]).is_some()
+            && let Some(object) = deadlock_core::objects::ObjectRef::from_node(&row.id)
+        {
+            let conn = row.id[0].clone();
+            self.open_object(&conn, object, None, window, cx);
             return true;
         }
         let (RowKind::Node(NodeKind::Table | NodeKind::View), [conn, db, _, table]) =
@@ -477,7 +573,7 @@ fn indent(row: &Row) -> Pixels {
     }
 }
 
-fn label(text: &str, hits: &[Range<usize>], p: &Palette) -> StyledText {
+pub(super) fn label(text: &str, hits: &[Range<usize>], p: &Palette) -> StyledText {
     // `.hit`: semibold in the link color.
     let style = HighlightStyle {
         font_weight: Some(FontWeight::SEMIBOLD),
@@ -548,7 +644,7 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
     } else {
         row.label.clone()
     };
-    let active = is_conn && shell.active.as_deref() == Some(row.id[0].as_str());
+    let active = is_conn && shell.active(cx).as_deref() == Some(row.id[0].as_str());
     let color = match row.kind {
         RowKind::Error => p.danger,
         RowKind::Node(NodeKind::More) => p.link,
@@ -575,7 +671,7 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                 },
                 p.tx3,
             ))
-            .on_click(cx.listener(move |this, _, window, cx| {
+            .clickable(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 window.focus(&this.tree_focus, cx);
                 this.select(ix, cx);
@@ -597,6 +693,21 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
         }
         _ => None,
     };
+    // The connection's tint: strong on its own row, faint down its subtree.
+    let tint = shell.color_of(&row.id[0]);
+    let (base, hover, sel) = match tint {
+        Some(t) if is_conn => (
+            Some(crate::color::over(t, 0.16, p.panel)),
+            crate::color::over(t, 0.26, p.panel),
+            crate::color::over(t, 0.34, p.panel),
+        ),
+        Some(t) => (
+            Some(crate::color::over(t, 0.06, p.panel)),
+            crate::color::over(t, 0.16, p.panel),
+            crate::color::over(t, 0.26, p.panel),
+        ),
+        None => (None, p.hover, p.sel),
+    };
     let element = div()
         .id(("tree-row", ix))
         .h(row_height() + px(1.))
@@ -612,13 +723,27 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                 .rounded(RADIUS)
                 .whitespace_nowrap()
                 .text_color(color)
+                .when_some(base, |d, b| d.bg(b))
                 .when(selected || marked, |d| {
-                    d.bg(p.sel).font_weight(FontWeight::MEDIUM)
+                    d.bg(sel).font_weight(FontWeight::MEDIUM)
                 })
                 .when(is_conn && row.expanded, |d| {
                     d.font_weight(FontWeight::MEDIUM)
                 })
-                .when(!selected, |d| d.hover(|s| s.bg(p.hover)))
+                .when(!selected, |d| d.hover(|s| s.bg(hover)))
+                // 3 px bar down the connection row's left edge.
+                .when_some(tint.filter(|_| is_conn), |d, t| {
+                    d.relative().child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(3.))
+                            .rounded_l(RADIUS)
+                            .bg(t),
+                    )
+                })
                 .children(chevron)
                 .when(spacer, |d| d.child(div().w(px(16.)).flex_none()))
                 .children(row_icon(row, &p))
@@ -651,21 +776,113 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                     )
                 }),
         )
-        .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+        .clickable(cx.listener(move |this, e: &ClickEvent, window, cx| {
             this.on_click_row(ix, e, window, cx);
         }))
         .when_some(tip, |d, tip| {
             d.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         });
-    if !redis_menu {
+    if is_conn {
+        let (id, shell_entity) = (row.id[0].clone(), cx.entity());
+        let hidden = shell
+            .config(&id)
+            .map(|c| c.hidden_schemas.clone())
+            .unwrap_or_default();
+        let current = shell.config(&id).and_then(|c| c.color.clone());
+        return element
+            .context_menu(move |menu, window, cx| {
+                let item = |label: &'static str, ic: Icon, editing: bool| {
+                    let (shell, id) = (shell_entity.clone(), id.clone());
+                    crate::assets::menu_item(label, ic).on_click(move |_, window, cx| {
+                        shell.update(cx, |s, cx| s.edit_connection(&id, editing, window, cx));
+                    })
+                };
+                let menu = menu
+                    .item(item("Edit connection…", Icon::Rename, true))
+                    .item(item("Duplicate connection…", Icon::Duplicate, false));
+                let (cshell, cid, current) = (shell_entity.clone(), id.clone(), current.clone());
+                let menu = menu.submenu_with_icon(
+                    Some(crate::assets::menu_icon(Icon::Color)),
+                    "Color",
+                    window,
+                    cx,
+                    move |m, _, _| color_menu(m, &cshell, &cid, current.as_deref()),
+                );
+                hidden.iter().fold(
+                    if hidden.is_empty() {
+                        menu
+                    } else {
+                        menu.separator().item(
+                            crate::assets::menu_item("Unhide all schemas", Icon::Eye).on_click({
+                                let (shell, id) = (shell_entity.clone(), id.clone());
+                                let all = hidden.clone();
+                                move |_, _, cx| {
+                                    shell.update(cx, |s, cx| {
+                                        for h in &all {
+                                            s.set_schema_hidden(&id, h, false, cx);
+                                        }
+                                    });
+                                }
+                            }),
+                        )
+                    },
+                    |menu, name| {
+                        let (shell, id, name) = (shell_entity.clone(), id.clone(), name.clone());
+                        menu.item(
+                            crate::assets::menu_item(format!("Unhide {name}"), Icon::Eye).on_click(
+                                move |_, _, cx| {
+                                    shell.update(cx, |s, cx| {
+                                        s.set_schema_hidden(&id, &name, false, cx)
+                                    });
+                                },
+                            ),
+                        )
+                    },
+                )
+            })
+            .into_any_element();
+    }
+    let is_db = row.kind == RowKind::Node(NodeKind::Database);
+    let object_menu = !redis_menu && shell.has_object_menu(row);
+    if !redis_menu && !is_db && !object_menu {
         return element.into_any_element();
     }
     let (row, shell_entity) = (row.clone(), cx.entity());
+    let term = if shell
+        .config(&row.id[0])
+        .is_some_and(|c| c.engine == Engine::Oracle)
+    {
+        "schema"
+    } else {
+        "database"
+    };
     element
         .context_menu(move |menu, _, cx| {
-            shell_entity
-                .read(cx)
-                .key_menu(&row, menu, shell_entity.clone())
+            let menu = if redis_menu {
+                shell_entity
+                    .read(cx)
+                    .key_menu(&row, menu, shell_entity.clone(), cx)
+            } else {
+                menu
+            };
+            let menu = if object_menu {
+                shell_entity
+                    .read(cx)
+                    .object_menu(&row, menu, shell_entity.clone(), cx)
+            } else {
+                menu
+            };
+            if !is_db {
+                return menu;
+            }
+            let (shell, conn, name) = (shell_entity.clone(), row.id[0].clone(), row.id[1].clone());
+            menu.item(
+                crate::assets::menu_item(format!("Hide {term}"), Icon::EyeOff).on_click(
+                    move |_, _, cx| {
+                        shell.update(cx, |s, cx| s.set_schema_hidden(&conn, &name, true, cx));
+                    },
+                ),
+            )
         })
         .into_any_element()
 }
@@ -731,7 +948,9 @@ fn search_field(
                         .hover(|s| s.bg(p.hover))
                         .child(icon(Icon::Close, p.tx3))
                         .tooltip(|window, cx| Tooltip::new("Clear search (Esc)").build(window, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx))),
+                        .clickable(
+                            cx.listener(|this, _, window, cx| this.close_search(window, cx)),
+                        ),
                 ),
         )
 }
@@ -776,7 +995,7 @@ pub(super) fn sidebar(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElemen
                                 ),
                                 cx,
                             )
-                            .on_click(cx.listener(
+                            .clickable(cx.listener(
                                 |this, _, window, cx| {
                                     this.open_search(window, cx);
                                 },
@@ -784,7 +1003,7 @@ pub(super) fn sidebar(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElemen
                         )
                         .child(
                             square_button("add-connection", Icon::Plus, "Add connection", cx)
-                                .on_click(cx.listener(|this, _, window, cx| {
+                                .clickable(cx.listener(|this, _, window, cx| {
                                     this.new_connection(window, cx);
                                 })),
                         ),
@@ -829,4 +1048,46 @@ pub(super) fn sidebar(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElemen
                 ),
         )
         .children(super::keys::job_status(shell, cx))
+}
+
+/// The Color submenu: None and the palette, the current one marked.
+fn color_menu(
+    mut menu: gpui_kit::component::menu::PopupMenu,
+    shell: &gpui_kit::Entity<Shell>,
+    id: &str,
+    current: Option<&str>,
+) -> gpui_kit::component::menu::PopupMenu {
+    let choices = std::iter::once(("None", None)).chain(
+        crate::color::PALETTE
+            .iter()
+            .map(|(name, hex)| (*name, Some(*hex))),
+    );
+    for (name, hex) in choices {
+        let on = current.map(str::to_lowercase).as_deref() == hex;
+        let swatch = hex.and_then(crate::color::parse_hex);
+        let (shell, id) = (shell.clone(), id.to_owned());
+        menu = menu.item(
+            gpui_kit::component::menu::PopupMenuItem::element(move |_, cx| {
+                let p = *cx.global::<Palette>();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(match swatch {
+                        Some(c) => div().size(px(12.)).rounded_full().bg(c),
+                        None => div()
+                            .size(px(12.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(p.line2),
+                    })
+                    .child(name)
+                    .when(on, |d| d.child(icon(Icon::Commit, p.tx3)))
+            })
+            .on_click(move |_, _, cx| {
+                shell.update(cx, |s, cx| s.set_color(&id, hex.map(str::to_owned), cx));
+            }),
+        );
+    }
+    menu
 }
