@@ -57,7 +57,8 @@ jobs:
     permissions:
       contents: write
     needs: check
-    runs-on: ubuntu-latest
+    # Pinned: the package depends on the build machine's glibc, and ubuntu-latest moved past 24.04.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
