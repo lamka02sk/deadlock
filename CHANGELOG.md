@@ -6,6 +6,13 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-25
+
+### Added
+
+- Table editing: edit columns, table actions, keys and checks, and create new tables.
+- Project management: new project, name, color and pattern, connections, delete project.
+
 ## [0.1.2] - 2026-11-24
 
 ### Fixed
@@ -67,7 +74,8 @@ First tagged version.
   shortcuts.
 - Linux packages (`.deb`, AppImage) and a macOS `.dmg`, attached to the release by CI.
 
-[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lamka02sk/deadlock/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lamka02sk/deadlock/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lamka02sk/deadlock/releases/tag/v0.1.0
