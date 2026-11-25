@@ -15,7 +15,7 @@ use crate::diagram::Diagram;
 use crate::edit::{Change, ChangeKind, ColumnInfo, TableInfo, TableRef, pick_key, quote_ident};
 use crate::plan::{self, Plan};
 use crate::structure::{
-    ForeignKey, Generated, Index, IndexPart, StructureColumn, TableFacts, TableStructure,
+    Check, ForeignKey, Generated, Index, IndexPart, StructureColumn, TableFacts, TableStructure,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -137,8 +137,10 @@ impl Driver for Mysql {
                 return Err(DriverError::ReadOnly(statement.verb));
             }
             let writes = statement.kind != Kind::Read;
+            // DDL only: START TRANSACTION also commits, but opens one.
+            let commits = statement.implicit_commit && statement.kind == Kind::Ddl;
             let (head_tx, head) = oneshot::channel();
-            tokio::spawn(run(conn, text, writes, wrote, head_tx));
+            tokio::spawn(run(conn, text, writes, commits, wrote, head_tx));
             head.await.map_err(|_| DriverError::Gone)?
         })
     }
@@ -251,7 +253,7 @@ impl Driver for Mysql {
                 columns,
                 view,
                 estimated_rows,
-                backslash_escapes: !mode.unwrap_or_default().contains("NO_BACKSLASH_ESCAPES"),
+                backslash_escapes: crate::edit::backslash_escapes(&mode.unwrap_or_default()),
                 oracle: false,
                 read_only: None,
             })
@@ -276,12 +278,16 @@ impl Driver for Mysql {
                     t.database, t.table
                 )));
             };
+            // MariaDB has no SRS_ID.
+            let srid = if self.mariadb { "NULL" } else { "SRS_ID" };
             let columns: Vec<ColumnRow> = conn
                 .exec(
-                    "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, \
-                     GENERATION_EXPRESSION, DATA_TYPE, COLUMN_COMMENT \
-                     FROM information_schema.COLUMNS \
-                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    format!(
+                        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, \
+                         GENERATION_EXPRESSION, DATA_TYPE, COLUMN_COMMENT, CHARACTER_SET_NAME, \
+                         COLLATION_NAME, {srid} FROM information_schema.COLUMNS \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+                    ),
                     args,
                 )
                 .await?;
@@ -325,11 +331,69 @@ impl Driver for Mysql {
                 .and_then(std::result::Result::ok)
                 .unwrap_or_default();
             let mode: Option<String> = conn.query_first("SELECT @@SESSION.sql_mode").await?;
+            // MariaDB's view has the table and no enforced flag; MySQL's has neither
+            // table nor flag, which TABLE_CONSTRAINTS has. Servers before MySQL 8.0.16 /
+            // MariaDB 10.2.22 have no such view: `None`.
+            let checks: Option<Vec<(String, String, Option<String>)>> = if view {
+                Some(Vec::new())
+            } else if self.mariadb {
+                // LEVEL is 10.5.10+; older servers get it from the DDL.
+                let level = "SELECT CONSTRAINT_NAME, CHECK_CLAUSE, LEVEL \
+                     FROM information_schema.CHECK_CONSTRAINTS \
+                     WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ? ORDER BY CONSTRAINT_NAME";
+                match conn.exec(level, args).await {
+                    Ok(rows) => Some(rows),
+                    Err(_) => conn.exec(level.replace("LEVEL", "NULL"), args).await.ok(),
+                }
+            } else {
+                conn.exec(
+                    "SELECT tc.CONSTRAINT_NAME, cc.CHECK_CLAUSE, tc.ENFORCED \
+                     FROM information_schema.TABLE_CONSTRAINTS tc \
+                     JOIN information_schema.CHECK_CONSTRAINTS cc \
+                       ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+                      AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+                     WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? \
+                       AND tc.CONSTRAINT_TYPE = 'CHECK' ORDER BY tc.CONSTRAINT_NAME",
+                    args,
+                )
+                .await
+                .ok()
+            };
+            // An InnoDB estimate can be 0 on a table with rows.
+            let rows_exist = if table.3 == Some(0) && !view {
+                conn.query_first::<u8, _>(format!("SELECT 1 FROM {name} LIMIT 1"))
+                    .await
+                    .map(|r| r.is_some())
+                    .ok()
+            } else {
+                None
+            };
             drop(conn);
-            let backslash = !mode.unwrap_or_default().contains("NO_BACKSLASH_ESCAPES");
+            let backslash = crate::edit::backslash_escapes(&mode.unwrap_or_default());
             let flavor = (self.mariadb, backslash);
             let mut s = structure_from_rows(t, flavor, table, columns, indexes, keys);
+            if rows_exist != Some(false) && s.facts.rows == Some(0) {
+                // Some rows, or no answer: the count is not known.
+                s.facts.rows = None;
+            }
             s.ddl = ddl;
+            s.checks_unsupported = checks.is_none();
+            for (name, condition, level) in checks.unwrap_or_default() {
+                let column = if self.mariadb {
+                    column_check(&s.ddl, &s.columns, &name, &condition, level.as_deref())
+                } else {
+                    None
+                };
+                match column {
+                    Some(i) => s.columns[i].check = Some(condition),
+                    None => s.checks.push(Check {
+                        name,
+                        condition,
+                        // MariaDB enforces every check it lists.
+                        enabled: self.mariadb || level.as_deref() == Some("YES"),
+                    }),
+                }
+            }
             Ok(s)
         })
     }
@@ -496,6 +560,38 @@ impl Driver for Mysql {
     }
 
     /// The tree's bulk load of the database, plus its foreign keys column by column.
+    fn collations(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async move {
+            let mut conn = self.conn.lock().await;
+            // MariaDB 10.10+ names its UCA 14.0 collations per character set only here
+            // (`utf8mb4_uca1400_ai_ci`); COLLATIONS has them without one.
+            let full = if self.mariadb {
+                conn.query(
+                    "SELECT FULL_COLLATION_NAME, CHARACTER_SET_NAME \
+                     FROM information_schema.COLLATION_CHARACTER_SET_APPLICABILITY",
+                )
+                .await
+                .ok()
+            } else {
+                None
+            };
+            let mut list: Vec<(String, String)> = match full {
+                Some(list) => list,
+                None => {
+                    conn.query(
+                        "SELECT COLLATION_NAME, CHARACTER_SET_NAME \
+                         FROM information_schema.COLLATIONS WHERE CHARACTER_SET_NAME IS NOT NULL",
+                    )
+                    .await?
+                }
+            };
+            // By name as Rust orders it: the server sorts in its own collation.
+            list.sort();
+            list.dedup();
+            Ok(list)
+        })
+    }
+
     fn diagram<'a>(&'a self, schema: &'a str) -> BoxFuture<'a, Result<Diagram>> {
         Box::pin(async move {
             let groups = self.children(&ObjectPath(vec![schema.to_owned()])).await?;
@@ -669,7 +765,8 @@ type TableRow = (
     Option<u64>,
     Option<String>,
 );
-/// `(name, type, nullable, default, extra, generation expression, data type, comment)`.
+/// `(name, type, nullable, default, extra, generation expression, data type, comment,
+/// character set, collation, SRID)`.
 type ColumnRow = (
     String,
     String,
@@ -679,6 +776,9 @@ type ColumnRow = (
     Option<String>,
     String,
     String,
+    Option<String>,
+    Option<String>,
+    Option<u32>,
 );
 /// `(index, non-unique, column, expression, collation, prefix, method)`.
 type IndexRow = (
@@ -792,7 +892,19 @@ fn structure_from_rows(
     let columns = columns
         .into_iter()
         .map(
-            |(name, column_type, nullable, default, extra, generation, data_type, comment)| {
+            |(
+                name,
+                column_type,
+                nullable,
+                default,
+                extra,
+                generation,
+                data_type,
+                comment,
+                charset,
+                collation,
+                srid,
+            )| {
                 column_from_row(
                     (mariadb, backslash),
                     StructureColumn {
@@ -802,6 +914,9 @@ fn structure_from_rows(
                         column_type,
                         nullable: nullable == "YES",
                         comment,
+                        charset,
+                        collation,
+                        srid,
                         ..StructureColumn::default()
                     },
                     default,
@@ -833,13 +948,42 @@ fn structure_from_rows(
             tablespace: None,
         },
         checks: Vec::new(),
+        checks_unsupported: false,
         ddl: String::new(),
         backslash_escapes: backslash,
         oracle: false,
+        mariadb,
     }
 }
 
-/// Fills in a column's default, generation expression and extra.
+/// MariaDB: the column a check belongs to, when it is the column's own (`LEVEL =
+/// 'Column'`). Before 10.5.10 there is no `LEVEL`: a column's own check is named after
+/// the column, and the DDL writes it at the end of that column's line.
+fn column_check(
+    ddl: &str,
+    columns: &[StructureColumn],
+    name: &str,
+    clause: &str,
+    level: Option<&str>,
+) -> Option<usize> {
+    let i = columns.iter().position(|c| c.name == name)?;
+    let own = match level {
+        Some(level) => level == "Column",
+        None => {
+            let (start, end) = (
+                format!("{} ", quote_ident(name)),
+                format!(" CHECK ({clause})"),
+            );
+            ddl.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with(&start) && l.trim_end_matches(',').ends_with(&end)
+            })
+        }
+    };
+    own.then_some(i)
+}
+
+/// Fills in a column's default, generation expression, `on update` and extra.
 fn column_from_row(
     (mariadb, backslash): (bool, bool),
     mut c: StructureColumn,
@@ -867,6 +1011,18 @@ fn column_from_row(
             rest.replace_range(i..i + token.len(), "");
         }
     }
+    // `on update CURRENT_TIMESTAMP(3)`: the token after it is the expression.
+    if let Some(i) = rest.to_ascii_lowercase().find("on update ") {
+        let after = &rest[i + "on update ".len()..];
+        let expr = after
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let end = i + "on update ".len() + after.find(&expr).unwrap_or(0) + expr.len();
+        rest.replace_range(i..end, "");
+        c.on_update = (!expr.is_empty()).then_some(expr);
+    }
     c.extra = rest.split_whitespace().collect::<Vec<_>>().join(" ");
     if let (Some(g), Some(expr)) = (generated, generation.filter(|e| !e.is_empty())) {
         // MySQL wraps the expression in parentheses already; MariaDB does not.
@@ -880,9 +1036,9 @@ fn column_from_row(
     c.default = match default {
         None => None,
         // MariaDB writes the default as SQL, and `NULL` for a NULL default.
-        Some(d) if mariadb => (d != "NULL").then_some(d),
+        Some(d) if mariadb => (d != "NULL").then(|| expression_default(d)),
         // MySQL writes literals bare and marks expressions.
-        Some(d) if upper.contains("DEFAULT_GENERATED") => Some(d),
+        Some(d) if upper.contains("DEFAULT_GENERATED") => Some(expression_default(d)),
         Some(d) => {
             let ty = data_type.to_ascii_lowercase();
             let bare = ty == "bit"
@@ -905,6 +1061,22 @@ fn column_from_row(
         }
     };
     c
+}
+
+/// A default as SQL: `uuid()` comes back bare and gets its parentheses, else it would
+/// be written as a string. Literals, numbers and current-time functions stay as they
+/// are (MySQL would turn `(CURRENT_TIMESTAMP)` into an expression default).
+fn expression_default(d: String) -> String {
+    let t = d.trim();
+    let literal = t.eq_ignore_ascii_case("null")
+        || t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'')
+        || t.len() >= 3
+            && t.get(..2).is_some_and(|b| b.eq_ignore_ascii_case("b'"))
+            && t.ends_with('\'')
+        || t.parse::<f64>().is_ok()
+        || t.starts_with('(') && t.ends_with(')')
+        || crate::structure::is_time_function(t);
+    if literal { d } else { format!("({t})") }
 }
 
 const SYSTEM_SCHEMAS: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
@@ -1066,10 +1238,13 @@ fn track(conn: &Conn, wrote: &AtomicBool, writes: bool) -> bool {
 /// Runs `text` and streams its result sets one after another: each stream carries the
 /// sender for the next. A set whose stream was dropped is read to its end and skipped.
 /// `writes`: `text` is more than a read, so the transaction it runs in counts as open.
+/// `commits`: it commits on its own (DDL), so once it ran nothing is left to commit,
+/// and a read after it does not count as open.
 async fn run(
     conn: Arc<Mutex<Conn>>,
     text: String,
     writes: bool,
+    commits: bool,
     wrote: Arc<AtomicBool>,
     head: oneshot::Sender<Result<ResultStream>>,
 ) {
@@ -1082,6 +1257,9 @@ async fn run(
             return;
         }
     };
+    if commits {
+        wrote.store(false, Ordering::Relaxed);
+    }
     let mut head = head;
     loop {
         let cols: Vec<mysql_async::Column> = result.columns_ref().to_vec();
@@ -1414,6 +1592,9 @@ mod tests {
                 generation,
                 s(dt),
                 String::new(),
+                (name == "title").then(|| s("utf8mb4")),
+                (name == "title").then(|| s("utf8mb4_bin")),
+                None,
             )
         };
         let columns = if mariadb {
@@ -1465,6 +1646,7 @@ mod tests {
                     o("`qty` + 1"),
                     "int",
                 ),
+                col("u", "char(36)", "YES", o("uuid()"), "", None, "char"),
             ]
         } else {
             vec![
@@ -1514,6 +1696,15 @@ mod tests {
                     "VIRTUAL GENERATED",
                     o("(`qty` + 1)"),
                     "int",
+                ),
+                col(
+                    "u",
+                    "char(36)",
+                    "YES",
+                    o("uuid()"),
+                    "DEFAULT_GENERATED",
+                    o(""),
+                    "char",
                 ),
             ]
         };
@@ -1602,11 +1793,17 @@ mod tests {
             assert!(!c[2].nullable && c[1].nullable);
             assert_eq!(c[3].default.as_deref(), Some("0"));
             assert!(
-                c[4].extra
-                    .to_ascii_lowercase()
-                    .starts_with("on update current_timestamp"),
+                c[4].on_update
+                    .as_deref()
+                    .is_some_and(|u| u.eq_ignore_ascii_case("current_timestamp")
+                        || u == "current_timestamp()"),
                 "{mariadb}"
             );
+            assert_eq!(c[4].extra, "", "{mariadb}");
+            assert_eq!(c[2].collation.as_deref(), Some("utf8mb4_bin"));
+            assert_eq!(c[3].collation, None);
+            assert_eq!(c[7].default.as_deref(), Some("(uuid())"), "{mariadb}");
+            assert_eq!(st.mariadb, mariadb);
             assert!(
                 c[4].default
                     .as_deref()
@@ -1651,6 +1848,80 @@ mod tests {
             assert_eq!(st.facts.size(), Some(16384 + 81920));
             assert_eq!(st.facts.comment, "kids");
             assert!(!st.view);
+        }
+    }
+
+    /// MariaDB before 10.5.10 lists checks without `LEVEL`: a column's own check is
+    /// the one named after the column whose DDL line ends with it.
+    #[test]
+    fn column_checks_without_level_come_from_the_ddl() {
+        let ddl = "CREATE TABLE `zz` (\n  `id` int(11) NOT NULL,\n  \
+                   `j` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`j`)),\n  \
+                   `c` int(11) DEFAULT NULL COMMENT 'CHECK (x)' CHECK (`c` > 0),\n  \
+                   `n` int(11) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  \
+                   CONSTRAINT `n` CHECK (`n` < 5),\n  CONSTRAINT `ck_t` CHECK (`id` > 0)\n\
+                   ) ENGINE=InnoDB";
+        let columns: Vec<StructureColumn> = ["id", "j", "c", "n"]
+            .iter()
+            .map(|n| StructureColumn {
+                name: s(n),
+                ..StructureColumn::default()
+            })
+            .collect();
+        let own = |name: &str, clause: &str, level: Option<&str>| {
+            column_check(ddl, &columns, name, clause, level)
+        };
+        assert_eq!(own("j", "json_valid(`j`)", None), Some(1));
+        assert_eq!(own("c", "`c` > 0", None), Some(2));
+        // A table check named after a column, and one named otherwise.
+        assert_eq!(own("n", "`n` < 5", None), None);
+        assert_eq!(own("ck_t", "`id` > 0", None), None);
+        // With LEVEL, the server says.
+        assert_eq!(own("j", "json_valid(`j`)", Some("Column")), Some(1));
+        assert_eq!(own("n", "`n` < 5", Some("Table")), None);
+    }
+
+    #[test]
+    fn existing_columns_restate_unchanged() {
+        use crate::structure::{NewColumn, column_definition};
+        for mariadb in [false, true] {
+            let st = probe(mariadb);
+            let lines: Vec<String> = st
+                .columns
+                .iter()
+                .map(|c| column_definition(&NewColumn::from_existing(c, &st), None, &st).unwrap())
+                .collect();
+            let (int, bigint, created, generated_null) = if mariadb {
+                (
+                    "int(11)",
+                    "bigint(20) unsigned",
+                    "current_timestamp() on update current_timestamp",
+                    "",
+                )
+            } else {
+                (
+                    "int",
+                    "bigint unsigned",
+                    "CURRENT_TIMESTAMP on update current_timestamp",
+                    " null",
+                )
+            };
+            assert_eq!(
+                lines,
+                [
+                    format!("`id` {bigint} not null auto_increment"),
+                    format!("`pa` {int} null"),
+                    "`title` varchar(200) collate utf8mb4_bin not null default 'it''s'".to_owned(),
+                    format!("`qty` {int} not null default 0"),
+                    format!("`created` datetime null default {created}"),
+                    format!(
+                        "`total` decimal(10,2) generated always as (`qty` * 2) stored{generated_null}"
+                    ),
+                    format!("`v` {int} generated always as (`qty` + 1) virtual{generated_null}"),
+                    "`u` char(36) null default (uuid())".to_owned(),
+                ],
+                "{mariadb}"
+            );
         }
     }
 

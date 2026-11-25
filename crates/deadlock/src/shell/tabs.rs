@@ -19,6 +19,7 @@ use crate::query::{Kind, QueryTab, Scope, TabEvent, TxMode, View};
 use crate::theme::{Palette, tab_height};
 use crate::ui::Clickable as _;
 use deadlock_core::edit::TableRef;
+use deadlock_core::objects::{ObjectKind, ObjectRef};
 use gpui_kit::{MouseButton, MouseUpEvent};
 
 /// What runs once a tab closed: [`Shell::close_tab_then`].
@@ -61,6 +62,20 @@ impl Shell {
                     Some(connection),
                     String::new(),
                 ),
+                TabState::Object {
+                    connection,
+                    schema,
+                    name,
+                    object,
+                } => {
+                    if let Some(kind) = ObjectKind::from_label(&object)
+                        && self.config(&connection).is_some()
+                    {
+                        let o = ObjectRef::new(schema, name, kind);
+                        self.restored_objects.push((connection, o));
+                    }
+                    continue;
+                }
                 TabState::Console { connection } => {
                     match console_path(self.project.root(), &connection)
                         .and_then(|p| load_text(&p).map(|t| (p, t)))
@@ -83,6 +98,11 @@ impl Shell {
         };
         if let Some(tab) = self.front_tab().cloned() {
             tab.update(cx, |t, cx| t.open_table(cx));
+        }
+        // Object tabs open once their connection connects; a table tab in front
+        // connects first, so two password prompts never race.
+        if !self.front_tab().is_some_and(|t| t.read(cx).table.is_some()) {
+            self.connect_restored(cx);
         }
         self.follow_front(cx);
     }
@@ -137,6 +157,12 @@ impl Shell {
                     self.load(vec![conn, database.clone()], cx);
                 }
             }
+            TabEvent::NeedTables(schema) => {
+                let others = conn
+                    .map(|conn| self.tree.cached_tables(&conn, schema))
+                    .unwrap_or_default();
+                tab.update(cx, |t, cx| t.reference_tables(others, window, cx));
+            }
             TabEvent::ResultsInline(inline) => {
                 let inline = *inline;
                 self.project.state.results_in_panel = Some(!inline);
@@ -148,6 +174,44 @@ impl Shell {
             TabEvent::KeysChanged(db, removed, added) => {
                 if let Some(conn) = conn {
                     self.keys_changed(&conn, db, removed.clone(), added.clone(), cx);
+                }
+            }
+            TabEvent::TableRenamed(from, to) => {
+                if let Some(conn) = conn {
+                    if from.table.is_empty() {
+                        // Created: the schema reload that follows selects it.
+                        self.reveal = Some(vec![
+                            conn.clone(),
+                            to.database.clone(),
+                            "Tables".into(),
+                            to.table.clone(),
+                        ]);
+                    } else {
+                        let objects: Vec<_> = self.objects.iter().map(|(o, _)| o.clone()).collect();
+                        for o in objects {
+                            o.update(cx, |o, cx| {
+                                o.table_renamed(&conn, from, &to.table, window, cx);
+                            });
+                        }
+                    }
+                    self.table_changed(&conn, from, Some(&to.table), cx);
+                }
+                self.schedule_save(cx);
+                cx.notify();
+            }
+            TabEvent::TableDropped(table) => {
+                if let Some(conn) = conn {
+                    self.table_changed(&conn, table, None, cx);
+                    self.close_objects_on_table(&conn, table, window, cx);
+                }
+                // No prompts: the dialog discarded pending edits, and the DDL committed.
+                if let Some(i) = self.tabs.iter().position(|(t, _)| t == tab) {
+                    self.remove_tab(i, cx);
+                }
+            }
+            TabEvent::Discard => {
+                if let Some(i) = self.tabs.iter().position(|(t, _)| t == tab) {
+                    self.remove_tab(i, cx);
                 }
             }
             TabEvent::Recorded => self.history_changed(cx),
@@ -479,6 +543,36 @@ impl Shell {
             });
             return;
         }
+        let unapplied = if tab.read(cx).draft_typed(cx) {
+            Some(("Discard the new table?", "It has not been created."))
+        } else {
+            tab.read(cx).form_unapplied(cx)
+        };
+        if let Some((question, text)) = unapplied {
+            let answer = crate::dialog::ask(
+                window,
+                cx,
+                crate::dialog::Ask::new(question, &["Discard", "Cancel"]).text(text),
+            );
+            let handle = self.window;
+            cx.spawn(async move |this, cx| {
+                if answer.await != Some(0) {
+                    return;
+                }
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        if let Some(i) = this.tabs.iter().position(|(t, _)| *t == tab) {
+                            this.remove_tab(i, cx);
+                            if let Some(then) = then {
+                                then(this, window, cx);
+                            }
+                        }
+                    })
+                });
+            })
+            .detach();
+            return;
+        }
         let (ask, title) = {
             let t = tab.read(cx);
             let ask = match &t.kind {
@@ -782,9 +876,10 @@ impl Shell {
         }
     }
 
-    /// `recent.sql`, `Untitled-2`, `local console`, `orders`.
+    /// `recent.sql`, `Untitled-2`, `local console`, `orders`, `New table`.
     pub(super) fn tab_title(&self, t: &QueryTab) -> String {
         match &t.kind {
+            Kind::Table(r) if r.table.is_empty() => "New table".into(),
             Kind::Table(r) => r.table.clone(),
             Kind::File(Some(p)) => deadlock_core::project::folder_name(p),
             Kind::File(None) => format!("Untitled-{}", t.untitled),
@@ -795,11 +890,14 @@ impl Shell {
         }
     }
 
-    /// The tab list as `state.json` keeps it.
+    /// The tab list as `state.json` keeps it. New table drafts are left out.
     pub(super) fn sync_tabs(&mut self, cx: &gpui_kit::App) {
+        let draft =
+            |t: &Entity<QueryTab>| matches!(&t.read(cx).kind, Kind::Table(r) if r.table.is_empty());
         self.project.state.tabs = self
             .tabs
             .iter()
+            .filter(|(t, _)| !draft(t))
             .map(|(t, _)| {
                 let t = t.read(cx);
                 let connection = t.connection.as_ref().map(|c| c.id.clone());
@@ -820,8 +918,22 @@ impl Shell {
                 }
             })
             .collect();
+        let objects = self
+            .objects
+            .iter()
+            .map(|(t, _)| t.read(cx))
+            .filter(|t| !t.new)
+            .map(|t| (t.connection.id.clone(), t.object.clone()))
+            .chain(self.restored_objects.iter().cloned())
+            .map(|(connection, o)| TabState::Object {
+                connection,
+                schema: o.schema,
+                name: o.name,
+                object: o.kind.label().to_owned(),
+            });
+        self.project.state.tabs.extend(objects);
         self.project.state.active_tab = match self.front {
-            Front::Query(i) => Some(i),
+            Front::Query(i) => Some(self.tabs.iter().take(i).filter(|(t, _)| !draft(t)).count()),
             _ => None,
         };
     }
@@ -836,6 +948,17 @@ impl Shell {
                 eprintln!("deadlock: console: {e}");
             }
         }
+    }
+
+    /// Table tabs whose New table draft or open Structure form holds typing not run yet; asked
+    /// about when the window closes.
+    pub(super) fn unapplied_tables(&self, cx: &gpui_kit::App) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|(t, _)| t.read(cx))
+            .filter(|t| t.draft_typed(cx) || t.form_unapplied(cx).is_some())
+            .map(|t| self.tab_title(t))
+            .collect()
     }
 
     /// Files with unsaved changes; asked about when the window closes.
@@ -924,7 +1047,13 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
         let table = matches!(t.kind, Kind::Table(_));
         let key = t.is_key();
         let title = shell.tab_title(t);
+        let draft = matches!(&t.kind, Kind::Table(r) if r.table.is_empty());
         let tip = match (&t.kind, t.connection.as_ref()) {
+            (Kind::Table(r), c) if draft => format!(
+                "New table in {}{}",
+                r.database,
+                c.map_or(String::new(), |c| format!(" · {}", c.name))
+            ),
             (Kind::Table(r), c) => format!(
                 "{}.{}{}",
                 r.database,
@@ -967,7 +1096,8 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                     .as_ref()
                     .and_then(|c| super::env_marker(c.environment, &p)),
             )
-            .when(t.dirty && !console && !table, |d| {
+            // An unsaved file, or a draft not created yet.
+            .when(t.dirty && !console && !table || draft, |d| {
                 d.child(div().size(px(6.)).rounded_full().bg(p.tx3))
             })
             // A table's pending changes and an open transaction share the warn dot.
@@ -991,25 +1121,33 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
                         this.close_tab(i, window, cx);
                     })),
             );
-        // A table tab's menu: Import CSV into the table.
+        // A table tab's menu: Import CSV into the table, then the table actions.
         let import = match (&t.kind, &t.connection) {
-            (Kind::Table(r), Some(c)) if !key => Some((c.id.clone(), r.clone())),
+            (Kind::Table(r), Some(c)) if !key && !draft => {
+                Some((c.id.clone(), r.clone(), c.read_only))
+            }
             _ => None,
         };
         match import {
-            Some((id, r)) => {
+            Some((id, r, read_only)) => {
                 let shell = cx.entity();
                 element
-                    .context_menu(move |menu, _, _| {
-                        let (shell, id, r) = (shell.clone(), id.clone(), r.clone());
-                        menu.item(
-                            crate::assets::menu_item("Import CSV…", crate::assets::Icon::Import)
+                    .context_menu(move |menu, _, cx| {
+                        let (s, id2, r2) = (shell.clone(), id.clone(), r.clone());
+                        let menu = menu
+                            .item(
+                                crate::assets::menu_item(
+                                    "Import CSV…",
+                                    crate::assets::Icon::Import,
+                                )
                                 .on_click(move |_, window, cx| {
-                                    shell.update(cx, |s, cx| {
-                                        s.open_import(&id, Some(r.clone()), window, cx);
+                                    s.update(cx, |s, cx| {
+                                        s.open_import(&id2, Some(r2.clone()), window, cx);
                                     });
                                 }),
-                        )
+                            )
+                            .separator();
+                        super::objects::table_actions(menu, &shell, &id, &r, read_only, cx)
                     })
                     .into_any_element()
             }

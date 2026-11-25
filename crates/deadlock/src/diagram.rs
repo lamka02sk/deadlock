@@ -766,6 +766,18 @@ impl DiagramTab {
         self.load = Load::Ready(board);
     }
 
+    /// Table `from` of the shown schema was renamed (`to`) or dropped: its saved card
+    /// follows, then the diagram reloads.
+    pub fn table_changed(&mut self, from: &str, to: Option<&str>, cx: &mut Context<Self>) {
+        self.save_now();
+        if let Err(e) =
+            diagram::rename_table(&self.root, &self.connection.id, &self.schema, from, to)
+        {
+            eprintln!("deadlock: {e}");
+        }
+        self.reload(cx);
+    }
+
     /// Switches to another schema of the connection.
     pub fn set_schema(&mut self, schema: String, cx: &mut Context<Self>) {
         if schema == self.schema && !matches!(self.load, Load::Failed(_)) {

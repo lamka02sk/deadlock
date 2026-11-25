@@ -39,6 +39,7 @@ pub(crate) mod table;
 
 use inline::{BlockEvent, Body, ResultBlock};
 
+pub(crate) use structure::TableAction;
 pub use table::{
     AddRow, DeleteRows, EditCell, NextCell, PasteCells, PickDate, PrevCell, SetDefault, SetNull,
     UndoChange, View,
@@ -112,6 +113,16 @@ pub enum TabEvent {
     OpenTable(deadlock_core::edit::TableRef),
     /// An ALTER changed a table in this database: the sidebar reloads it.
     SchemaChanged(String),
+    /// The Add foreign key form wants this schema's tables: answer with
+    /// [`QueryTab::reference_tables`], from the sidebar's cache when it has them.
+    NeedTables(String),
+    /// The tab's table was renamed (from, to), or a draft created (`from` has no
+    /// name): diagram cards follow, the tab list saves.
+    TableRenamed(deadlock_core::edit::TableRef, deadlock_core::edit::TableRef),
+    /// The tab's table was dropped: its diagram card goes and the tab closes.
+    TableDropped(deadlock_core::edit::TableRef),
+    /// A New table draft's Discard: the tab closes without asking.
+    Discard,
     /// The user chose where results go: inline (`true`) or the bottom panel. The
     /// project remembers it and every tab follows.
     ResultsInline(bool),

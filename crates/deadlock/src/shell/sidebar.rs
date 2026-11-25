@@ -249,6 +249,18 @@ impl Shell {
                 if self.tree.set_children(&id, nodes) {
                     self.fresh.insert(id.clone());
                 }
+                if id.len() == 2 {
+                    // Open Add foreign key forms list this database's tables.
+                    for (t, _) in &self.tabs {
+                        if t.read(cx)
+                            .connection
+                            .as_ref()
+                            .is_some_and(|c| c.id == id[0])
+                        {
+                            t.update(cx, |t, cx| t.tables_changed(cx));
+                        }
+                    }
+                }
                 if id.len() == 1 {
                     // A reloaded connection reloads its open databases.
                     let open: Vec<NodeId> = self
@@ -269,6 +281,15 @@ impl Shell {
                     && self.tree.is_gone(sel)
                 {
                     self.selected = Some(sel[..sel.len() - 1].to_vec());
+                }
+                if let Some(r) = self.reveal.take_if(|r| r.starts_with(&id))
+                    && self.tree.reveal(&r)
+                {
+                    self.selected = Some(r);
+                    self.rebuild(cx);
+                    if let Some(ix) = self.selected_ix() {
+                        self.list.scroll_to_item(ix, ScrollStrategy::Nearest);
+                    }
                 }
             }
             Err(e) => {
@@ -844,7 +865,11 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
     }
     let is_db = row.kind == RowKind::Node(NodeKind::Database);
     let object_menu = !redis_menu && shell.has_object_menu(row);
-    if !redis_menu && !is_db && !object_menu {
+    let table_menu = row.kind == RowKind::Node(NodeKind::Table)
+        && row.id.len() == 4
+        && row.id[2] == "Tables"
+        && shell.flavor(&row.id[0]).is_some();
+    if !redis_menu && !is_db && !object_menu && !table_menu {
         return element.into_any_element();
     }
     let (row, shell_entity) = (row.clone(), cx.entity());
@@ -869,6 +894,13 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                 shell_entity
                     .read(cx)
                     .object_menu(&row, menu, shell_entity.clone(), cx)
+            } else {
+                menu
+            };
+            let menu = if table_menu {
+                shell_entity
+                    .read(cx)
+                    .table_menu(&row, menu, shell_entity.clone(), cx)
             } else {
                 menu
             };

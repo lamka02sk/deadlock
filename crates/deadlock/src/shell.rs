@@ -157,6 +157,8 @@ pub struct Shell {
     diagrams: Vec<(Entity<crate::diagram::DiagramTab>, Subscription)>,
     /// Object editor tabs, one per object, after the diagram tabs.
     objects: Vec<(Entity<crate::object::ObjectTab>, Subscription)>,
+    /// Object tabs from `state.json`, waiting for their connection to connect.
+    restored_objects: Vec<(String, deadlock_core::objects::ObjectRef)>,
     /// Sessions waiting on a lock, per connection, from the periodic check.
     waiting: HashMap<String, usize>,
     _watch: Task<()>,
@@ -175,6 +177,8 @@ pub struct Shell {
     /// Nodes loaded from the server this session; the rest came from the cache.
     fresh: HashSet<NodeId>,
     selected: Option<NodeId>,
+    /// A table just created: selected once its schema reloads with it.
+    reveal: Option<NodeId>,
     list: UniformListScrollHandle,
     tree_focus: FocusHandle,
     search: Option<Search>,
@@ -250,6 +254,7 @@ impl Shell {
             configs: Vec::new(),
             diagrams: Vec::new(),
             objects: Vec::new(),
+            restored_objects: Vec::new(),
             waiting: HashMap::new(),
             _watch: Self::watch_waits(cx),
             front: Front::None,
@@ -262,6 +267,7 @@ impl Shell {
             query_active: false,
             fresh: HashSet::new(),
             selected: None,
+            reveal: None,
             list: UniformListScrollHandle::new(),
             tree_focus: cx.focus_handle(),
             search: None,
@@ -388,18 +394,20 @@ impl Shell {
             );
             return false;
         }
-        let objects = self.dirty_objects(cx);
+        let mut objects = self.dirty_objects(cx);
+        objects.extend(self.unapplied_tables(cx));
         if !objects.is_empty() && !std::mem::take(&mut self.objects_settled) {
             let answer = crate::dialog::ask(
                 window,
                 cx,
                 crate::dialog::Ask::new(
-                    "Discard the unapplied object changes before closing?",
+                    "Discard the unapplied changes before closing?",
                     &["Discard", "Cancel"],
                 )
                 .text(format!(
-                    "{} have edits that were not applied.",
-                    objects.join(", ")
+                    "{} {} edits that were not applied.",
+                    objects.join(", "),
+                    if objects.len() == 1 { "has" } else { "have" }
                 )),
             );
             let handle = window.window_handle();
@@ -761,6 +769,7 @@ impl Shell {
                 self.conns.insert(id.clone(), Conn::Connected(driver));
                 self.follow_link(&id, cx);
                 self.resume_tabs(&id, None, cx);
+                self.reopen_objects(&id, cx);
                 self.tree.status.remove(&vec![id.clone()]);
                 if let Some(keep) = keep {
                     self.remember_password(&id, keep, cx);
@@ -779,6 +788,7 @@ impl Shell {
                 self.conns.insert(id, Conn::Failed(e));
             }
         }
+        self.connect_restored(cx);
         // Search everywhere may be waiting for this server.
         self.run_everywhere(cx);
         self.rebuild(cx);

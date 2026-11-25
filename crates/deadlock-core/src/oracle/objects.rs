@@ -13,7 +13,7 @@ use crate::objects::{
 };
 
 fn missing(o: &ObjectRef) -> DriverError {
-    DriverError::Invalid(format!(
+    DriverError::NotFound(format!(
         "{} {}.{} does not exist, or this account cannot see it",
         o.kind.label(),
         o.schema,
@@ -32,7 +32,9 @@ fn source_text(conn: &Connection, o: &ObjectRef, ty: &str) -> Result<String> {
         .iter()
         .map(|r| col(r, 0))
         .collect::<String>()
-        .trim_end()
+        // Oracle ends a trigger's source with a NUL once it rewrote it (after a rename
+        // of its table); left in, the body differs from the one read before.
+        .trim_end_matches(|c: char| c.is_whitespace() || c == '\0')
         .to_owned())
 }
 

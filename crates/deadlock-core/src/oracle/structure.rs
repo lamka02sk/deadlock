@@ -89,6 +89,14 @@ pub(super) fn structure(conn: &Connection, t: &TableRef) -> Result<TableStructur
         tablespace: table.first().cloned().flatten(),
         ..TableFacts::default()
     };
+    if s.facts.rows == Some(0) && !s.view {
+        // Statistics can say 0 for a table with rows: a count that is not known then.
+        let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+        let probe = format!("SELECT 1 FROM {}.{} WHERE ROWNUM = 1", q(owner), q(name));
+        if !texts(conn, &probe, &[]).is_ok_and(|r| r.is_empty()) {
+            s.facts.rows = None;
+        }
+    }
     if !s.view {
         // Sizes need the segment views: the user's own, else DBA_SEGMENTS if granted.
         if let Ok((data, index)) = segments(conn, t) {
@@ -254,8 +262,8 @@ fn from_rows(
                 },
                 to_columns: Vec::new(),
                 on_delete: col(r, 7).to_ascii_lowercase(),
-                // Oracle never cascades updates of a referenced key.
-                on_update: "no action".into(),
+                // Oracle has no ON UPDATE clause, so the grid shows nothing.
+                on_update: String::new(),
             });
         }
         if let Some(k) = all.last_mut() {
@@ -286,6 +294,12 @@ fn from_rows(
         .map(|r| {
             let name = col(r, 0);
             let default = col(r, 8).trim().to_owned();
+            // `modify (c default null)` leaves `null` as the default's text.
+            let default = if default.eq_ignore_ascii_case("null") {
+                String::new()
+            } else {
+                default
+            };
             let virtual_column = col(r, 9) == "YES";
             let identity = col(r, 10);
             StructureColumn {
@@ -307,6 +321,7 @@ fn from_rows(
                 },
                 comment: col(r, 11),
                 name,
+                ..StructureColumn::default()
             }
         })
         .collect();
@@ -371,6 +386,9 @@ mod tests {
                 ]),
                 r(&[
                     "QTY", "NUMBER", "22", "10", "0", "0", "", "Y", "0 ", "NO", "", "how many",
+                ]),
+                r(&[
+                    "NOTE", "VARCHAR2", "40", "", "", "40", "C", "Y", "null", "NO", "", "",
                 ]),
                 r(&[
                     "TWICE",
@@ -440,8 +458,10 @@ mod tests {
         assert_eq!(s.columns[1].default.as_deref(), Some("0"));
         assert_eq!(s.columns[1].key_label(), "FK");
         assert_eq!(s.columns[1].column_type, "number(10)");
+        assert_eq!(s.columns[2].default, None);
+        assert_eq!(s.columns[2].column_type, "varchar2(40 char)");
         assert_eq!(
-            s.columns[2].default_label(),
+            s.columns[3].default_label(),
             "generated always as (\"QTY\"*2) virtual"
         );
         let kinds: Vec<_> = s
@@ -461,6 +481,7 @@ mod tests {
         );
         assert_eq!(s.indexes[4].constraint.as_deref(), Some("ORD_UQ_C"));
         assert_eq!(s.foreign_keys[0].on_delete, "cascade");
+        assert_eq!(s.foreign_keys[0].on_update, "");
         assert_eq!(s.referenced_by[0].from.table, "LINE");
         assert_eq!(s.checks.len(), 1);
         assert_eq!(s.checks[0].condition, "qty >= 0");

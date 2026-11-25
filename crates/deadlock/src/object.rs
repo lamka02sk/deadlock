@@ -242,6 +242,34 @@ impl ObjectTab {
         !self.new && self.connection.id == conn && self.object == *object
     }
 
+    /// Whether the tab edits a trigger on table `table` of connection `conn`.
+    pub(crate) fn is_on_table(&self, conn: &str, table: &deadlock_core::edit::TableRef) -> bool {
+        self.connection.id == conn
+            && (self.base.is_on_table(table) || self.draft.is_on_table(table))
+    }
+
+    /// Table `from` of connection `conn` is `to` now: a trigger on it follows, keeping
+    /// unapplied edits, and reads itself again from the server.
+    pub(crate) fn table_renamed(
+        &mut self,
+        conn: &str,
+        from: &deadlock_core::edit::TableRef,
+        to: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.connection.id != conn || !self.draft.follow_table_rename(from, to) {
+            return;
+        }
+        self.base.follow_table_rename(from, to);
+        self.build_form(window, cx);
+        if self.new {
+            self.changed(cx);
+        } else {
+            self.reload(false, window, cx);
+        }
+    }
+
     fn source_first(&self) -> bool {
         matches!(self.draft.props, Properties::Source(_))
     }

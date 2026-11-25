@@ -182,6 +182,37 @@ pub fn labelled(label: &'static str, input: impl IntoElement) -> Div {
         .child(div().font_weight(gpui_kit::FontWeight::NORMAL).child(input))
 }
 
+/// The design's `.ban.w`: a warning triangle, then `body` (any text children), on the
+/// warn background.
+pub fn warning_band(body: impl IntoElement, p: &Palette) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(8.))
+        .border_1()
+        .border_color(p.warn_line)
+        .bg(p.warn_bg)
+        .rounded(RADIUS)
+        .line_height(px(20.))
+        .child(icon(Icon::Warning, p.warn).mt(px(2.)))
+        .child(div().flex_1().min_w_0().child(body))
+}
+
+/// The design's `.hw`: a 14 px warning triangle and the text, in the warn color.
+pub fn warning_line(text: impl Into<SharedString>, p: &Palette) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(6.))
+        .text_size(crate::theme::small_size())
+        .line_height(px(18.))
+        .text_color(p.warn)
+        .child(icon(Icon::Warning, p.warn).size(px(14.)).mt(px(2.)))
+        .child(div().flex_1().min_w_0().child(text.into()))
+}
+
 /// The 8 px status dot.
 pub fn dot(color: Hsla) -> Div {
     div().size(px(8.)).flex_none().rounded_full().bg(color)

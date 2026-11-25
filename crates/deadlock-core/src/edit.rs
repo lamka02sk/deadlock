@@ -290,6 +290,11 @@ pub fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// Whether a session with this `@@sql_mode` treats `\` in strings as an escape.
+pub fn backslash_escapes(sql_mode: &str) -> bool {
+    !sql_mode.contains("NO_BACKSLASH_ESCAPES")
+}
+
 /// A quoted string literal. `'` doubles; with backslash escapes on, `\` doubles and
 /// NUL is written `\0`.
 pub fn quote_str(s: &str, backslash_escapes: bool) -> String {
@@ -1057,7 +1062,7 @@ pub fn select_sql(
     if !order_by.is_empty() {
         let _ = write!(sql, "\norder by {}", order_by.join(", "));
     }
-    one_statement(&sql, info.engine())?;
+    one_statement(&sql, info)?;
     Ok(sql)
 }
 
@@ -1084,12 +1089,13 @@ pub fn count_sql(
             format!("select count(*) from ({sql}\nlimit {n}\n) x")
         };
     }
-    one_statement(&sql, info.engine())?;
+    one_statement(&sql, info)?;
     Ok(sql)
 }
 
-fn one_statement(sql: &str, engine: Engine) -> Result<(), String> {
-    if crate::split::split(sql, engine).len() == 1 {
+/// Scans literals as the session does (`NO_BACKSLASH_ESCAPES`).
+fn one_statement(sql: &str, info: &TableInfo) -> Result<(), String> {
+    if crate::split::split_in_mode(sql, info.engine(), info.backslash_escapes).len() == 1 {
         Ok(())
     } else {
         Err("the where and order by fields must not end the statement (;)".into())
@@ -1530,6 +1536,14 @@ mod tests {
         );
         assert!(select_sql(&t, &info, "1; delete from orders", "").is_err());
         assert!(count_sql(&t, &info, "1); drop table x; (1", None).is_err());
+        // `\'` ends the literal only without backslash escapes, as the session reads it.
+        let typed = "status = 'C:\\' or status = ';'";
+        assert!(select_sql(&t, &info, typed, "").is_err());
+        let plain = TableInfo {
+            backslash_escapes: false,
+            ..info.clone()
+        };
+        assert!(select_sql(&t, &plain, typed, "").is_ok());
         assert_eq!(
             count_sql(&t, &info, "id > 1", Some(5)).unwrap(),
             "select count(*) from (select 1 from `shop`.`orders`\nwhere (\nid > 1\n)\nlimit 5\n) x"

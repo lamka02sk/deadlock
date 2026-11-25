@@ -557,6 +557,35 @@ pub fn save(root: &Path, connection: &str, schema: &str, saved: &Saved) -> Resul
     write_json(&path, &all)
 }
 
+/// Renames (`to = Some`) or removes (`None`) table `from` in the saved layout of
+/// `schema` on `connection`. Nothing saved, or no such card: no write.
+///
+/// # Errors
+/// Fails when `.deadlock/diagrams.json` cannot be written.
+pub fn rename_table(
+    root: &Path,
+    connection: &str,
+    schema: &str,
+    from: &str,
+    to: Option<&str>,
+) -> Result<()> {
+    let path = saved_path(root);
+    let Ok(mut all) = read_json::<SavedAll>(&path) else {
+        return Ok(());
+    };
+    let Some(saved) = all.get_mut(connection).and_then(|s| s.get_mut(schema)) else {
+        return Ok(());
+    };
+    let Some(i) = saved.tables.iter().position(|t| t.name == from) else {
+        return Ok(());
+    };
+    match to {
+        Some(to) => to.clone_into(&mut saved.tables[i].name),
+        None => drop(saved.tables.remove(i)),
+    }
+    write_json(&path, &all)
+}
+
 /// Colors for [`svg`], as CSS colors.
 #[derive(Debug, Clone)]
 pub struct Colors {
@@ -982,6 +1011,46 @@ mod tests {
         .unwrap();
         assert_eq!(load(dir.path(), "c", "shop"), Some(saved));
         assert_eq!(load(dir.path(), "d", "shop").unwrap().zoom, 2.);
+    }
+
+    #[test]
+    fn renamed_and_dropped_tables_follow_in_saved_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Nothing saved: no file is written.
+        rename_table(root, "c", "shop", "orders", None).unwrap();
+        assert!(!root.join(".deadlock").exists());
+        std::fs::create_dir(root.join(".deadlock")).unwrap();
+        let placed = |name: &str, x: f32| Placed {
+            name: name.into(),
+            x,
+            y: 20.,
+        };
+        let saved = Saved {
+            tables: vec![placed("orders", 10.), placed("items", 30.)],
+            zoom: 0.5,
+            pan: (3., 4.),
+        };
+        for (conn, schema) in [("c", "shop"), ("c", "other"), ("d", "shop")] {
+            save(root, conn, schema, &saved).unwrap();
+        }
+        rename_table(root, "c", "shop", "orders", Some("sales")).unwrap();
+        let after = load(root, "c", "shop").unwrap();
+        assert_eq!(
+            after.tables,
+            vec![placed("sales", 10.), placed("items", 30.)]
+        );
+        rename_table(root, "c", "shop", "items", None).unwrap();
+        assert_eq!(
+            load(root, "c", "shop").unwrap().tables,
+            vec![placed("sales", 10.)]
+        );
+        // No such card: the file stays as it is.
+        let before = std::fs::read(saved_path(root)).unwrap();
+        rename_table(root, "c", "shop", "gone", None).unwrap();
+        assert_eq!(std::fs::read(saved_path(root)).unwrap(), before);
+        assert_eq!(load(root, "c", "other"), Some(saved.clone()));
+        assert_eq!(load(root, "d", "shop"), Some(saved));
     }
 
     #[test]

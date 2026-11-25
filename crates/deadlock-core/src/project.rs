@@ -70,6 +70,14 @@ pub enum TabState {
         database: String,
         table: String,
     },
+    /// An object editor tab; `object` is the kind's label (`trigger`, `view`…).
+    /// Object tabs come after the others.
+    Object {
+        connection: String,
+        schema: String,
+        name: String,
+        object: String,
+    },
 }
 
 /// Window position and size in logical pixels. For a maximized or fullscreen window,
@@ -299,6 +307,12 @@ mod tests {
             TabState::Console {
                 connection: "local".into(),
             },
+            TabState::Object {
+                connection: "local".into(),
+                schema: "app".into(),
+                name: "orders_bu".into(),
+                object: "trigger".into(),
+            },
         ];
         project.state.active_tab = Some(2);
         project.state.files_open = true;
@@ -308,6 +322,7 @@ mod tests {
         assert_eq!(again.state, project.state);
         let json = fs::read_to_string(dir.path().join(DIR).join(STATE)).unwrap();
         assert!(json.contains(r#""kind": "console""#), "{json}");
+        assert!(json.contains(r#""object": "trigger""#), "{json}");
     }
 
     #[test]
