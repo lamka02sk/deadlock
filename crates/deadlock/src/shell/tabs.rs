@@ -1001,7 +1001,8 @@ fn write(tab: &Entity<QueryTab>, path: &Path, cx: &mut gpui_kit::App) -> bool {
 
 /// The tab strip: editor tabs, then the New connection tab.
 /// A connection's tint on its tab: a tinted background (stronger in front), a 2 px
-/// accent along the top and, behind the front tab's blue underline, along the bottom.
+/// accent along the top and the front tab's blue underline; a tab behind keeps its
+/// bottom border in its own background.
 pub(super) fn tinted(
     tab: gpui_kit::Stateful<gpui_kit::Div>,
     color: Option<gpui_kit::Hsla>,
@@ -1009,9 +1010,10 @@ pub(super) fn tinted(
     p: &Palette,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let Some(c) = color else { return tab };
+    let bg = crate::color::over(c, if on { 0.32 } else { 0.14 }, p.bg);
     tab.relative()
-        .bg(crate::color::over(c, if on { 0.32 } else { 0.14 }, p.bg))
-        .border_color(if on { p.blue } else { c })
+        .bg(bg)
+        .border_color(if on { p.blue } else { bg })
         .child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(c))
 }
 

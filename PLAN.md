@@ -235,6 +235,16 @@ A project stays a folder. Its name, color and pattern live in `.deadlock/project
 
 **Design gaps:** dropdown rows, Settings Project section, title bar patterns (19); Connections block, Danger zone, both delete dialogs (20).
 
+### Milestone 8 — Console schema, navigation and fixes (0.1.4)
+
+Brief: `docs/plans/milestone-8-console-and-polish.md`. Design: canvas artboard "Console schema picker (0.1.4)".
+
+**Phase 21 — Console schema picker, console follows the last click (M).** Toolbar schema chip before Run with a filterable menu; switching runs `USE` / `ALTER SESSION SET CURRENT_SCHEMA` / `SELECT n` on the tab's session, follows a typed `USE`, survives a restart. Console opens on the connection and schema last clicked in the sidebar or tab strip.
+
+**Phase 22 — Run icons, Ctrl+click, connection order, project switching and closing (M).** Gutter run icons in step with scrolling; Ctrl+click on object names opens them; reorder connections in Settings → Project; fix project switch from the dropdown and the title bar X sometimes doing nothing.
+
+Done on the branch before the phases: softer dark theme text (`#E5E5E5`), inactive tinted tabs without the connection-colored bottom border.
+
 ## Phase 0 result (2026-11-22): go on GPUI
 
 - Pins: `gpui-kit` (re-exports gpui and gpui-component) at git rev `1c7e7f7c6c8d6585da909804496614da01bb8663`; gpui itself is `gpui-pre = "=0.3.12"` from crates.io.
