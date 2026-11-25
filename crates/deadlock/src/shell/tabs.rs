@@ -624,7 +624,7 @@ impl Shell {
         .detach();
     }
 
-    fn remove_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+    pub(super) fn remove_tab(&mut self, i: usize, cx: &mut Context<Self>) {
         if i >= self.tabs.len() {
             return;
         }

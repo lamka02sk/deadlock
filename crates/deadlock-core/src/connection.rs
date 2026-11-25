@@ -275,6 +275,11 @@ pub mod keychain {
 
     const SERVICE: &str = "deadlock";
 
+    /// The entry name of a connection's SSH password or passphrase.
+    pub fn ssh_entry(id: &str) -> String {
+        format!("{id}#ssh")
+    }
+
     fn entry(project: &Path, id: &str) -> keyring::Result<keyring::Entry> {
         keyring::Entry::new(SERVICE, &format!("{}#{id}", project.display()))
     }

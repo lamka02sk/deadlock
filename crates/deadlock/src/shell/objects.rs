@@ -326,7 +326,7 @@ impl Shell {
         .detach();
     }
 
-    fn remove_object(&mut self, i: usize, cx: &mut Context<Self>) {
+    pub(super) fn remove_object(&mut self, i: usize, cx: &mut Context<Self>) {
         if i >= self.objects.len() {
             return;
         }

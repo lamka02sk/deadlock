@@ -586,6 +586,21 @@ pub fn rename_table(
     write_json(&path, &all)
 }
 
+/// Removes every saved layout of `connection`. Nothing saved for it: no write.
+///
+/// # Errors
+/// Fails when `.deadlock/diagrams.json` cannot be written.
+pub fn forget(root: &Path, connection: &str) -> Result<()> {
+    let path = saved_path(root);
+    let Ok(mut all) = read_json::<SavedAll>(&path) else {
+        return Ok(());
+    };
+    if all.remove(connection).is_none() {
+        return Ok(());
+    }
+    write_json(&path, &all)
+}
+
 /// Colors for [`svg`], as CSS colors.
 #[derive(Debug, Clone)]
 pub struct Colors {
@@ -1050,6 +1065,27 @@ mod tests {
         rename_table(root, "c", "shop", "gone", None).unwrap();
         assert_eq!(std::fs::read(saved_path(root)).unwrap(), before);
         assert_eq!(load(root, "c", "other"), Some(saved.clone()));
+        assert_eq!(load(root, "d", "shop"), Some(saved));
+    }
+
+    #[test]
+    fn forget_removes_one_connection_and_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        forget(root, "c").unwrap();
+        assert!(!root.join(".deadlock").exists());
+        std::fs::create_dir(root.join(".deadlock")).unwrap();
+        let saved = Saved {
+            tables: vec![],
+            zoom: 1.,
+            pan: (0., 0.),
+        };
+        for (conn, schema) in [("c", "shop"), ("c", "other"), ("d", "shop")] {
+            save(root, conn, schema, &saved).unwrap();
+        }
+        forget(root, "c").unwrap();
+        assert_eq!(load(root, "c", "shop"), None);
+        assert_eq!(load(root, "c", "other"), None);
         assert_eq!(load(root, "d", "shop"), Some(saved));
     }
 

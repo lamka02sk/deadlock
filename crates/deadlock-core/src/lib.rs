@@ -65,6 +65,10 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    #[error("keychain: {0}")]
+    Keychain(#[from] keyring::Error),
+    #[error(transparent)]
+    Cache(#[from] cache::CacheError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

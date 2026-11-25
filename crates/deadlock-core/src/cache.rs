@@ -107,6 +107,25 @@ impl SchemaCache {
         Ok(())
     }
 
+    /// Deletes the cached rows of `connection` in `project`, or of the whole project
+    /// with `None`.
+    ///
+    /// # Errors
+    /// Fails when SQLite refuses the write.
+    pub fn forget(&self, project: &Path, connection: Option<&str>) -> Result<(), CacheError> {
+        let project = project.to_string_lossy();
+        match connection {
+            Some(c) => self.0.execute(
+                "DELETE FROM nodes WHERE project = ?1 AND connection = ?2",
+                (&project, c),
+            )?,
+            None => self
+                .0
+                .execute("DELETE FROM nodes WHERE project = ?1", [&project])?,
+        };
+        Ok(())
+    }
+
     /// Every cached path of the connection with its children, shortest path first, so
     /// parents can be applied before their children.
     ///
@@ -183,5 +202,25 @@ mod tests {
         assert_eq!(cache.load(a, "c2").unwrap()[0].1, vec![db("other")]);
         assert_eq!(cache.load(b, "c1").unwrap()[0].1, vec![db("elsewhere")]);
         assert!(cache.load(b, "none").unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_drops_one_connection_or_the_whole_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (Path::new("/p/a"), Path::new("/p/b"));
+        let mut cache = SchemaCache::open(&dir.path().join("cache.sqlite3")).unwrap();
+        cache.save(a, "c1", &[], &[db("one")]).unwrap();
+        cache.save(a, "c1", &["one".into()], &[db("x")]).unwrap();
+        cache.save(a, "c2", &[], &[db("two")]).unwrap();
+        cache.save(b, "c1", &[], &[db("three")]).unwrap();
+
+        cache.forget(a, Some("c1")).unwrap();
+        assert!(cache.load(a, "c1").unwrap().is_empty());
+        assert_eq!(cache.load(a, "c2").unwrap().len(), 1);
+        assert_eq!(cache.load(b, "c1").unwrap().len(), 1);
+
+        cache.forget(a, None).unwrap();
+        assert!(cache.load(a, "c2").unwrap().is_empty());
+        assert_eq!(cache.load(b, "c1").unwrap().len(), 1);
     }
 }

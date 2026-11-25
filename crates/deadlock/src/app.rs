@@ -28,6 +28,9 @@ pub(crate) struct Registry {
     shells: Vec<(AnyWindowHandle, gpui_kit::WeakEntity<shell::Shell>)>,
     pub recent: RecentProjects,
     recent_file: Option<PathBuf>,
+    /// A folder New project just made a project of: Settings opens on its Project
+    /// section once its window has it.
+    name_next: Option<PathBuf>,
 }
 
 impl Global for Registry {}
@@ -341,6 +344,8 @@ fn register(
     shell: &gpui_kit::Entity<shell::Shell>,
     cx: &mut App,
 ) {
+    let config = &shell.read(cx).project().config;
+    let (name, color) = (config.name.clone(), config.color.clone());
     let r = cx.global_mut::<Registry>();
     r.projects.insert(root.clone(), handle);
     r.shells.push((handle, shell.downgrade()));
@@ -348,12 +353,46 @@ fn register(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     r.recent.touch(&root, now);
+    let name_it = r.name_next.take_if(|p| *p == root).is_some();
+    set_recent_look(&root, name, color, cx);
+    log(&format!("opened {}", root.display()), cx);
+    if name_it {
+        let _ = handle.update(cx, |_, window, cx| {
+            shell.update(cx, |s, cx| s.open_project_settings(window, cx));
+        });
+    }
+}
+
+/// Stores the project's name and color in the recent list and saves it; every window
+/// redraws, so the project menus and the open-project window show them.
+pub(crate) fn set_recent_look(
+    root: &Path,
+    name: Option<String>,
+    color: Option<String>,
+    cx: &mut App,
+) {
+    cx.global_mut::<Registry>()
+        .recent
+        .set_look(root, name, color);
+    save_recent(cx);
+}
+
+/// Drops a deleted project from the recent list and saves it.
+pub(crate) fn forget_recent(root: &Path, cx: &mut App) {
+    cx.global_mut::<Registry>().recent.remove(root);
+    save_recent(cx);
+}
+
+/// Writes the recent list; every window redraws, so the project menus and the
+/// open-project window show it.
+fn save_recent(cx: &mut App) {
+    let r = cx.global::<Registry>();
     if let Some(file) = &r.recent_file
         && let Err(e) = r.recent.save(file)
     {
         eprintln!("deadlock: recent projects: {e}");
     }
-    log(&format!("opened {}", root.display()), cx);
+    cx.refresh_windows();
 }
 
 /// Closes every window the way its close button does: each project window asks about
@@ -395,6 +434,55 @@ pub(crate) fn pick_folder(cx: &mut App) {
             }
         };
         cx.update(|cx| open_from_welcome(&path, cx));
+    })
+    .detach();
+}
+
+/// New project…: the native folder picker, where the user picks a folder or makes one.
+/// The folder then opens like a recent pick in window `handle`, or in a new window;
+/// when it had no `.deadlock/` yet, Settings opens on its Project section.
+pub(crate) fn new_project(handle: AnyWindowHandle, new_window: bool, cx: &mut App) {
+    let picked = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("Create project".into()),
+    });
+    cx.spawn(async move |cx| {
+        let path = match picked.await {
+            Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.swap_remove(0),
+            Ok(Ok(_)) | Err(_) => return,
+            Ok(Err(e)) => {
+                eprintln!("deadlock: folder picker: {e:#}");
+                return;
+            }
+        };
+        let Ok(path) = std::fs::canonicalize(&path) else {
+            eprintln!("deadlock: cannot open {}", path.display());
+            return;
+        };
+        cx.update(|cx| {
+            let r = cx.global_mut::<Registry>();
+            r.name_next = (!path.join(".deadlock").exists()).then(|| path.clone());
+            let shell = r
+                .shells
+                .iter()
+                .find(|(h, _)| *h == handle)
+                .map(|(_, s)| s.clone());
+            let picked = shell.is_some_and(|shell| {
+                handle
+                    .update(cx, |_, window, cx| {
+                        shell.update(cx, |s, cx| {
+                            s.pick_project(path.clone(), new_window, window, cx)
+                        })
+                    })
+                    .is_ok_and(|r| r.is_ok())
+            });
+            // The window is gone: open the project on its own.
+            if !picked && let Err(e) = open_project(&path, false, cx) {
+                eprintln!("deadlock: cannot open {}: {e:#}", path.display());
+            }
+        });
     })
     .detach();
 }

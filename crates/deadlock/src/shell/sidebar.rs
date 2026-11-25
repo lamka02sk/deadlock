@@ -190,8 +190,9 @@ impl Shell {
         let Some(cache) = cx.global::<Cache>().0.clone() else {
             return;
         };
-        // Keys change too often for a cached tree to be worth showing.
-        if self.is_redis(&id[0]) {
+        // Keys change too often for a cached tree to be worth showing. A deleted
+        // connection or project keeps no rows.
+        if self.is_redis(&id[0]) || self.deleted || self.config(&id[0]).is_none() {
             return;
         }
         let (root, path) = (self.project.root().to_owned(), id.to_vec());
@@ -829,7 +830,7 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                     cx,
                     move |m, _, _| color_menu(m, &cshell, &cid, current.as_deref()),
                 );
-                hidden.iter().fold(
+                let menu = hidden.iter().fold(
                     if hidden.is_empty() {
                         menu
                     } else {
@@ -859,6 +860,13 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                             ),
                         )
                     },
+                );
+                let (shell, id) = (shell_entity.clone(), id.clone());
+                menu.separator().item(
+                    crate::assets::menu_item_danger("Delete connection…", Icon::Trash, cx)
+                        .on_click(move |_, window, cx| {
+                            shell.update(cx, |s, cx| s.delete_connection(&id, window, cx));
+                        }),
                 )
             })
             .into_any_element();
