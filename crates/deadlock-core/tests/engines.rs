@@ -472,16 +472,22 @@ fn manual_transactions(engine: Engine, port: u16, database: &str) {
     assert!(!open(&rt, &*a));
     // MySQL's `b` reads a fresh snapshot: in Auto mode each SELECT is its own transaction.
     assert_eq!(count(&rt, &*b, "p5_tx"), "1");
+    // DDL commits what ran before it, and the reads after it leave nothing to commit.
+    run(&rt, &*a, "INSERT INTO p5_tx VALUES (5)").unwrap();
+    run(&rt, &*a, "ALTER TABLE p5_tx ADD c INT").unwrap();
+    assert_eq!(count(&rt, &*a, "p5_tx"), "2");
+    assert!(!open(&rt, &*a));
+    assert_eq!(count(&rt, &*b, "p5_tx"), "2");
 
     // Auto mode: every statement commits on its own.
     rt.block_on(a.set_auto_commit(true)).unwrap();
-    run(&rt, &*a, "INSERT INTO p5_tx VALUES (4)").unwrap();
+    run(&rt, &*a, "INSERT INTO p5_tx VALUES (4, NULL)").unwrap();
     assert!(!open(&rt, &*a));
-    assert_eq!(count(&rt, &*b, "p5_tx"), "2");
+    assert_eq!(count(&rt, &*b, "p5_tx"), "3");
     // A transaction started by hand counts as open before any write.
     if engine != Engine::Oracle {
         run(&rt, &*a, "START TRANSACTION").unwrap();
-        assert_eq!(count(&rt, &*a, "p5_tx"), "2");
+        assert_eq!(count(&rt, &*a, "p5_tx"), "3");
         assert!(open(&rt, &*a));
         rt.block_on(a.end_transaction(false)).unwrap();
         assert!(!open(&rt, &*a));
@@ -1188,9 +1194,11 @@ mod table_structure {
         );
         assert!(
             c("created")
-                .extra
-                .to_ascii_lowercase()
-                .starts_with("on update current_timestamp")
+                .on_update
+                .as_deref()
+                .is_some_and(|u| u.to_ascii_lowercase().starts_with("current_timestamp")),
+            "{:?}",
+            c("created")
         );
         assert_eq!(
             c("total").default_label(),
@@ -1244,11 +1252,12 @@ mod table_structure {
                 auto_increment: false,
                 comment: "new one".into(),
                 position: Position::After("pb".into()),
+                ..NewColumn::default()
             },
             &s,
         )
         .unwrap();
-        run(&rt, &*d, &add).unwrap();
+        run(&rt, &*d, &add[0]).unwrap();
         let idx = structure::add_index_sql(
             &t,
             &NewIndex {
@@ -1308,6 +1317,709 @@ mod table_structure {
         for sql in cleanup {
             run(&rt, &*d, sql).unwrap();
         }
+    }
+
+    /// Reads `name`, edits column `column` with `f` through `modify_column_sql`, runs
+    /// the statements and re-reads: every other column must come back unchanged.
+    fn edit_column(
+        rt: &Runtime,
+        d: &dyn Driver,
+        name: &str,
+        column: &str,
+        f: impl FnOnce(&mut NewColumn),
+    ) -> Result<TableStructure, String> {
+        let s = read(rt, d, name);
+        let old = s.columns.iter().find(|c| c.name == column).unwrap();
+        let mut new = NewColumn::from_existing(old, &s);
+        f(&mut new);
+        for sql in structure::modify_column_sql(&table(name), old, &new, &s)? {
+            run(rt, d, &sql).map_err(|e| format!("{sql}: {e}"))?;
+        }
+        let after = read(rt, d, name);
+        for c in s.columns.iter().filter(|c| c.name != column) {
+            let now = after.columns.iter().find(|x| x.name == c.name);
+            assert_eq!(now, Some(c), "{column} edit touched {}", c.name);
+        }
+        Ok(after)
+    }
+
+    /// Phase 15: every attribute of a column changes alone; a no-op edit leaves
+    /// `SHOW CREATE TABLE` byte-identical.
+    fn columns_edit(engine: Engine, port: u16) {
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &config(engine, port, "deadlock"));
+        let mariadb = engine == Engine::Mariadb;
+        run(&rt, &*d, "DROP TABLE IF EXISTS p15_edit").unwrap();
+        // Members with a comma, a quote and a backslash (a SET member cannot hold a
+        // comma: 1367); MySQL's SRID, MariaDB's
+        // column-level checks (JSON's json_valid and a typed one).
+        let more = if mariadb {
+            "j JSON, ck INT CHECK (ck > 0)"
+        } else {
+            "pt POINT NOT NULL SRID 4326"
+        };
+        run(
+            &rt,
+            &*d,
+            &format!(
+                "CREATE TABLE p15_edit (
+                   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                   name VARCHAR(20) COLLATE utf8mb4_bin NOT NULL DEFAULT 'x' COMMENT 'c',
+                   ts DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+                   amount DECIMAL(10,2) UNSIGNED,
+                   kind ENUM('a','b'),
+                   g DECIMAL(12,2) AS (amount * 2) VIRTUAL,
+                   u CHAR(36) DEFAULT (uuid()),
+                   e ENUM('a,b','it''s','x\\\\y'),
+                   {more}
+                 )"
+            ),
+        )
+        .unwrap();
+        let point = if mariadb {
+            ""
+        } else {
+            ", ST_SRID(POINT(1, 2), 4326)"
+        };
+        run(
+            &rt,
+            &*d,
+            &format!(
+                "INSERT INTO p15_edit (name, amount, kind, e{}) VALUES ('n', 1.5, 'a', 'a,b'{point})",
+                if mariadb { "" } else { ", pt" }
+            ),
+        )
+        .unwrap();
+        let s = read(&rt, &*d, "p15_edit");
+        let ddl = s.ddl.clone();
+        let e = s.columns.iter().find(|c| c.name == "e").unwrap();
+        assert_eq!(
+            NewColumn::from_existing(e, &s).length,
+            r"'a,b','it''s','x\\y'"
+        );
+        if mariadb {
+            let j = s.columns.iter().find(|c| c.name == "j").unwrap();
+            assert_eq!(j.check.as_deref(), Some("json_valid(`j`)"));
+            let ck = s.columns.iter().find(|c| c.name == "ck").unwrap();
+            assert_eq!(ck.check.as_deref(), Some("`ck` > 0"));
+            assert!(s.checks.is_empty(), "{:?}", s.checks);
+        } else {
+            let pt = s.columns.iter().find(|c| c.name == "pt").unwrap();
+            assert_eq!(pt.srid, Some(4326));
+        }
+        // (a) Round trip: restating each column as it is changes nothing.
+        for c in read(&rt, &*d, "p15_edit").columns {
+            edit_column(&rt, &*d, "p15_edit", &c.name, |_| {}).unwrap();
+            assert_eq!(read(&rt, &*d, "p15_edit").ddl, ddl, "{}", c.name);
+        }
+        let col =
+            |s: &TableStructure, n: &str| s.columns.iter().find(|c| c.name == n).cloned().unwrap();
+        // (b) Rename keeps collation, default and comment.
+        let s = edit_column(&rt, &*d, "p15_edit", "name", |c| c.name = "title".into()).unwrap();
+        let title = col(&s, "title");
+        assert_eq!(title.collation.as_deref(), Some("utf8mb4_bin"));
+        assert_eq!(title.default.as_deref(), Some("'x'"));
+        assert_eq!(title.comment, "c");
+        assert!(!title.nullable);
+        // (c) Longer.
+        let s = edit_column(&rt, &*d, "p15_edit", "title", |c| c.length = "40".into()).unwrap();
+        assert_eq!(col(&s, "title").column_type, "varchar(40)");
+        assert_eq!(col(&s, "title").collation.as_deref(), Some("utf8mb4_bin"));
+        // (d) Null and back.
+        let s = edit_column(&rt, &*d, "p15_edit", "title", |c| c.nullable = true).unwrap();
+        assert!(col(&s, "title").nullable);
+        let s = edit_column(&rt, &*d, "p15_edit", "title", |c| c.nullable = false).unwrap();
+        assert!(!col(&s, "title").nullable);
+        // (e) Another default, then none.
+        let s = edit_column(&rt, &*d, "p15_edit", "title", |c| c.default = "it's".into()).unwrap();
+        assert_eq!(col(&s, "title").default.as_deref(), Some("'it''s'"));
+        let s = edit_column(&rt, &*d, "p15_edit", "amount", |c| {
+            c.default = String::new()
+        })
+        .unwrap();
+        assert_eq!(col(&s, "amount").default, None);
+        let s = edit_column(&rt, &*d, "p15_edit", "amount", |c| c.default = "2.5".into()).unwrap();
+        assert_eq!(col(&s, "amount").default.as_deref(), Some("2.50"));
+        // (f) On update off, then on again with the column's precision.
+        let s = edit_column(&rt, &*d, "p15_edit", "ts", |c| c.on_update = false).unwrap();
+        assert_eq!(col(&s, "ts").on_update, None);
+        assert!(col(&s, "ts").default.is_some());
+        let s = edit_column(&rt, &*d, "p15_edit", "ts", |c| c.on_update = true).unwrap();
+        assert!(
+            col(&s, "ts")
+                .on_update
+                .is_some_and(|u| u.eq_ignore_ascii_case("current_timestamp(3)")),
+            "{:?}",
+            col(&s, "ts")
+        );
+        // (g) Comment.
+        let s = edit_column(&rt, &*d, "p15_edit", "title", |c| {
+            c.comment = "a 'new' one".into()
+        })
+        .unwrap();
+        assert_eq!(col(&s, "title").comment, "a 'new' one");
+        // (h) Move first, then back after id.
+        let s = edit_column(&rt, &*d, "p15_edit", "kind", |c| {
+            c.position = Position::First
+        })
+        .unwrap();
+        assert_eq!(s.columns[0].name, "kind");
+        let s = edit_column(&rt, &*d, "p15_edit", "kind", |c| {
+            c.position = Position::After("id".into());
+        })
+        .unwrap();
+        let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names[..8],
+            ["id", "kind", "title", "ts", "amount", "g", "u", "e"]
+        );
+        // (i) The expression.
+        let s = edit_column(&rt, &*d, "p15_edit", "g", |c| {
+            c.generated.as_mut().unwrap().expression = "amount * 3".into();
+        })
+        .unwrap();
+        let g = col(&s, "g").generated.unwrap();
+        assert!(g.expression.contains("* 3") && !g.stored, "{g:?}");
+        // (j) Stored and virtual do not switch.
+        let err = edit_column(&rt, &*d, "p15_edit", "g", |c| {
+            c.generated.as_mut().unwrap().stored = true;
+        })
+        .unwrap_err();
+        assert!(err.contains("stored and virtual"), "{err}");
+        // The row survived every edit.
+        assert_eq!(count(&rt, &*d, "p15_edit"), "1");
+        if mariadb {
+            // MariaDB refuses `null` after a generated column's definition.
+            let err = run(
+                &rt,
+                &*d,
+                "ALTER TABLE p15_edit CHANGE COLUMN g g DECIMAL(12,2) GENERATED ALWAYS AS (amount * 2) VIRTUAL NULL",
+            )
+            .unwrap_err();
+            assert!(err.contains("1064") || err.contains("syntax"), "{err}");
+            // A column's own check stays through an edit and follows a rename.
+            let s = edit_column(&rt, &*d, "p15_edit", "j", |c| {
+                c.name = "doc".into();
+                c.comment = "doc".into();
+            })
+            .unwrap();
+            assert_eq!(col(&s, "doc").check.as_deref(), Some("json_valid(`doc`)"));
+            assert!(s.ddl.contains("CHECK (json_valid(`doc`))"), "{}", s.ddl);
+            assert!(run(&rt, &*d, "UPDATE p15_edit SET doc = 'not json'").is_err());
+            let s = edit_column(&rt, &*d, "p15_edit", "ck", |c| {
+                c.data_type = "bigint".into()
+            })
+            .unwrap();
+            assert_eq!(col(&s, "ck").check.as_deref(), Some("`ck` > 0"));
+            assert!(run(&rt, &*d, "UPDATE p15_edit SET ck = -1").is_err());
+        } else {
+            let s =
+                edit_column(&rt, &*d, "p15_edit", "pt", |c| c.comment = "where".into()).unwrap();
+            assert_eq!(col(&s, "pt").srid, Some(4326));
+        }
+        // A member with a comma still matches after an edit of the enum.
+        let s = edit_column(&rt, &*d, "p15_edit", "e", |c| {
+            c.length.push_str(",'new'");
+        })
+        .unwrap();
+        assert_eq!(
+            col(&s, "e").column_type,
+            r"enum('a,b','it''s','x\\y','new')"
+        );
+        assert_eq!(
+            rows(&rt, &*d, "SELECT e FROM p15_edit"),
+            [[Value::Text("a,b".into())]]
+        );
+        run(&rt, &*d, "DROP TABLE p15_edit").unwrap();
+    }
+
+    /// Phase 16: truncate, rename and drop a table, and the server's refusals while
+    /// another table's key points at it.
+    fn table_actions(engine: Engine, port: u16) {
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &config(engine, port, "deadlock"));
+        for sql in [
+            "DROP TABLE IF EXISTS p16_kid, p16_child, p16_parent",
+            "CREATE TABLE p16_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE p16_child (id INT PRIMARY KEY, parent_id INT, \
+             CONSTRAINT p16_fk FOREIGN KEY (parent_id) REFERENCES p16_parent (id))",
+            "INSERT INTO p16_parent VALUES (1)",
+            "INSERT INTO p16_child VALUES (1, 1)",
+        ] {
+            run(&rt, &*d, sql).unwrap();
+        }
+        let s = read(&rt, &*d, "p16_parent");
+        assert_eq!(s.referenced_by.len(), 1);
+        let parent = table("p16_parent");
+        assert!(run(&rt, &*d, &structure::truncate_table_sql(&parent, &s)).is_err());
+        assert_eq!(count(&rt, &*d, "p16_parent"), "1");
+        let child = table("p16_child");
+        run(&rt, &*d, &structure::truncate_table_sql(&child, &s)).unwrap();
+        assert_eq!(count(&rt, &*d, "p16_child"), "0");
+        let sql = structure::rename_table_sql(&child, "p16_kid", &s).unwrap();
+        run(&rt, &*d, &sql).unwrap();
+        let kid = read(&rt, &*d, "p16_kid");
+        assert_eq!(kid.foreign_keys.len(), 1);
+        assert_eq!(kid.foreign_keys[0].to, parent);
+        assert!(rt.block_on(d.structure(&child)).is_err());
+        assert!(run(&rt, &*d, &structure::drop_table_sql(&parent, true, &s)).is_err());
+        for t in ["p16_kid", "p16_parent"] {
+            run(&rt, &*d, &structure::drop_table_sql(&table(t), false, &s)).unwrap();
+            assert!(rt.block_on(d.structure(&table(t))).is_err(), "{t}");
+        }
+
+        // An InnoDB estimate of 0 on a table with rows reads as not known.
+        run(&rt, &*d, "DROP TABLE IF EXISTS p16_est").unwrap();
+        run(&rt, &*d, "CREATE TABLE p16_est (id INT PRIMARY KEY)").unwrap();
+        assert_eq!(read(&rt, &*d, "p16_est").facts.rows, Some(0));
+        run(&rt, &*d, "INSERT INTO p16_est VALUES (1)").unwrap();
+        let estimate = rows(
+            &rt,
+            &*d,
+            "SELECT TABLE_ROWS FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'deadlock' AND TABLE_NAME = 'p16_est'",
+        );
+        let rows_now = read(&rt, &*d, "p16_est").facts.rows;
+        if matches!(estimate[0][0], Value::UInt(0) | Value::Int(0)) {
+            eprintln!("{engine:?}: the estimate says 0 with a row");
+            assert_eq!(rows_now, None);
+        } else {
+            assert_ne!(rows_now, Some(0), "{estimate:?}");
+        }
+        run(&rt, &*d, "DROP TABLE p16_est").unwrap();
+    }
+
+    /// Phase 17: a named composite foreign key with both actions, an unnamed one, a
+    /// check that refuses a row; all listed after a re-read, then dropped. Then a key
+    /// into another schema, and the collation hint against the server's refusal.
+    fn keys_and_checks(engine: Engine, port: u16) {
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &config(engine, port, "deadlock"));
+        let mariadb = engine == Engine::Mariadb;
+        // MariaDB's JSON column brings a column-level json_valid check, which is not
+        // listed: `drop constraint` refuses it.
+        let doc = if mariadb { ", doc JSON" } else { "" };
+        for sql in [
+            "DROP TABLE IF EXISTS p17_child, p17_parent".to_owned(),
+            "CREATE TABLE p17_parent (a INT, b VARCHAR(20), PRIMARY KEY (a, b))".to_owned(),
+            format!(
+                "CREATE TABLE p17_child (id INT PRIMARY KEY, pa INT, pb VARCHAR(20), qty INT{doc})"
+            ),
+        ] {
+            run(&rt, &*d, &sql).unwrap();
+        }
+        let child = table("p17_child");
+        let s = read(&rt, &*d, "p17_child");
+        assert!(!s.checks_unsupported);
+        assert!(s.checks.is_empty(), "{:?}", s.checks);
+        let key = structure::NewForeignKey {
+            name: "p17_fk".into(),
+            columns: vec!["pa".into(), "pb".into()],
+            ref_table: table("p17_parent"),
+            ref_columns: vec!["a".into(), "b".into()],
+            on_delete: "cascade".into(),
+            on_update: "set null".into(),
+        };
+        let parent = read(&rt, &*d, "p17_parent");
+        assert!(structure::foreign_key_hints(&key, &s, &parent).is_empty());
+        assert!(
+            structure::foreign_key_index_note(&key, &s)
+                .is_some_and(|n| n.starts_with("(pa, pb) have no index yet"))
+        );
+        run(
+            &rt,
+            &*d,
+            &structure::add_foreign_key_sql(&child, &key, &s).unwrap(),
+        )
+        .unwrap();
+        // The server added the index the note announced, named after the key.
+        let added = read(&rt, &*d, "p17_child");
+        assert!(
+            added.indexes.iter().any(|ix| ix.name == "p17_fk"),
+            "{:?}",
+            added.indexes
+        );
+        assert_eq!(structure::foreign_key_index_note(&key, &added), None);
+        let unnamed = structure::NewForeignKey {
+            name: String::new(),
+            on_delete: "restrict".into(),
+            on_update: "no action".into(),
+            ..key.clone()
+        };
+        let sql = structure::add_foreign_key_sql(&child, &unnamed, &s).unwrap();
+        run(&rt, &*d, &sql).unwrap();
+        let sql = structure::add_check_sql(&child, "p17_ck", "qty >= 0", &s).unwrap();
+        run(&rt, &*d, &sql).unwrap();
+
+        let s = read(&rt, &*d, "p17_child");
+        assert_eq!(s.foreign_keys.len(), 2, "{:?}", s.foreign_keys);
+        let named = s.foreign_keys.iter().find(|k| k.name == "p17_fk").unwrap();
+        assert_eq!(named.from_columns, ["pa", "pb"]);
+        assert_eq!(named.to_columns, ["a", "b"]);
+        assert_eq!(
+            (named.on_delete.as_str(), named.on_update.as_str()),
+            ("cascade", "set null")
+        );
+        let other = s.foreign_keys.iter().find(|k| k.name != "p17_fk").unwrap();
+        assert!(!other.name.is_empty());
+        assert_eq!(other.on_delete, "restrict");
+        let parent = read(&rt, &*d, "p17_parent");
+        assert_eq!(parent.referenced_by.len(), 2);
+        let ck = s.checks.iter().find(|c| c.name == "p17_ck").unwrap();
+        let condition = if mariadb {
+            "`qty` >= 0"
+        } else {
+            "(`qty` >= 0)"
+        };
+        assert_eq!(ck.condition, condition);
+        assert!(ck.enabled);
+        assert!(run(&rt, &*d, "INSERT INTO p17_child (id, qty) VALUES (1, -1)").is_err());
+        run(&rt, &*d, "INSERT INTO p17_child (id, qty) VALUES (1, 1)").unwrap();
+
+        for c in &s.checks {
+            run(&rt, &*d, &s.drop_constraint_sql(&child, &c.name)).unwrap();
+        }
+        for k in &s.foreign_keys {
+            run(
+                &rt,
+                &*d,
+                &structure::drop_foreign_key_sql(&child, &k.name, &s),
+            )
+            .unwrap();
+        }
+        let s = read(&rt, &*d, "p17_child");
+        assert!(s.foreign_keys.is_empty() && s.checks.is_empty(), "{s:?}");
+
+        // A key into another schema: the statement qualifies the referenced table.
+        let mut admin = config(engine, port, "");
+        admin.user = "root".into();
+        let root = connect_as(&rt, &admin);
+        for sql in [
+            "DROP DATABASE IF EXISTS p17_other",
+            "CREATE DATABASE p17_other",
+            "CREATE TABLE p17_other.p17_ref (id INT PRIMARY KEY)",
+            "GRANT SELECT, REFERENCES ON p17_other.* TO 'deadlock'@'%'",
+        ] {
+            run(&rt, &*root, sql).unwrap();
+        }
+        let other = TableRef {
+            database: "p17_other".into(),
+            table: "p17_ref".into(),
+        };
+        let cross = structure::NewForeignKey {
+            name: "p17_cross_fk".into(),
+            columns: vec!["qty".into()],
+            ref_table: other.clone(),
+            ref_columns: vec!["id".into()],
+            on_delete: "restrict".into(),
+            on_update: "restrict".into(),
+        };
+        let sql = structure::add_foreign_key_sql(&child, &cross, &s).unwrap();
+        assert!(
+            sql.contains("references `p17_other`.`p17_ref` (`id`)"),
+            "{sql}"
+        );
+        run(&rt, &*d, "DELETE FROM p17_child").unwrap();
+        run(&rt, &*d, &sql).unwrap();
+        let s = read(&rt, &*d, "p17_child");
+        assert_eq!(s.foreign_keys.len(), 1, "{:?}", s.foreign_keys);
+        assert_eq!(s.foreign_keys[0].to, other);
+        let target = rt.block_on(root.structure(&other)).unwrap();
+        assert_eq!(target.referenced_by.len(), 1, "{:?}", target.referenced_by);
+        run(
+            &rt,
+            &*d,
+            &structure::drop_foreign_key_sql(&child, "p17_cross_fk", &s),
+        )
+        .unwrap();
+
+        // Text columns whose collations differ: the hint says so, and the server refuses.
+        run(
+            &rt,
+            &*root,
+            "CREATE TABLE p17_other.p17_txt (k VARCHAR(20) COLLATE utf8mb4_bin PRIMARY KEY)",
+        )
+        .unwrap();
+        run(&rt, &*d, "DROP TABLE IF EXISTS p17_tchild").unwrap();
+        run(
+            &rt,
+            &*d,
+            "CREATE TABLE p17_tchild (k VARCHAR(20) COLLATE utf8mb4_general_ci)",
+        )
+        .unwrap();
+        let txt = TableRef {
+            database: "p17_other".into(),
+            table: "p17_txt".into(),
+        };
+        let by_text = structure::NewForeignKey {
+            name: String::new(),
+            columns: vec!["k".into()],
+            ref_table: txt.clone(),
+            ref_columns: vec!["k".into()],
+            ..cross.clone()
+        };
+        let tchild = read(&rt, &*d, "p17_tchild");
+        let hints = structure::foreign_key_hints(
+            &by_text,
+            &tchild,
+            &rt.block_on(root.structure(&txt)).unwrap(),
+        );
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(
+            hints[0].starts_with("k uses collation utf8mb4_general_ci"),
+            "{hints:?}"
+        );
+        let sql = structure::add_foreign_key_sql(&table("p17_tchild"), &by_text, &tchild).unwrap();
+        let err = run(&rt, &*d, &sql).unwrap_err();
+        assert!(err.contains(if mariadb { "1005" } else { "3780" }), "{err}");
+        run(&rt, &*d, "DROP TABLE p17_tchild, p17_child, p17_parent").unwrap();
+        run(&rt, &*root, "DROP DATABASE p17_other").unwrap();
+    }
+
+    /// Phase 18: the New table example as `p18_new`: 5 columns, composite primary key,
+    /// a default, on update (MySQL / MariaDB) and comments.
+    pub(super) fn p18_table(oracle: bool) -> structure::NewTable {
+        let col = |name: &str, ty: &str, length: &str| NewColumn {
+            name: name.into(),
+            data_type: ty.into(),
+            length: length.into(),
+            ..NewColumn::default()
+        };
+        let (id, int, text, temporal, now) = if oracle {
+            ("number", "number", "varchar2", "timestamp", "systimestamp")
+        } else {
+            (
+                "bigint unsigned",
+                "int",
+                "varchar",
+                "datetime",
+                "current_timestamp(3)",
+            )
+        };
+        structure::NewTable {
+            name: "p18_new".into(),
+            columns: vec![
+                NewColumn {
+                    auto_increment: true,
+                    comment: "row id".into(),
+                    ..col("id", id, "")
+                },
+                col("line", int, if oracle { "10" } else { "" }),
+                NewColumn {
+                    default: "new".into(),
+                    collation: (!oracle).then(|| "utf8mb4_bin".into()),
+                    ..col("status", text, "20")
+                },
+                NewColumn {
+                    default: now.into(),
+                    on_update: !oracle,
+                    ..col("created", temporal, "3")
+                },
+                NewColumn {
+                    nullable: true,
+                    comment: "free text".into(),
+                    ..col("note", if oracle { "clob" } else { "text" }, "")
+                },
+            ],
+            primary_key: vec!["id".into(), "line".into()],
+            engine: (!oracle).then(|| "InnoDB".into()),
+            collation: (!oracle).then(|| "utf8mb4_bin".into()),
+            comment: "orders".into(),
+        }
+    }
+
+    /// Phase 18: `create_table_sql` on the server, then the table reads back as drafted.
+    fn create_table(engine: Engine, port: u16) {
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &config(engine, port, "deadlock"));
+        run(&rt, &*d, "DROP TABLE IF EXISTS p18_new").unwrap();
+        let flags = TableStructure {
+            mariadb: engine == Engine::Mariadb,
+            backslash_escapes: true,
+            ..TableStructure::default()
+        };
+        for sql in structure::create_table_sql("deadlock", &p18_table(false), &flags).unwrap() {
+            run(&rt, &*d, &sql).unwrap();
+        }
+        let s = read(&rt, &*d, "p18_new");
+        let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "line", "status", "created", "note"]);
+        assert!(s.indexes[0].primary);
+        assert_eq!(s.indexes[0].parts_label(), "id, line");
+        let c = |n: &str| s.columns.iter().find(|c| c.name == n).unwrap();
+        assert!(c("id").extra.contains("auto_increment"), "{:?}", c("id"));
+        assert_eq!(c("status").default.as_deref(), Some("'new'"));
+        assert_eq!(c("status").collation.as_deref(), Some("utf8mb4_bin"));
+        assert_eq!(c("created").column_type, "datetime(3)");
+        assert_eq!(
+            c("created")
+                .on_update
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("current_timestamp(3)"),
+            "{:?}",
+            c("created")
+        );
+        assert_eq!(c("id").comment, "row id");
+        assert_eq!(c("note").comment, "free text");
+        assert!(c("note").nullable && !c("line").nullable);
+        assert_eq!(s.facts.comment, "orders");
+        assert_eq!(s.facts.engine.as_deref(), Some("InnoDB"));
+        assert_eq!(s.facts.collation.as_deref(), Some("utf8mb4_bin"));
+        run(&rt, &*d, "DROP TABLE p18_new").unwrap();
+
+        // A session with NO_BACKSLASH_ESCAPES: the draft quotes for the mode it reads.
+        let nb = connect_as(&rt, &config(engine, port, "deadlock"));
+        run(
+            &rt,
+            &*nb,
+            "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES')",
+        )
+        .unwrap();
+        let mode = match &rows(&rt, &*nb, "SELECT @@SESSION.sql_mode")[0][0] {
+            Value::Text(m) => m.clone(),
+            v => panic!("{v:?}"),
+        };
+        let flags = TableStructure {
+            backslash_escapes: deadlock_core::edit::backslash_escapes(&mode),
+            ..flags
+        };
+        assert!(!flags.backslash_escapes, "{mode}");
+        let mut draft = p18_table(false);
+        draft.comment = r"C:\dir\".into();
+        draft.columns[2].default = r"a\b".into();
+        // A value ending in `\` before one holding `;`: still one statement here.
+        draft.columns[1].comment = r"ends\".into();
+        draft.columns[4].comment = r"it's \n; x".into();
+        // The key's order is its own, not the columns' (no auto_increment: InnoDB wants
+        // that column first in a key).
+        draft.columns[0].auto_increment = false;
+        draft.primary_key = vec!["line".into(), "id".into()];
+        draft.columns.push(NewColumn {
+            name: "e".into(),
+            data_type: "enum".into(),
+            length: r"'x\\y','a,b'".into(),
+            nullable: true,
+            ..NewColumn::default()
+        });
+        for sql in structure::create_table_sql("deadlock", &draft, &flags).unwrap() {
+            assert!(sql.contains(r"'C:\dir\'"), "{sql}");
+            run(&rt, &*nb, &sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let s = read(&rt, &*d, "p18_new");
+        assert_eq!(s.facts.comment, r"C:\dir\");
+        assert_eq!(s.indexes[0].parts_label(), "line, id");
+        let c = |n: &str| s.columns.iter().find(|c| c.name == n).unwrap();
+        assert_eq!(c("line").comment, r"ends\");
+        assert_eq!(c("note").comment, r"it's \n; x");
+        assert_eq!(c("e").column_type, r"enum('x\\y','a,b')");
+        assert_eq!(
+            rows(
+                &rt,
+                &*d,
+                "SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = 'deadlock' AND TABLE_NAME = 'p18_new' AND COLUMN_NAME = 'status'"
+            )[0][0],
+            // MariaDB writes COLUMN_DEFAULT as SQL, MySQL as the bare value.
+            Value::Text(
+                if engine == Engine::Mariadb {
+                    r"'a\\b'"
+                } else {
+                    r"a\b"
+                }
+                .into()
+            )
+        );
+        run(&rt, &*d, "DROP TABLE p18_new").unwrap();
+    }
+
+    /// The Collation lists: every collation a column reports is offered, with its
+    /// character set, the server default included (MariaDB 11's `uca1400` ones too).
+    fn collations_cover_column_collations(engine: Engine, port: u16) {
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &config(engine, port, "deadlock"));
+        let list = rt.block_on(d.collations()).unwrap();
+        assert!(list.windows(2).all(|w| w[0].0 <= w[1].0), "sorted by name");
+        run(&rt, &*d, "DROP TABLE IF EXISTS p15_coll").unwrap();
+        run(
+            &rt,
+            &*d,
+            "CREATE TABLE p15_coll (a VARCHAR(5), b VARCHAR(5) COLLATE utf8mb4_bin, \
+             c VARCHAR(5) CHARACTER SET latin1)",
+        )
+        .unwrap();
+        let s = read(&rt, &*d, "p15_coll");
+        for c in &s.columns {
+            let (Some(collation), Some(charset)) = (&c.collation, &c.charset) else {
+                panic!("{c:?}");
+            };
+            assert!(
+                list.iter().any(|(n, cs)| n == collation && cs == charset),
+                "{collation} ({charset}) missing"
+            );
+        }
+        run(&rt, &*d, "DROP TABLE p15_coll").unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mysql_collations_cover_column_collations() {
+        collations_cover_column_collations(Engine::Mysql, 3306);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mariadb_collations_cover_column_collations() {
+        collations_cover_column_collations(Engine::Mariadb, 3307);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mysql_create_table() {
+        create_table(Engine::Mysql, 3306);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mariadb_create_table() {
+        create_table(Engine::Mariadb, 3307);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mysql_keys_and_checks() {
+        keys_and_checks(Engine::Mysql, 3306);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mariadb_keys_and_checks() {
+        keys_and_checks(Engine::Mariadb, 3307);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mysql_table_actions() {
+        table_actions(Engine::Mysql, 3306);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mariadb_table_actions() {
+        table_actions(Engine::Mariadb, 3307);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mysql_columns_edit() {
+        columns_edit(Engine::Mysql, 3306);
+    }
+
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn mariadb_columns_edit() {
+        columns_edit(Engine::Mariadb, 3307);
     }
 
     #[test]
@@ -2683,15 +3395,18 @@ mod oracle {
                 auto_increment: false,
                 comment: String::new(),
                 position: Position::Last,
+                ..NewColumn::default()
             },
             &s,
         )
         .unwrap();
         assert_eq!(
             add,
-            "alter table \"DEADLOCK\".\"P11_ORD\" add (\"Odd name\" varchar2(20) default 'it''s' not null)"
+            [
+                "alter table \"DEADLOCK\".\"P11_ORD\" add (\"Odd name\" varchar2(20) default 'it''s' not null)"
+            ]
         );
-        exec(&rt, &*d, &add);
+        exec(&rt, &*d, &add[0]);
         let idx = structure::add_index_sql(
             &t,
             &NewIndex {
@@ -2764,6 +3479,424 @@ mod oracle {
         ] {
             exec(&rt, &*d, sql);
         }
+    }
+
+    /// Phase 15: Oracle edits write only what changed.
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn oracle_columns_edit() {
+        use deadlock_core::edit::TableRef;
+        use deadlock_core::structure::{self, NewColumn, Position, TableStructure};
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &plain());
+        for sql in [
+            "DROP TABLE IF EXISTS p15_ora PURGE",
+            "CREATE TABLE p15_ora (id NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+             qty NUMBER(10) DEFAULT 0 NOT NULL, note VARCHAR2(40 CHAR), amt NUMBER(10), \
+             twice NUMBER AS (qty * 2) VIRTUAL)",
+            "INSERT INTO p15_ora (qty, note, amt) VALUES (2, 'n', 5)",
+        ] {
+            exec(&rt, &*d, sql);
+        }
+        let t = TableRef {
+            database: "DEADLOCK".into(),
+            table: "P15_ORA".into(),
+        };
+        let read = || rt.block_on(d.structure(&t)).unwrap();
+        let col =
+            |s: &TableStructure, n: &str| s.columns.iter().find(|c| c.name == n).cloned().unwrap();
+        let edit = |column: &str, f: &dyn Fn(&mut NewColumn)| -> Result<TableStructure, String> {
+            let s = read();
+            let old = col(&s, column);
+            let mut new = NewColumn::from_existing(&old, &s);
+            f(&mut new);
+            for sql in structure::modify_column_sql(&t, &old, &new, &s)? {
+                run(&rt, &*d, &sql).map_err(|e| format!("{sql}: {e}"))?;
+            }
+            let after = read();
+            for c in s
+                .columns
+                .iter()
+                .filter(|c| c.name != column && c.name != new.name)
+            {
+                assert_eq!(after.columns.iter().find(|x| x.name == c.name), Some(c));
+            }
+            Ok(after)
+        };
+        // No edit, no statements.
+        let s = read();
+        for c in &s.columns {
+            let same = NewColumn::from_existing(c, &s);
+            assert_eq!(
+                structure::modify_column_sql(&t, c, &same, &s),
+                Ok(vec![]),
+                "{}",
+                c.name
+            );
+        }
+        let s = edit("NOTE", &|c| c.name = "REMARK".into()).unwrap();
+        assert_eq!(col(&s, "REMARK").column_type, "varchar2(40 char)");
+        let s = edit("AMT", &|c| c.length = "12".into()).unwrap();
+        assert_eq!(col(&s, "AMT").column_type, "number(12)");
+        // A column a virtual column reads cannot change: the form says so before
+        // Apply, and the server agrees.
+        let s = read();
+        let qty = col(&s, "QTY");
+        let mut longer = NewColumn::from_existing(&qty, &s);
+        longer.length = "12".into();
+        assert_eq!(
+            structure::modify_column_hints(&qty, &longer, &s),
+            [
+                "Oracle cannot change a column that virtual column TWICE reads: drop or change \
+              TWICE first."
+            ]
+        );
+        let err = edit("QTY", &|c| c.length = "12".into()).unwrap_err();
+        assert!(err.contains("ORA-54031"), "{err}");
+        // Rename and retype: the rename runs, the modify fails. Rebased on the column
+        // re-read by its new name, the same form builds only what is left.
+        longer.name = "QTY2".into();
+        let sql = structure::modify_column_sql(&t, &qty, &longer, &s).unwrap();
+        let labels: Vec<String> = sql.iter().map(|q| structure::statement_label(q)).collect();
+        assert_eq!(labels, ["rename column", "modify"]);
+        run(&rt, &*d, &sql[0]).unwrap();
+        assert!(run(&rt, &*d, &sql[1]).unwrap_err().contains("ORA-54031"));
+        let s = read();
+        let qty2 = col(&s, "QTY2");
+        let rest = structure::modify_column_sql(&t, &qty2, &longer, &s).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(structure::statement_label(&rest[0]), "modify");
+        let back = NewColumn {
+            name: "QTY".into(),
+            ..NewColumn::from_existing(&qty2, &s)
+        };
+        for sql in structure::modify_column_sql(&t, &qty2, &back, &s).unwrap() {
+            exec(&rt, &*d, &sql);
+        }
+        // Not null, null, not null: only the change is written (ORA-01451 / ORA-01442).
+        let s = edit("AMT", &|c| c.nullable = false).unwrap();
+        assert!(!col(&s, "AMT").nullable);
+        let s = edit("AMT", &|c| c.nullable = true).unwrap();
+        assert!(col(&s, "AMT").nullable);
+        let s = edit("AMT", &|c| c.default = "7".into()).unwrap();
+        assert_eq!(col(&s, "AMT").default.as_deref(), Some("7"));
+        assert_eq!(col(&s, "AMT").column_type, "number(12)");
+        let s = edit("REMARK", &|c| c.default = "it's".into()).unwrap();
+        assert_eq!(col(&s, "REMARK").default.as_deref(), Some("'it''s'"));
+        let s = edit("REMARK", &|c| c.default = String::new()).unwrap();
+        assert_eq!(col(&s, "REMARK").default, None);
+        let s = edit("REMARK", &|c| c.comment = "a note".into()).unwrap();
+        assert_eq!(col(&s, "REMARK").comment, "a note");
+        let s = edit("REMARK", &|c| c.comment = String::new()).unwrap();
+        assert_eq!(col(&s, "REMARK").comment, "");
+        let s = edit("REMARK", &|c| c.length = "60 char".into()).unwrap();
+        assert_eq!(col(&s, "REMARK").column_type, "varchar2(60 char)");
+        let err = edit("REMARK", &|c| c.position = Position::First).unwrap_err();
+        assert!(err.contains("reorder"), "{err}");
+        // A virtual column's expression changes in place.
+        let s = edit("TWICE", &|c| {
+            c.generated.as_mut().unwrap().expression = "(qty * 3)".into();
+        })
+        .unwrap();
+        assert!(
+            col(&s, "TWICE")
+                .generated
+                .unwrap()
+                .expression
+                .contains("*3"),
+            "{:?}",
+            col(&s, "TWICE")
+        );
+        // Add with a comment: two statements.
+        let add = structure::add_column_sql(
+            &t,
+            &NewColumn {
+                name: "EXTRA".into(),
+                data_type: "number".into(),
+                nullable: true,
+                comment: "added".into(),
+                ..NewColumn::default()
+            },
+            &s,
+        )
+        .unwrap();
+        assert_eq!(add.len(), 2);
+        for sql in &add {
+            exec(&rt, &*d, sql);
+        }
+        assert_eq!(col(&read(), "EXTRA").comment, "added");
+        let err = edit("QTY", &|c| c.auto_increment = true).unwrap_err();
+        assert!(err.contains("identity"), "{err}");
+        let s = edit("ID", &|c| c.auto_increment = false).unwrap();
+        assert_eq!(col(&s, "ID").extra, "");
+        assert_eq!(count(&rt, &*d, "p15_ora"), "1");
+        exec(&rt, &*d, "DROP TABLE p15_ora PURGE");
+    }
+
+    /// Phase 16: truncate, rename and drop; `cascade constraints` drops the child's key.
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn oracle_table_actions() {
+        use deadlock_core::edit::TableRef;
+        use deadlock_core::structure;
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &plain());
+        for sql in [
+            "DROP TABLE IF EXISTS p16_kid PURGE",
+            "DROP TABLE IF EXISTS p16_child PURGE",
+            "DROP TABLE IF EXISTS p16_parent PURGE",
+            "CREATE TABLE p16_parent (id NUMBER PRIMARY KEY)",
+            "CREATE TABLE p16_child (id NUMBER PRIMARY KEY, parent_id NUMBER \
+             CONSTRAINT p16_fk REFERENCES p16_parent (id))",
+            "INSERT INTO p16_parent VALUES (1)",
+            "INSERT INTO p16_child VALUES (1, 1)",
+            "COMMIT",
+        ] {
+            exec(&rt, &*d, sql);
+        }
+        let t = |name: &str| TableRef {
+            database: "DEADLOCK".into(),
+            table: name.into(),
+        };
+        let read = |name: &str| rt.block_on(d.structure(&t(name)));
+        let s = read("P16_PARENT").unwrap();
+        assert_eq!(s.referenced_by.len(), 1);
+        let parent = t("P16_PARENT");
+        let err = run(&rt, &*d, &structure::truncate_table_sql(&parent, &s)).unwrap_err();
+        assert!(err.contains("ORA-02266"), "{err}");
+        run(
+            &rt,
+            &*d,
+            &structure::truncate_table_sql(&t("P16_CHILD"), &s),
+        )
+        .unwrap();
+        assert_eq!(count(&rt, &*d, "p16_child"), "0");
+        exec(
+            &rt,
+            &*d,
+            "CREATE TRIGGER p16_child_ai AFTER INSERT ON p16_child FOR EACH ROW \
+             BEGIN NULL; END;",
+        );
+        let sql = structure::rename_table_sql(&t("P16_CHILD"), "P16_KID", &s).unwrap();
+        exec(&rt, &*d, &sql);
+        assert_eq!(read("P16_KID").unwrap().foreign_keys.len(), 1);
+        // Oracle rewrites the trigger's source for the new name: the body reads the same.
+        let trigger = deadlock_core::objects::ObjectRef {
+            schema: "DEADLOCK".into(),
+            name: "P16_CHILD_AI".into(),
+            kind: deadlock_core::objects::ObjectKind::Trigger,
+        };
+        let def = rt.block_on(d.object(&trigger)).unwrap();
+        match def.props {
+            deadlock_core::objects::Properties::Trigger(t) => {
+                assert_eq!(t.table, "P16_KID");
+                assert_eq!(t.body, "BEGIN NULL; END;");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(read("P16_CHILD").is_err());
+        let err = run(&rt, &*d, &structure::drop_table_sql(&parent, false, &s)).unwrap_err();
+        assert!(err.contains("ORA-02449"), "{err}");
+        exec(&rt, &*d, &structure::drop_table_sql(&parent, true, &s));
+        assert!(read("P16_PARENT").is_err());
+        assert!(read("P16_KID").unwrap().foreign_keys.is_empty());
+        exec(&rt, &*d, "DROP TABLE p16_kid PURGE");
+        exec(&rt, &*d, "PURGE TABLE p16_parent");
+
+        // Statistics gathered while empty say 0 rows after an insert: not known then.
+        for sql in [
+            "DROP TABLE IF EXISTS p16_est PURGE",
+            "CREATE TABLE p16_est (id NUMBER PRIMARY KEY)",
+            "BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'P16_EST'); END;",
+        ] {
+            exec(&rt, &*d, sql);
+        }
+        assert_eq!(read("P16_EST").unwrap().facts.rows, Some(0));
+        exec(&rt, &*d, "INSERT INTO p16_est VALUES (1)");
+        exec(&rt, &*d, "COMMIT");
+        assert_eq!(
+            rows(
+                &rt,
+                &*d,
+                "SELECT TO_CHAR(NUM_ROWS) FROM USER_TABLES WHERE TABLE_NAME = 'P16_EST'"
+            ),
+            [[Value::Text("0".into())]]
+        );
+        assert_eq!(read("P16_EST").unwrap().facts.rows, None);
+        exec(&rt, &*d, "DROP TABLE p16_est PURGE");
+    }
+
+    /// Phase 18: the New table example with an identity column and `comment on`
+    /// statements; the quoted lower-case name stays lower case.
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn oracle_create_table() {
+        use deadlock_core::edit::TableRef;
+        use deadlock_core::structure::{self, TableStructure};
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &plain());
+        exec(&rt, &*d, r#"DROP TABLE IF EXISTS "p18_new" PURGE"#);
+        let flags = TableStructure {
+            oracle: true,
+            ..TableStructure::default()
+        };
+        let t = super::table_structure::p18_table(true);
+        let stmts = structure::create_table_sql("DEADLOCK", &t, &flags).unwrap();
+        assert_eq!(stmts.len(), 4);
+        for sql in &stmts {
+            exec(&rt, &*d, sql);
+        }
+        let s = rt
+            .block_on(d.structure(&TableRef {
+                database: "DEADLOCK".into(),
+                table: "p18_new".into(),
+            }))
+            .unwrap();
+        let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "line", "status", "created", "note"]);
+        let c = |n: &str| s.columns.iter().find(|c| c.name == n).unwrap();
+        assert!(c("id").extra.starts_with("generated "), "{:?}", c("id"));
+        assert!(s.indexes[0].primary);
+        assert_eq!(s.indexes[0].parts_label(), "id, line");
+        assert_eq!(c("status").default.as_deref(), Some("'new'"));
+        assert!(!c("status").nullable && c("note").nullable);
+        assert_eq!(c("id").comment, "row id");
+        assert_eq!(c("note").comment, "free text");
+        assert_eq!(s.facts.comment, "orders");
+        exec(&rt, &*d, r#"DROP TABLE "p18_new" PURGE"#);
+    }
+
+    /// Phase 17: a foreign key with on delete set null (on update is not written), an
+    /// unnamed one, a check that refuses a row; listed after a re-read, then dropped.
+    #[test]
+    #[ignore = "needs docker compose"]
+    fn oracle_keys_and_checks() {
+        use deadlock_core::edit::TableRef;
+        use deadlock_core::structure;
+        let rt = Runtime::new().unwrap();
+        let d = connect_as(&rt, &plain());
+        for sql in [
+            "DROP TABLE IF EXISTS p17_child PURGE",
+            "DROP TABLE IF EXISTS p17_parent PURGE",
+            "CREATE TABLE p17_parent (a NUMBER, b VARCHAR2(20), u NUMBER UNIQUE, \
+             PRIMARY KEY (a, b))",
+            "CREATE TABLE p17_child (id NUMBER PRIMARY KEY, pa NUMBER, pb VARCHAR2(20), \
+             pu NUMBER, qty NUMBER)",
+        ] {
+            exec(&rt, &*d, sql);
+        }
+        let t = |name: &str| TableRef {
+            database: "DEADLOCK".into(),
+            table: name.into(),
+        };
+        let read = |name: &str| rt.block_on(d.structure(&t(name))).unwrap();
+        let child = t("P17_CHILD");
+        let s = read("P17_CHILD");
+        let key = structure::NewForeignKey {
+            name: "P17_FK".into(),
+            columns: vec!["PA".into(), "PB".into()],
+            ref_table: t("P17_PARENT"),
+            ref_columns: vec!["A".into(), "B".into()],
+            on_delete: "set null".into(),
+            on_update: "cascade".into(),
+        };
+        let parent = read("P17_PARENT");
+        assert!(structure::foreign_key_hints(&key, &s, &parent).is_empty());
+        let sql = structure::add_foreign_key_sql(&child, &key, &s).unwrap();
+        assert!(!sql.contains("on update"), "{sql}");
+        exec(&rt, &*d, &sql);
+        let unnamed = structure::NewForeignKey {
+            name: String::new(),
+            columns: vec!["PU".into()],
+            ref_columns: vec!["U".into()],
+            on_delete: "no action".into(),
+            ..key.clone()
+        };
+        assert!(structure::foreign_key_hints(&unnamed, &s, &parent).is_empty());
+        exec(
+            &rt,
+            &*d,
+            &structure::add_foreign_key_sql(&child, &unnamed, &s).unwrap(),
+        );
+        exec(
+            &rt,
+            &*d,
+            &structure::add_check_sql(&child, "P17_CK", "qty >= 0", &s).unwrap(),
+        );
+
+        let s = read("P17_CHILD");
+        assert_eq!(s.foreign_keys.len(), 2, "{:?}", s.foreign_keys);
+        let named = s.foreign_keys.iter().find(|k| k.name == "P17_FK").unwrap();
+        assert_eq!(named.from_columns, ["PA", "PB"]);
+        assert_eq!(named.on_delete, "set null");
+        let other = s.foreign_keys.iter().find(|k| k.name != "P17_FK").unwrap();
+        assert!(!other.name.is_empty());
+        assert_eq!(other.on_delete, "no action");
+        assert_eq!(read("P17_PARENT").referenced_by.len(), 2);
+        assert_eq!(s.checks.len(), 1, "{:?}", s.checks);
+        assert_eq!(s.checks[0].name, "P17_CK");
+        let err = run(&rt, &*d, "INSERT INTO p17_child (id, qty) VALUES (1, -1)").unwrap_err();
+        assert!(err.contains("ORA-02290"), "{err}");
+
+        exec(&rt, &*d, &s.drop_constraint_sql(&child, "P17_CK"));
+        for k in &s.foreign_keys {
+            exec(
+                &rt,
+                &*d,
+                &structure::drop_foreign_key_sql(&child, &k.name, &s),
+            );
+        }
+        let s = read("P17_CHILD");
+        assert!(s.foreign_keys.is_empty() && s.checks.is_empty(), "{s:?}");
+
+        // A key into another schema: refused (shown as the server says it) until that
+        // schema grants REFERENCES, then listed with its schema.
+        let admin = connect_as(&rt, &dba());
+        let _ = run(&rt, &*admin, "DROP USER p17_other CASCADE");
+        for sql in [
+            "CREATE USER p17_other IDENTIFIED BY deadlock QUOTA UNLIMITED ON USERS",
+            "CREATE TABLE p17_other.p17_ref (id NUMBER PRIMARY KEY)",
+        ] {
+            exec(&rt, &*admin, sql);
+        }
+        let other = TableRef {
+            database: "P17_OTHER".into(),
+            table: "P17_REF".into(),
+        };
+        let cross = structure::NewForeignKey {
+            name: "P17_CROSS_FK".into(),
+            columns: vec!["QTY".into()],
+            ref_table: other.clone(),
+            ref_columns: vec!["ID".into()],
+            on_delete: "no action".into(),
+            ..key.clone()
+        };
+        let sql = structure::add_foreign_key_sql(&child, &cross, &s).unwrap();
+        assert!(
+            sql.contains(r#"references "P17_OTHER"."P17_REF" ("ID")"#),
+            "{sql}"
+        );
+        exec(&rt, &*d, "DELETE FROM p17_child");
+        let err = run(&rt, &*d, &sql).unwrap_err();
+        // Without a grant the table is hidden from this user.
+        assert!(err.contains("ORA-00942"), "{err}");
+        exec(
+            &rt,
+            &*admin,
+            "GRANT REFERENCES ON p17_other.p17_ref TO deadlock",
+        );
+        exec(&rt, &*d, &sql);
+        let s = read("P17_CHILD");
+        assert_eq!(s.foreign_keys.len(), 1, "{:?}", s.foreign_keys);
+        assert_eq!(s.foreign_keys[0].to, other);
+        exec(
+            &rt,
+            &*d,
+            &structure::drop_foreign_key_sql(&child, "P17_CROSS_FK", &s),
+        );
+        exec(&rt, &*d, "DROP TABLE p17_child PURGE");
+        exec(&rt, &*d, "DROP TABLE p17_parent PURGE");
+        exec(&rt, &*admin, "DROP USER p17_other CASCADE");
     }
 
     #[test]
@@ -4677,7 +5810,12 @@ mod objects {
             let out = apply(&rt, d, &drop_plan(flavor, o));
             assert_eq!(out.state, FinalState::Changed, "{o:?} {out:?}");
         }
-        assert!(rt.block_on(d.object(&dropped[0])).is_err());
+        // Gone, not a failed read: restored tabs rely on telling these apart.
+        let gone = rt.block_on(d.object(&dropped[0]));
+        assert!(
+            matches!(gone, Err(deadlock_core::driver::DriverError::NotFound(_))),
+            "{gone:?}"
+        );
         run(&rt, d, "DROP TABLE ob_t").unwrap();
     }
 
@@ -5088,6 +6226,12 @@ mod objects {
             let out = apply(&rt, d, &drop_plan(f, &ObjectRef::new(s, name, kind)));
             assert_eq!(out.state, FinalState::Changed, "{name} {out:?}");
         }
+        // Gone, not a failed read: restored tabs rely on telling these apart.
+        let gone = rt.block_on(d.object(&ObjectRef::new(s, "OB_V2", ObjectKind::View)));
+        assert!(
+            matches!(gone, Err(deadlock_core::driver::DriverError::NotFound(_))),
+            "{gone:?}"
+        );
         run(&rt, d, "DROP TABLE OB_T PURGE").unwrap();
     }
 }

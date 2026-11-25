@@ -183,7 +183,7 @@ fn count_value(rows: &[deadlock_core::driver::Row]) -> Option<u64> {
 }
 
 /// `1234567` → `1,234,567`.
-fn grouped(n: u64) -> String {
+pub(super) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -303,6 +303,14 @@ impl QueryTab {
     /// Loads the view in front once: asks for a session first when there is none.
     pub fn open_table(&mut self, cx: &mut Context<Self>) {
         let Some(t) = &mut self.table else { return };
+        // A draft loads nothing; Create needs the session.
+        if t.structure.is_draft() {
+            if matches!(self.session, Session::None) && !t.waiting {
+                t.waiting = true;
+                cx.emit(TabEvent::NeedSession);
+            }
+            return;
+        }
         let loaded = match t.view {
             View::Data => t.grid.is_some() || t.busy,
             View::Structure => t.structure.is_loaded(),
@@ -322,8 +330,19 @@ impl QueryTab {
 
     /// The session opened or failed while the table waited for it.
     pub(super) fn table_session(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        if error.is_none() {
+            self.read_draft_mode(cx);
+            self.ensure_collations(cx);
+        }
         let Some(t) = &mut self.table else { return };
         if !std::mem::take(&mut t.waiting) {
+            return;
+        }
+        if t.structure.is_draft() {
+            if let Some(e) = error {
+                t.structure.fail(e);
+            }
+            cx.notify();
             return;
         }
         match error {
@@ -1743,6 +1762,55 @@ fn sort_text(info: &TableInfo, keys: &[(usize, bool)]) -> String {
         .join(", ")
 }
 
+/// `sql` as a preview shows it: each line longer than `width` breaks at spaces outside
+/// quotes, continued two spaces deeper than it started, so a long statement reads
+/// without scrolling sideways. Shorter lines stay as they are. Display only.
+pub(crate) fn wrap_sql(sql: &str, width: usize) -> String {
+    let mut out = String::with_capacity(sql.len());
+    // A quote may span lines, so its state carries over.
+    let (mut quote, mut escaped) = (None, false);
+    for (n, line) in sql.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let mut words = Vec::new();
+        let mut start = 0;
+        for (i, c) in line.char_indices() {
+            match quote {
+                _ if escaped => escaped = false,
+                Some(q) if c == q => quote = None,
+                Some(q) if c == '\\' && q != '`' => escaped = true,
+                Some(_) => {}
+                None if matches!(c, '\'' | '"' | '`') => quote = Some(c),
+                None if c.is_whitespace() => {
+                    words.push(&line[start..i]);
+                    start = i + c.len_utf8();
+                }
+                None => {}
+            }
+        }
+        words.push(&line[start..]);
+        if line.len() <= width {
+            out.push_str(line);
+            continue;
+        }
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let mut current = indent.to_owned();
+        for word in words.into_iter().filter(|w| !w.is_empty()) {
+            if !current.trim().is_empty() && current.len() + 1 + word.len() > width {
+                out.push_str(&current);
+                out.push('\n');
+                current = format!("{indent}  ");
+            } else if !current.trim().is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        out.push_str(&current);
+    }
+    out
+}
+
 /// SQL with the design's colors: keywords in the link color, strings green. For the
 /// pending changes, the Structure view's definition and its ALTER previews.
 pub(crate) fn highlighted(sql: &str, p: &Palette) -> StyledText {
@@ -1875,14 +1943,21 @@ pub(crate) fn highlighted(sql: &str, p: &Palette) -> StyledText {
 }
 
 /// The Data / Structure switch: the view in front is filled with `--tx`.
-pub(super) fn segments(view: View, cx: &mut Context<QueryTab>) -> gpui_kit::Div {
+/// A New table draft has no Data yet.
+pub(super) fn segments(view: View, draft: bool, cx: &mut Context<QueryTab>) -> gpui_kit::Div {
     let p = *cx.global::<Palette>();
     let segment = |id: &'static str, label: &'static str, target: View, tip: &'static str| {
         let on = view == target;
-        button(id, ButtonKind::Outline, true, tip, cx)
+        let off = draft && target == View::Data;
+        let tip = if off { "Create the table first" } else { tip };
+        button(id, ButtonKind::Outline, !off, tip, cx)
             .when(on, |b| b.bg(p.tx).border_color(p.tx).text_color(p.bg))
             .child(label)
-            .clickable(cx.listener(move |this, _, window, cx| this.set_view(target, window, cx)))
+            .when(!off, |b| {
+                b.clickable(
+                    cx.listener(move |this, _, window, cx| this.set_view(target, window, cx)),
+                )
+            })
     };
     div()
         .flex()
@@ -2046,7 +2121,8 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
         .as_ref()
         .is_some_and(|t| t.view == View::Structure)
     {
-        let segments = segments(View::Structure, cx);
+        let draft = this.table.as_ref().is_some_and(|t| t.structure.is_draft());
+        let segments = segments(View::Structure, draft, cx);
         return super::structure::render(this, segments, cx);
     }
     let p = *cx.global::<Palette>();
@@ -2069,7 +2145,7 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
         .py(px(10.))
         .border_b_1()
         .border_color(p.line)
-        .child(segments(View::Data, cx))
+        .child(segments(View::Data, false, cx))
         .child(
             div()
                 .flex_grow(2.)
@@ -2457,6 +2533,17 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_lines_wrap_keeping_their_indent_and_short_lines_as_typed() {
+        let sql = "select  1;\n  update t set note = 'a b c d e', qty = 1 where id = 2;";
+        assert_eq!(
+            wrap_sql(sql, 24),
+            "select  1;\n  update t set note =\n    'a b c d e', qty = 1\n    where id = 2;"
+        );
+        // A quote opened on an earlier line keeps its spaces.
+        assert_eq!(wrap_sql("'x\ny z' or a", 4), "'x\ny z'\n  or\n  a");
+    }
 
     #[test]
     fn order_text_maps_to_a_header_sort() {

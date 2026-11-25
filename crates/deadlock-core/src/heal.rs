@@ -323,6 +323,10 @@ impl Driver for Healing {
         Box::pin(async move { run!(self, true, |d| d.structure(table)).await })
     }
 
+    fn collations(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async move { run!(self, true, |d| d.collations()).await })
+    }
+
     fn explain<'a>(
         &'a self,
         statement: &'a str,

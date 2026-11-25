@@ -990,3 +990,43 @@ fn a_failed_restore_writes_the_backup() {
     assert_eq!(std::fs::read_to_string(path).unwrap(), *text);
     assert_eq!(out.errors.len(), 2);
 }
+
+#[test]
+fn triggers_follow_a_renamed_table_of_their_schema() {
+    let from = crate::edit::TableRef {
+        database: "warehouse".into(),
+        table: "orders".into(),
+    };
+    let table = |d: &ObjectDraft| match &d.props {
+        Properties::Trigger(t) => t.table.clone(),
+        _ => String::new(),
+    };
+    let mut d = audit_trigger(Flavor::Mysql).draft();
+    assert!(d.is_on_table(&from));
+    assert!(d.follow_table_rename(&from, "sales"));
+    assert!(!d.is_on_table(&from));
+    assert_eq!(table(&d), "sales");
+    // Already moved, or another schema's table of that name: left alone.
+    assert!(!d.follow_table_rename(&from, "x"));
+    let mut other = audit_trigger(Flavor::Oracle).draft();
+    if let Properties::Trigger(t) = &mut other.props {
+        t.table_schema = "SHOP".into();
+    }
+    assert!(!other.follow_table_rename(&from, "sales"));
+    let shop = crate::edit::TableRef {
+        database: "SHOP".into(),
+        table: "orders".into(),
+    };
+    assert!(other.follow_table_rename(&shop, "sales"));
+    assert_eq!(table(&other), "sales");
+    let mut view = def(
+        Flavor::Mysql,
+        "warehouse",
+        "v",
+        ObjectKind::View,
+        Properties::Source(SourceProps::default()),
+    )
+    .draft();
+    assert!(!view.follow_table_rename(&from, "sales"));
+    assert!(!view.is_on_table(&from));
+}

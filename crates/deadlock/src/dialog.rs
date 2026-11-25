@@ -7,15 +7,23 @@
 //! Keyboard: Esc cancels, Enter takes the default action unless it is destructive, Tab
 //! and Shift+Tab move between the buttons, Space or Enter presses the one with focus.
 //! GPUI keeps the focus inside the dialog while it is open and gives it back after.
+//!
+//! A dialog may also hold one text field and one checkbox ([`ask_inputs`] reads them
+//! back), with the statement rebuilt from them as they change.
 
+use std::cell::RefCell;
 use std::future::Future;
+use std::rc::Rc;
 
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, BoxShadow, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    Global, InteractiveElement, IntoElement, ParentElement, PromptButton, PromptHandle,
+    App, AppContext as _, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Global, InteractiveElement, IntoElement, ParentElement, PromptButton, PromptHandle,
     PromptLevel, PromptResponse, Render, RenderablePromptHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window, actions, div, hsla, point, px, relative, white,
+    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, hsla, point, px,
+    relative, white,
 };
 
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size};
@@ -38,7 +46,36 @@ pub struct Ask {
     /// The default action destroys something: it is drawn in the danger color and
     /// Enter does not take it.
     pub danger: bool,
+    /// A one-line text field under the text: its label and first value.
+    pub field: Option<(String, String)>,
+    /// A warning band under the field.
+    pub warning: Option<String>,
+    /// A labelled list of `(name, detail)` rows.
+    pub list: Option<(String, Vec<(String, String)>)>,
+    /// A checkbox under the list, unchecked at first.
+    pub check: Option<String>,
+    /// Rebuilds the statement from the field's text and the checkbox.
+    pub preview: Option<Preview>,
+    /// Where [`ask_inputs`] reads the field and the checkbox back.
+    inputs: Option<Inputs>,
 }
+
+/// The statement for the field's text and the checkbox, or what the default action
+/// waits for: "To finish: …" shows in its place and the action is disabled.
+#[derive(Clone)]
+pub struct Preview(pub Rc<PreviewFn>);
+
+/// The field's text and the checkbox to the statement.
+pub type PreviewFn = dyn Fn(&str, bool) -> Result<String, String>;
+
+impl std::fmt::Debug for Preview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Preview")
+    }
+}
+
+/// The field's text and the checkbox as the dialog closed.
+type Inputs = Rc<RefCell<(String, bool)>>;
 
 impl Ask {
     pub fn new(title: impl Into<String>, buttons: &[&str]) -> Self {
@@ -100,6 +137,24 @@ pub fn ask(
     async move { rx.await.ok() }
 }
 
+/// [`ask`] for a dialog with a field or a checkbox: also resolves to the field's text
+/// and whether the box was checked.
+pub fn ask_inputs(
+    window: &mut Window,
+    cx: &mut App,
+    mut ask: Ask,
+) -> impl Future<Output = Option<(usize, String, bool)>> + use<> {
+    let first = ask.field.as_ref().map(|f| f.1.clone()).unwrap_or_default();
+    let inputs = Rc::new(RefCell::new((first, false)));
+    ask.inputs = Some(Rc::clone(&inputs));
+    let answer = self::ask(window, cx, ask);
+    async move {
+        let i = answer.await?;
+        let (text, checked) = inputs.borrow().clone();
+        Some((i, text, checked))
+    }
+}
+
 fn build(
     _: PromptLevel,
     message: &str,
@@ -120,7 +175,7 @@ fn build(
             buttons: actions.iter().map(|a| a.label().to_string()).collect(),
             ..Ask::default()
         });
-    let view = cx.new(|cx| Dialog::new(ask, cx));
+    let view = cx.new(|cx| Dialog::new(ask, window, cx));
     handle.with_view(view, window, cx)
 }
 
@@ -132,16 +187,34 @@ struct Dialog {
     focused: Option<usize>,
     /// Tab was pressed: the focus ring shows.
     keyboard: bool,
+    /// The text field, which takes the focus.
+    field: Option<Entity<InputState>>,
+    checked: bool,
+    _sub: Option<Subscription>,
 }
 
 impl Dialog {
-    fn new(ask: Ask, cx: &mut Context<Self>) -> Self {
+    fn new(ask: Ask, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focused = (!ask.danger && !ask.buttons.is_empty()).then_some(0);
+        let field = ask.field.as_ref().map(|(_, value)| {
+            let value = value.clone();
+            cx.new(|cx| InputState::new(window, cx).default_value(value))
+        });
+        let sub = field.as_ref().map(|f| {
+            cx.subscribe(f, |_, _, e: &InputEvent, cx| {
+                if matches!(e, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+        });
         Self {
             ask,
             focus: cx.focus_handle(),
             focused,
             keyboard: false,
+            field,
+            checked: false,
+            _sub: sub,
         }
     }
 
@@ -149,7 +222,26 @@ impl Dialog {
         cancel_index(&self.ask.buttons)
     }
 
+    fn text(&self, cx: &App) -> String {
+        self.field
+            .as_ref()
+            .map(|f| f.read(cx).value().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The statement from the field and the checkbox; `Err` holds back the default action.
+    fn preview(&self, cx: &App) -> Option<Result<String, String>> {
+        let p = self.ask.preview.as_ref()?;
+        Some((p.0)(&self.text(cx), self.checked))
+    }
+
     fn answer(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i == 0 && i != self.cancel_index() && matches!(self.preview(cx), Some(Err(_))) {
+            return;
+        }
+        if let Some(inputs) = &self.ask.inputs {
+            *inputs.borrow_mut() = (self.text(cx), self.checked);
+        }
         cx.emit(PromptResponse(i));
     }
 
@@ -197,8 +289,11 @@ fn cancel_index(buttons: &[String]) -> usize {
 impl EventEmitter<PromptResponse> for Dialog {}
 
 impl Focusable for Dialog {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.field {
+            Some(f) => f.focus_handle(cx),
+            None => self.focus.clone(),
+        }
     }
 }
 
@@ -232,7 +327,23 @@ impl Render for Dialog {
                         .child(SharedString::from(t)),
                 )
             });
-        let statement = ask.statement.as_ref().map(|sql| {
+        let preview = self.preview(cx);
+        let ready = !matches!(preview, Some(Err(_)));
+        let waiting = match &preview {
+            Some(Err(e)) => Some(
+                div()
+                    .text_size(crate::theme::small_size())
+                    .text_color(p.tx3)
+                    .child(format!("To finish: {e}.")),
+            ),
+            _ => None,
+        };
+        let sql = match preview {
+            Some(Ok(sql)) => Some(sql),
+            Some(Err(_)) => None,
+            None => ask.statement.clone(),
+        };
+        let statement = sql.map(|sql| {
             div()
                 .id("dialog-statement")
                 .max_h(px(220.))
@@ -247,12 +358,100 @@ impl Render for Dialog {
                 .text_size(data_size())
                 .line_height(px(20.))
                 .whitespace_nowrap()
-                .child(crate::query::table::highlighted(sql, &p))
+                // About as many characters as fit in the 480 px card.
+                .child(crate::query::table::highlighted(
+                    &crate::query::table::wrap_sql(&sql, 52),
+                    &p,
+                ))
+        });
+        let field = self
+            .field
+            .as_ref()
+            .zip(ask.field.as_ref())
+            .map(|(f, (label, _))| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(crate::theme::small_size())
+                            .text_color(p.tx2)
+                            .child(SharedString::from(label.clone())),
+                    )
+                    .child(
+                        Styled::h(Input::new(f), crate::theme::row_height())
+                            .font_family(MONO_FONT)
+                            .text_size(data_size()),
+                    )
+            });
+        let warning = ask
+            .warning
+            .clone()
+            .map(|w| crate::ui::warning_band(SharedString::from(w), &p));
+        let list = ask.list.as_ref().map(|(label, rows)| {
+            let last = rows.len().saturating_sub(1);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(crate::theme::small_size())
+                        .text_color(p.tx2)
+                        .child(SharedString::from(label.clone())),
+                )
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(p.line)
+                        .rounded(RADIUS)
+                        .overflow_hidden()
+                        .font_family(MONO_FONT)
+                        .text_size(data_size())
+                        .children(rows.iter().enumerate().map(|(i, (name, detail))| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.))
+                                .min_h(px(32.))
+                                .px(px(12.))
+                                .when(i < last, |d| d.border_b_1().border_color(p.line))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(SharedString::from(name.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(p.tx3)
+                                        .child(SharedString::from(detail.clone())),
+                                )
+                        })),
+                )
+                .when_some(ask.check.clone(), |d, label| {
+                    d.child(
+                        Checkbox::new("dialog-check")
+                            .checked(self.checked)
+                            .label(label)
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.checked = *checked;
+                                cx.notify();
+                            })),
+                    )
+                })
         });
         let cancel = self.cancel_index();
         let buttons = self.order().into_iter().map(|i| {
             let label = SharedString::from(ask.buttons[i].clone());
             let primary = i == 0 && i != cancel;
+            let off = primary && !ready;
             // The dark theme's danger token is too light under white text, so the fill is fixed.
             let red: gpui_kit::Hsla = gpui_kit::rgb(0xB9_1C1C).into();
             let (bg, fg, border, hover) = match (primary, ask.danger) {
@@ -274,7 +473,8 @@ impl Render for Dialog {
                 .text_color(fg)
                 .whitespace_nowrap()
                 .when(primary, |d| d.font_weight(FontWeight::MEDIUM))
-                .hover(move |s| s.bg(hover))
+                .when(off, |d| d.opacity(0.5))
+                .when(!off, |d| d.hover(move |s| s.bg(hover)))
                 // The design's `:focus-visible`: 2 px blue, 1 px off the button.
                 .when(ring, |d| {
                     d.shadow(vec![
@@ -310,8 +510,10 @@ impl Render for Dialog {
                 }
             }))
             .on_action(cx.listener(|this, _: &Press, _, cx| {
-                if let Some(i) = this.focused.filter(|_| this.keyboard) {
-                    this.answer(i, cx);
+                match this.focused.filter(|_| this.keyboard) {
+                    Some(i) => this.answer(i, cx),
+                    // Space types into the field.
+                    None => cx.propagate(),
                 }
             }))
             .on_action(cx.listener(|this, _: &NextButton, _, cx| this.step(true, cx)))
@@ -349,6 +551,10 @@ impl Render for Dialog {
                     }])
                     .line_height(relative(1.4))
                     .child(header)
+                    .children(field)
+                    .children(warning)
+                    .children(list)
+                    .children(waiting)
                     .children(statement)
                     .child(
                         div()

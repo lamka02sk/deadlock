@@ -14,7 +14,7 @@ use crate::objects::{
 };
 
 fn missing(o: &ObjectRef) -> DriverError {
-    DriverError::Invalid(format!(
+    DriverError::NotFound(format!(
         "{} {}.{} does not exist, or this account cannot see it",
         o.kind.label(),
         o.schema,

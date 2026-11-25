@@ -43,6 +43,9 @@ pub enum DriverError {
     Unsupported(&'static str),
     #[error("{0}")]
     Invalid(String),
+    /// The object asked for does not exist, or this account cannot see it.
+    #[error("{0}")]
+    NotFound(String),
     #[error("the connection's background task stopped")]
     Gone,
     /// The SSH tunnel did not open: the SSH hop failed, or its host key needs a decision.
@@ -441,6 +444,13 @@ pub trait Driver: Send + Sync {
                 "no table structure on this engine",
             ))
         })
+    }
+
+    /// The server's collations, each with its character set (`utf8mb4_bin`,
+    /// `utf8mb4`), sorted by name: what the Collation lists offer. Engines without
+    /// collations return none.
+    fn collations(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     /// The plan for one statement. `analyze`: run the statement and measure each step,

@@ -219,6 +219,45 @@ impl Tree {
         false
     }
 
+    /// The tables the tree holds for the shown databases of `conn` other than
+    /// `except`, by database then name: what the Add foreign key form lists as
+    /// `schema.table`. Databases whose tables are not loaded add none.
+    pub fn cached_tables(&self, conn: &str, except: &str) -> Vec<crate::edit::TableRef> {
+        let Some(c) = self.connections.iter().find(|c| c.id == conn) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for db in c.nodes.iter().flatten() {
+            if db.name == except || c.hidden.contains(&db.name) {
+                continue;
+            }
+            let tables = db
+                .children
+                .iter()
+                .flatten()
+                .filter(|g| g.kind == NodeKind::Group && g.name == "Tables")
+                .flat_map(|g| g.children.iter().flatten())
+                .filter(|t| t.kind == NodeKind::Table);
+            out.extend(tables.map(|t| crate::edit::TableRef {
+                database: db.name.clone(),
+                table: t.name.clone(),
+            }));
+        }
+        out.sort_by(|a, b| (&a.database, &a.table).cmp(&(&b.database, &b.table)));
+        out
+    }
+
+    /// Opens the ancestors of `id` so its row shows. Returns whether `id` is in the tree.
+    pub fn reveal(&mut self, id: &[String]) -> bool {
+        if self.node(id).is_none() {
+            return false;
+        }
+        for n in 1..id.len() {
+            self.expanded.insert(id[..n].to_vec());
+        }
+        true
+    }
+
     /// Forgets open nodes that no longer exist.
     pub fn prune(&mut self) {
         let gone: Vec<NodeId> = self
@@ -551,6 +590,42 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn cached_tables_of_other_shown_databases() {
+        let mut t = sample();
+        let names = |t: &Tree, except: &str| -> Vec<String> {
+            t.cached_tables("shop", except)
+                .into_iter()
+                .map(|r| format!("{}.{}", r.database, r.table))
+                .collect()
+        };
+        assert_eq!(names(&t, "app"), Vec::<String>::new());
+        assert_eq!(
+            names(&t, "other"),
+            ["app.customers", "app.order_items", "app.orders"]
+        );
+        t.connections[0].hidden.push("app".into());
+        assert!(names(&t, "other").is_empty());
+        assert!(t.cached_tables("nope", "").is_empty());
+    }
+
+    #[test]
+    fn reveal_opens_the_ancestors_of_a_loaded_node() {
+        let mut t = sample();
+        assert!(!t.reveal(&id(&["shop", "app", "Tables", "invoices"])));
+        assert!(t.expanded.is_empty());
+        assert!(t.reveal(&id(&["shop", "app", "Tables", "orders"])));
+        assert_eq!(
+            labels(&t.rows())[..4],
+            ["shop", "  app", "    Tables 3", "      customers"]
+        );
+        assert!(
+            t.rows()
+                .iter()
+                .any(|r| r.id == id(&["shop", "app", "Tables", "orders"]))
+        );
     }
 
     #[test]

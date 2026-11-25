@@ -88,6 +88,7 @@ pub enum Icon {
     Open,
     SelectAll,
     Color,
+    Warning,
 }
 
 impl Icon {
@@ -145,6 +146,7 @@ impl Icon {
             Self::Open => "deadlock/icons/open.svg",
             Self::SelectAll => "deadlock/icons/select-all.svg",
             Self::Color => "deadlock/icons/color.svg",
+            Self::Warning => "deadlock/icons/warning.svg",
         }
     }
 }
@@ -175,6 +177,34 @@ pub fn menu_icon(i: Icon) -> gpui_kit::component::Icon {
     gpui_kit::component::Icon::empty().path(i.path())
 }
 
+/// A context-menu item with a hint at its right end, as the design's `.mi .kb`
+/// ("Double-click", "Enter"): what else does the same.
+pub fn menu_item_hint(
+    label: impl Into<SharedString>,
+    hint: &'static str,
+    i: Icon,
+) -> gpui_kit::component::menu::PopupMenuItem {
+    use gpui_kit::{ParentElement as _, px};
+    let label = label.into();
+    gpui_kit::component::menu::PopupMenuItem::element(move |_, cx| {
+        let p = *cx.global::<crate::theme::Palette>();
+        gpui_kit::div()
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_between()
+            .gap(px(16.))
+            .child(label.clone())
+            .child(
+                gpui_kit::div()
+                    .text_size(px(11.5))
+                    .text_color(p.tx3)
+                    .child(hint),
+            )
+    })
+    .icon(menu_icon(i))
+}
+
 /// A destructive context-menu item: label and icon in the danger color.
 pub fn menu_item_danger(
     label: impl Into<SharedString>,
@@ -186,6 +216,33 @@ pub fn menu_item_danger(
         gpui_kit::div().text_color(danger).child(label.clone())
     })
     .icon(menu_icon(i).text_color(danger))
+}
+
+/// A disabled item with the reason under it, as the design's `.mi.x`.
+pub fn menu_item_disabled(
+    label: &'static str,
+    reason: &'static str,
+    i: Icon,
+) -> gpui_kit::component::menu::PopupMenuItem {
+    use gpui_kit::{ParentElement as _, px};
+    gpui_kit::component::menu::PopupMenuItem::element(move |_, cx| {
+        let p = *cx.global::<crate::theme::Palette>();
+        gpui_kit::div()
+            .flex()
+            .flex_col()
+            .max_w(px(300.))
+            .py(px(2.))
+            .child(label)
+            .child(
+                gpui_kit::div()
+                    .text_size(crate::theme::small_size())
+                    .text_color(p.tx3)
+                    .whitespace_normal()
+                    .child(reason),
+            )
+    })
+    .icon(menu_icon(i))
+    .disabled(true)
 }
 
 #[cfg(test)]
@@ -247,6 +304,7 @@ mod tests {
             Icon::Open,
             Icon::SelectAll,
             Icon::Color,
+            Icon::Warning,
         ];
         for path in all.iter().map(|i| i.path()).chain([APP_LOGO]) {
             assert!(Assets.load(path).unwrap().is_some(), "{path}");

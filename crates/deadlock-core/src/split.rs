@@ -21,8 +21,15 @@ use crate::connection::Engine;
 ///   quoting, `--` and `/* */` comments.
 /// - Redis: one command per non-blank line.
 pub fn split(text: &str, engine: Engine) -> Vec<Range<usize>> {
+    split_in_mode(text, engine, true)
+}
+
+/// [`split`] for a MySQL / MariaDB session whose `sql_mode` may hold
+/// `NO_BACKSLASH_ESCAPES`: with `backslash_escapes` off, `\` in a string is a plain
+/// character (`'a\'` is a whole literal). Oracle and Redis ignore it.
+pub fn split_in_mode(text: &str, engine: Engine, backslash_escapes: bool) -> Vec<Range<usize>> {
     match engine {
-        Engine::Mysql | Engine::Mariadb => mysql(text),
+        Engine::Mysql | Engine::Mariadb => mysql(text, backslash_escapes),
         Engine::Oracle => oracle(text),
         Engine::Redis => lines(text),
     }
@@ -99,7 +106,7 @@ pub(crate) fn quoted_end(b: &[u8], i: usize, backslash: bool) -> usize {
     b.len()
 }
 
-fn mysql(text: &str) -> Vec<Range<usize>> {
+fn mysql(text: &str, backslash_escapes: bool) -> Vec<Range<usize>> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut cur = Current::default();
@@ -122,7 +129,7 @@ fn mysql(text: &str) -> Vec<Range<usize>> {
             continue;
         }
         let end = match b[i] {
-            b'\'' | b'"' => quoted_end(b, i, true),
+            b'\'' | b'"' => quoted_end(b, i, backslash_escapes),
             b'`' => quoted_end(b, i, false),
             b'#' => {
                 i = line_end(b, i);
@@ -563,6 +570,14 @@ mod tests {
             my("SELECT 'ends with backslash\\"),
             ["SELECT 'ends with backslash\\"]
         );
+    }
+
+    #[test]
+    fn no_backslash_escapes_ends_a_string_at_its_quote() {
+        // `'a\'` is a whole literal without escapes, so `';'` is the second value.
+        let text = "SELECT 'a\\', ';'";
+        assert_eq!(split_in_mode(text, Engine::Mysql, true).len(), 2);
+        assert_eq!(split_in_mode(text, Engine::Mariadb, false).len(), 1);
     }
 
     #[test]

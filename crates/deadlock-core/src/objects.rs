@@ -603,6 +603,31 @@ pub struct ObjectDraft {
     pub props: Properties,
 }
 
+impl ObjectDraft {
+    /// Whether this is a trigger on table `table`.
+    pub fn is_on_table(&self, table: &crate::edit::TableRef) -> bool {
+        let Properties::Trigger(t) = &self.props else {
+            return false;
+        };
+        let schema = if t.table_schema.is_empty() {
+            &self.object.schema
+        } else {
+            &t.table_schema
+        };
+        t.table == table.table && *schema == table.database
+    }
+
+    /// Table `from` was renamed to `to`: a trigger on it is on `to` now. Returns
+    /// whether this is such a trigger.
+    pub fn follow_table_rename(&mut self, from: &crate::edit::TableRef, to: &str) -> bool {
+        let on = self.is_on_table(from);
+        if on && let Properties::Trigger(t) = &mut self.props {
+            to.clone_into(&mut t.table);
+        }
+        on
+    }
+}
+
 /// What a step does; decides how [`crate::driver::Driver::apply_object`] treats a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {

@@ -1,14 +1,15 @@
 //! The object editor tabs in the window: opening one per object (or a new one from a
 //! template), their strip entries, closing with the Discard prompt, the tree reloads
-//! after an apply, and the sidebar's object menus.
+//! after an apply, and the sidebar's object and table menus.
 
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deadlock_core::driver::NodeKind;
+use deadlock_core::driver::{DriverError, NodeKind};
+use deadlock_core::edit::TableRef;
 use deadlock_core::objects::{Flavor, ObjectKind, ObjectRef, Properties, template};
 use deadlock_core::schema::{Row, RowKind};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
@@ -17,9 +18,10 @@ use gpui_kit::{
 
 use super::{Conn, Front, Shell};
 use crate::app::Db;
-use crate::assets::{Icon, icon, menu_item, menu_item_danger};
+use crate::assets::{Icon, icon, menu_item, menu_item_danger, menu_item_disabled, menu_item_hint};
 use crate::object::{ObjectEvent, ObjectTab, Target, Then};
-use crate::theme::{Palette, small_size, tab_height};
+use crate::query::{Kind, TableAction, View};
+use crate::theme::{Palette, tab_height};
 use crate::ui::Clickable as _;
 use gpui_kit::{MouseButton, MouseUpEvent};
 
@@ -57,7 +59,69 @@ impl Shell {
             self.show_tab(Front::Object(i), window, cx);
             return;
         }
-        self.add_object(conn, Target::Existing(object, then), window, cx);
+        if let Some(i) = self.add_object(conn, Target::Existing(object, then), window, cx) {
+            self.show_tab(Front::Object(i), window, cx);
+        }
+    }
+
+    /// Connects the next connection that restored object tabs wait for, one at a time
+    /// and never over a password prompt.
+    pub(super) fn connect_restored(&mut self, cx: &mut Context<Self>) {
+        if self.prompt.is_some() || self.conns.values().any(|c| matches!(c, Conn::Connecting)) {
+            return;
+        }
+        let next = self
+            .restored_objects
+            .iter()
+            .map(|(c, _)| c)
+            .find(|c| !self.conns.contains_key(*c))
+            .cloned();
+        if let Some(id) = next {
+            self.connect(&id, cx);
+        }
+    }
+
+    /// Connection `id` connected: opens the object tabs `state.json` listed for it,
+    /// behind the tab in front. Objects that are gone are left out without a word.
+    pub(super) fn reopen_objects(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(Conn::Connected(driver)) = self.conns.get(id) else {
+            return;
+        };
+        let (due, rest) = std::mem::take(&mut self.restored_objects)
+            .into_iter()
+            .partition(|(c, _)| c == id);
+        self.restored_objects = rest;
+        if due.is_empty() {
+            return;
+        }
+        let (driver, handle, id) = (Arc::clone(driver), self.window, id.to_owned());
+        let rt = Arc::clone(&cx.global::<Db>().0);
+        cx.spawn(async move |this, cx| {
+            for (_, object) in due {
+                let (driver, o) = (Arc::clone(&driver), object.clone());
+                // Only an object that is gone is left out; on any other failure the
+                // tab still opens and shows the error, so it is not lost.
+                if matches!(
+                    rt.spawn(async move { driver.object(&o).await }).await,
+                    Ok(Err(DriverError::NotFound(_)))
+                ) {
+                    continue;
+                }
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        let open = this
+                            .objects
+                            .iter()
+                            .any(|(t, _)| t.read(cx).is(&id, &object));
+                        if !open {
+                            this.add_object(&id, Target::Existing(object, None), window, cx);
+                            cx.notify();
+                        }
+                    })
+                });
+            }
+        })
+        .detach();
     }
 
     /// A New … menu item: the editor on `kind`'s template in `schema`, for `table`'s
@@ -78,22 +142,48 @@ impl Shell {
         if let (Properties::Trigger(t), Some(table)) = (&mut draft.props, table) {
             t.table = table;
         }
-        self.add_object(conn, Target::New(Box::new(draft)), window, cx);
+        if let Some(i) = self.add_object(conn, Target::New(Box::new(draft)), window, cx) {
+            self.show_tab(Front::Object(i), window, cx);
+        }
     }
 
+    /// New table…: a table tab in draft state for `schema`, on its Structure view.
+    pub(super) fn new_table(
+        &mut self,
+        conn: &str,
+        schema: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(binding) = self.binding(Some(conn)) else {
+            return;
+        };
+        let mariadb = self.flavor(conn) == Some(Flavor::Mariadb);
+        let table = TableRef {
+            database: schema.into(),
+            table: String::new(),
+        };
+        let i = self.add_tab(Kind::Table(table), Some(binding), String::new(), window, cx);
+        self.tabs[i]
+            .0
+            .update(cx, |t, cx| t.start_draft(mariadb, window, cx));
+        self.show_tab(Front::Query(i), window, cx);
+    }
+
+    /// Adds an object tab at the end of the strip; its index, once `conn` is connected.
     fn add_object(
         &mut self,
         conn: &str,
         target: Target,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<usize> {
         let (Some(config), Some(Conn::Connected(driver)), Some(flavor)) = (
             self.config(conn).cloned(),
             self.conns.get(conn),
             self.flavor(conn),
         ) else {
-            return;
+            return None;
         };
         let driver = Arc::clone(driver);
         let root = self.project.root().to_owned();
@@ -112,7 +202,7 @@ impl Shell {
             cx.new(|cx| ObjectTab::new(config, driver, flavor, root, target, complete, window, cx));
         let sub = cx.subscribe_in(&tab, window, Self::on_object_event);
         self.objects.push((tab, sub));
-        self.show_tab(Front::Object(self.objects.len() - 1), window, cx);
+        Some(self.objects.len() - 1)
     }
 
     fn on_object_event(
@@ -146,6 +236,58 @@ impl Shell {
                 }
             }
         }
+    }
+
+    /// Table `table` of connection `conn` was dropped: closes the tabs of its triggers,
+    /// asking once first about those with unapplied edits.
+    pub(super) fn close_objects_on_table(
+        &mut self,
+        conn: &str,
+        table: &TableRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on: Vec<_> = self
+            .objects
+            .iter()
+            .map(|(t, _)| t.clone())
+            .filter(|t| t.read(cx).is_on_table(conn, table) && !t.read(cx).is_running())
+            .collect();
+        let (dirty, clean): (Vec<_>, Vec<_>) = on.into_iter().partition(|t| t.read(cx).dirty());
+        for tab in clean {
+            if let Some(i) = self.objects.iter().position(|(t, _)| *t == tab) {
+                self.remove_object(i, cx);
+            }
+        }
+        if dirty.is_empty() {
+            return;
+        }
+        let titles: Vec<_> = dirty.iter().map(|t| t.read(cx).title()).collect();
+        let answer = crate::dialog::ask(
+            window,
+            cx,
+            crate::dialog::Ask::new(
+                format!("Discard changes to {}?", titles.join(", ")),
+                &["Discard", "Cancel"],
+            )
+            .text(format!(
+                "Table {} was dropped, and with it its triggers. The edits have not been applied.",
+                table.table
+            )),
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await != Some(0) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                for tab in dirty {
+                    if let Some(i) = this.objects.iter().position(|(t, _)| *t == tab) {
+                        this.remove_object(i, cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Closes object tab `i`; unapplied edits ask Discard / Cancel first. A tab whose
@@ -213,6 +355,28 @@ impl Shell {
 
     /// Reads the object's CREATE statement from the server onto the clipboard.
     fn copy_create(&mut self, conn: &str, object: ObjectRef, cx: &mut Context<Self>) {
+        self.copy_create_with(conn, cx, async move |d| {
+            d.object(&object).await.map(|def| def.source)
+        });
+    }
+
+    /// The table's CREATE statement, as its Structure view shows it, onto the clipboard.
+    fn copy_table_create(&mut self, conn: &str, table: TableRef, cx: &mut Context<Self>) {
+        self.copy_create_with(conn, cx, async move |d| {
+            d.structure(&table).await.map(|s| s.ddl)
+        });
+    }
+
+    /// Runs `read` on the connection's driver and puts what it returns on the
+    /// clipboard, or says why it could not.
+    fn copy_create_with<F>(
+        &mut self,
+        conn: &str,
+        cx: &mut Context<Self>,
+        read: impl FnOnce(Arc<dyn deadlock_core::driver::Driver>) -> F + Send + 'static,
+    ) where
+        F: Future<Output = Result<String, deadlock_core::driver::DriverError>> + Send + 'static,
+    {
         let Some(Conn::Connected(driver)) = self.conns.get(conn) else {
             return;
         };
@@ -220,16 +384,14 @@ impl Shell {
         let rx = cx
             .global::<Db>()
             .0
-            .spawn(async move { driver.object(&object).await.map_err(|e| e.to_string()) });
+            .spawn(async move { read(driver).await.map_err(|e| e.to_string()) });
         let window = self.window;
         cx.spawn(async move |_, cx| {
             match rx
                 .await
                 .unwrap_or_else(|_| Err("the object task stopped".into()))
             {
-                Ok(def) => {
-                    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(def.source)))
-                }
+                Ok(sql) => cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(sql))),
                 Err(e) => {
                     let _ = cx.update_window(window, |_, window, cx| {
                         drop(crate::dialog::ask(
@@ -256,7 +418,9 @@ impl Shell {
                 RowKind::Node(NodeKind::Routine | NodeKind::View) => {
                     ObjectRef::from_node(&row.id).is_some()
                 }
-                RowKind::Node(NodeKind::Group) => new_kind(&row.id).is_some(),
+                RowKind::Node(NodeKind::Group) => {
+                    new_kind(&row.id).is_some() || is_tables_group(&row.id)
+                }
                 RowKind::Node(NodeKind::Database) => true,
                 _ => false,
             }
@@ -286,8 +450,17 @@ impl Shell {
                     });
                 })
         };
+        let new_table = |schema: String| {
+            let (shell, conn) = (shell.clone(), conn.clone());
+            menu_item("New table…", Icon::Plus)
+                .disabled(read_only)
+                .on_click(move |_, window, cx| {
+                    shell.update(cx, |s, cx| s.new_table(&conn, &schema, window, cx));
+                })
+        };
         match row.kind {
             RowKind::Node(NodeKind::Database) => {
+                menu = menu.item(new_table(row.id[1].clone()));
                 for kind in ObjectKind::managed(flavor) {
                     menu = menu.item(new_item(*kind, row.id[1].clone(), None));
                 }
@@ -295,6 +468,7 @@ impl Shell {
             }
             RowKind::Node(NodeKind::Group) => match new_kind(&row.id) {
                 Some((kind, table)) => menu.item(new_item(kind, row.id[1].clone(), table)),
+                None if is_tables_group(&row.id) => menu.item(new_table(row.id[1].clone())),
                 None => menu,
             },
             _ => {
@@ -303,7 +477,8 @@ impl Shell {
                 };
                 let item = |label: String, ic: Icon, then: Option<Then>, off: bool| {
                     let (shell, conn, object) = (shell.clone(), conn.clone(), object.clone());
-                    let it = if then == Some(Then::Drop) {
+                    // Disabled items keep the plain look: a red one reads as available.
+                    let it = if then == Some(Then::Drop) && !off {
                         menu_item_danger(label, ic, cx)
                     } else {
                         menu_item(label, ic)
@@ -347,7 +522,7 @@ impl Shell {
                         Some(Then::Rename),
                         read_only,
                     )),
-                    Err(reason) => menu.item(disabled_with_reason("Rename…", reason)),
+                    Err(reason) => menu.item(menu_item_disabled("Rename…", reason, Icon::Rename)),
                 };
                 if flavor == Flavor::Oracle && row.detail == "invalid" {
                     menu = menu.item(item(
@@ -368,26 +543,142 @@ impl Shell {
     }
 }
 
-/// A disabled item with the reason under it, as the design's `.mi.x`.
-fn disabled_with_reason(label: &'static str, reason: &'static str) -> PopupMenuItem {
-    PopupMenuItem::element(move |_, cx| {
-        let p = *cx.global::<Palette>();
-        div()
-            .flex()
-            .flex_col()
-            .max_w(px(300.))
-            .py(px(2.))
-            .child(label)
-            .child(
-                div()
-                    .text_size(small_size())
-                    .text_color(p.tx3)
-                    .whitespace_normal()
-                    .child(reason),
-            )
-    })
-    .icon(gpui_kit::component::Icon::empty().path(Icon::Rename.path()))
-    .disabled(true)
+impl Shell {
+    /// The items of a sidebar table row (`[conn, schema, "Tables", table]`), after the
+    /// object items.
+    pub(super) fn table_menu(
+        &self,
+        row: &Row,
+        menu: PopupMenu,
+        shell: Entity<Shell>,
+        cx: &gpui_kit::App,
+    ) -> PopupMenu {
+        let [conn, schema, _, name] = row.id.as_slice() else {
+            return menu;
+        };
+        let table = TableRef {
+            database: schema.clone(),
+            table: name.clone(),
+        };
+        let read_only = self.config(conn).is_some_and(|c| c.read_only);
+        let (s, c, t) = (shell.clone(), conn.clone(), table.clone());
+        let menu = menu.item(menu_item_hint("Open", "Enter", Icon::Open).on_click(
+            move |_, window, cx| {
+                s.update(cx, |s, cx| {
+                    s.open_table(&c, t.clone(), View::Data, window, cx)
+                });
+            },
+        ));
+        let name = name.clone();
+        let menu = menu.item(
+            menu_item("Copy name", Icon::Copy).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(name.clone()));
+            }),
+        );
+        let (s, c, t) = (shell.clone(), conn.clone(), table.clone());
+        let menu = menu.item(menu_item("Copy CREATE statement", Icon::Copy).on_click(
+            move |_, _, cx| {
+                s.update(cx, |s, cx| s.copy_table_create(&c, t.clone(), cx));
+            },
+        ));
+        let (s, c, t) = (shell.clone(), conn.clone(), table.clone());
+        let menu = menu.separator().item(
+            menu_item("Import CSV…", Icon::Import)
+                .disabled(read_only)
+                .on_click(move |_, window, cx| {
+                    s.update(cx, |s, cx| s.open_import(&c, Some(t.clone()), window, cx));
+                }),
+        );
+        table_actions(menu, &shell, conn, &table, read_only, cx)
+    }
+
+    /// Opens (or brings forward) the table's tab on its Structure view, which asks.
+    pub(super) fn table_action(
+        &mut self,
+        conn: &str,
+        table: TableRef,
+        action: TableAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_table(conn, table.clone(), View::Structure, window, cx);
+        let tab = self.tabs.iter().map(|(t, _)| t).find(|t| {
+            let t = t.read(cx);
+            t.kind == Kind::Table(table.clone())
+                && t.connection.as_ref().is_some_and(|c| c.id == conn)
+        });
+        if let Some(tab) = tab.cloned() {
+            tab.update(cx, |t, cx| t.start_table_action(action, window, cx));
+        }
+    }
+
+    /// Table `from` was renamed (`to`) or dropped: its saved diagram card follows, in
+    /// the open diagram when it shows that schema.
+    pub(super) fn table_changed(
+        &mut self,
+        conn: &str,
+        from: &TableRef,
+        to: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let tabs: Vec<_> = self.tabs.iter().map(|(t, _)| t.clone()).collect();
+        for tab in tabs {
+            tab.update(cx, |t, cx| t.other_table_changed(conn, from, cx));
+        }
+        let open = self.diagrams.iter().map(|(d, _)| d).find(|d| {
+            let d = d.read(cx);
+            d.connection.id == conn && d.schema == from.database
+        });
+        match open.cloned() {
+            Some(d) => d.update(cx, |d, cx| d.table_changed(&from.table, to, cx)),
+            None => {
+                let root = self.project.root();
+                let renamed = deadlock_core::diagram::rename_table(
+                    root,
+                    conn,
+                    &from.database,
+                    &from.table,
+                    to,
+                );
+                if let Err(e) = renamed {
+                    eprintln!("deadlock: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Rename…, Truncate… and Drop table… for `table` of `conn`; only Drop is red.
+pub(super) fn table_actions(
+    menu: PopupMenu,
+    shell: &Entity<Shell>,
+    conn: &str,
+    table: &TableRef,
+    read_only: bool,
+    cx: &gpui_kit::App,
+) -> PopupMenu {
+    let item = |label: &'static str, ic: Icon, action: TableAction| {
+        let (shell, conn, table) = (shell.clone(), conn.to_owned(), table.clone());
+        // Disabled items keep the plain look: a red one reads as available.
+        let it = if action == TableAction::Drop && !read_only {
+            menu_item_danger(label, ic, cx)
+        } else {
+            menu_item(label, ic)
+        };
+        it.disabled(read_only).on_click(move |_, window, cx| {
+            shell.update(cx, |s, cx| {
+                s.table_action(&conn, table.clone(), action, window, cx)
+            });
+        })
+    };
+    menu.item(item("Rename…", Icon::Rename, TableAction::Rename))
+        .item(item("Truncate…", Icon::Minus, TableAction::Truncate))
+        .item(item("Drop table…", Icon::Trash, TableAction::Drop))
+}
+
+/// A schema's Tables group: `[conn, schema, "Tables"]`.
+fn is_tables_group(id: &[String]) -> bool {
+    matches!(id, [_, _, g] if g == "Tables")
 }
 
 /// The kind a group row's New item makes, and the table for triggers under a table:
@@ -512,6 +803,13 @@ mod tests {
             new_kind(&id(&["c", "shop", "Tables", "orders", "Columns"])),
             None
         );
+    }
+
+    #[test]
+    fn tables_groups_offer_new_table() {
+        assert!(is_tables_group(&id(&["c", "shop", "Tables"])));
+        assert!(!is_tables_group(&id(&["c", "shop", "Views"])));
+        assert!(!is_tables_group(&id(&["c", "shop", "Tables", "orders"])));
     }
 
     #[test]
