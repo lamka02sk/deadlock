@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::connection::ConnectionConfig;
+use crate::cache::SchemaCache;
+use crate::connection::{ConnectionConfig, keychain};
+use crate::history::History;
 use crate::{Error, Result, io_err, read_json, write_atomic, write_json};
 
 const DIR: &str = ".deadlock";
@@ -16,8 +18,46 @@ const CONSOLES: &str = "consoles";
 /// `.deadlock/project.toml`: shared project settings. Never holds secrets.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfig {
+    /// Shown instead of the folder name. `None` or blank: the folder name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `#rrggbb`, one of the app's palette colors. `None`: no title bar gradient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// The pattern laid over `color` in the title bar.
+    #[serde(default, skip_serializing_if = "Pattern::is_none")]
+    pub pattern: Pattern,
+    /// Stays last: TOML writes plain values before an array of tables.
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
+}
+
+/// The pattern laid over the project color in the title bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pattern {
+    #[default]
+    None,
+    Stripes,
+    Checks,
+    Dots,
+}
+
+impl Pattern {
+    pub const ALL: [Self; 4] = [Self::None, Self::Stripes, Self::Checks, Self::Dots];
+
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Stripes => "Stripes",
+            Self::Checks => "Checks",
+            Self::Dots => "Dots",
+        }
+    }
 }
 
 /// `.deadlock/state.json`: per-machine UI state, rewritten freely.
@@ -152,9 +192,10 @@ impl Project {
         &self.root
     }
 
-    /// The folder's name, shown in the window title and the recent list.
+    /// The project's display name, or the folder's name when it has none; shown in the
+    /// window title, the title bar and the recent list.
     pub fn name(&self) -> String {
-        folder_name(&self.root)
+        display_name(self.config.name.as_deref(), &self.root)
     }
 
     /// Writes `config` to `.deadlock/project.toml`.
@@ -202,6 +243,51 @@ pub fn console_path(root: &Path, connection: &str) -> Result<PathBuf> {
         .join(format!("{connection}.sql")))
 }
 
+/// Removes everything Deadlock stored for the project at `root`, never the folder itself:
+/// keychain entries of `connections` (password and SSH secret), history rows, schema
+/// cache rows, then `.deadlock/`. Secrets go first and `.deadlock/` last, so a failure
+/// part way leaves a project that still opens and can be deleted again. A machine with
+/// no keychain service at all skips the secrets: nothing could have been saved there.
+///
+/// # Errors
+/// The first step that fails; nothing after it runs. A locked keychain is a failure.
+pub fn delete(
+    root: &Path,
+    connections: &[String],
+    history: &mut History,
+    cache: &SchemaCache,
+) -> Result<()> {
+    delete_with(root, connections, history, cache, keychain::delete)
+}
+
+/// [`delete`] with the keychain step passed in, so tests run without a keychain.
+fn delete_with(
+    root: &Path,
+    connections: &[String],
+    history: &mut History,
+    cache: &SchemaCache,
+    mut forget_secret: impl FnMut(&Path, &str) -> keyring::Result<()>,
+) -> Result<()> {
+    'secrets: for id in connections {
+        for entry in [id.clone(), keychain::ssh_entry(id)] {
+            match forget_secret(root, &entry) {
+                Ok(()) => {}
+                Err(keyring::Error::NoDefaultStore | keyring::Error::PlatformFailure(_)) => {
+                    break 'secrets;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    history.clear(root)?;
+    cache.forget(root, None)?;
+    let dir = root.join(DIR);
+    match fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_err(&dir)(e)),
+        _ => Ok(()),
+    }
+}
+
 /// Reads a text file; a missing file reads as empty (a console never saved).
 ///
 /// # Errors
@@ -223,6 +309,14 @@ pub fn save_text(path: &Path, text: &str) -> Result<()> {
         fs::create_dir_all(dir).map_err(io_err(dir))?;
     }
     write_atomic(path, text.as_bytes())
+}
+
+/// `name` trimmed, or the folder's name when `name` is missing or blank.
+pub fn display_name(name: Option<&str>, root: &Path) -> String {
+    match name.map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => folder_name(root),
+    }
 }
 
 /// The last component of `path`, or the whole path for a root like `/`.
@@ -268,6 +362,10 @@ mod tests {
         fs::write(dir.path().join(DIR).join(CONFIG), text).unwrap();
         let project = Project::open(dir.path()).unwrap();
         assert_eq!(project.config.connections.len(), 1);
+        // A file from before names, colors and patterns.
+        assert_eq!(project.config.name, None);
+        assert_eq!(project.config.color, None);
+        assert_eq!(project.config.pattern, Pattern::None);
         assert_eq!(
             fs::read_to_string(dir.path().join(DIR).join(CONFIG)).unwrap(),
             text
@@ -287,6 +385,41 @@ mod tests {
         project.save_config().unwrap();
         let again = Project::open(dir.path()).unwrap();
         assert_eq!(again.config, project.config);
+    }
+
+    #[test]
+    fn name_color_and_pattern_round_trip() {
+        use crate::connection::{ConnectionConfig, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project::open(dir.path()).unwrap();
+        assert_eq!(project.name(), folder_name(project.root()));
+        project.config.name = Some("Billing".into());
+        project.config.color = Some("#2f6fed".into());
+        project.config.pattern = Pattern::Dots;
+        project.config.connections.push(ConnectionConfig {
+            id: "local".into(),
+            name: "local".into(),
+            ..ConnectionConfig::new(Engine::Mysql)
+        });
+        project.save_config().unwrap();
+        let text = fs::read_to_string(dir.path().join(DIR).join(CONFIG)).unwrap();
+        assert!(
+            text.starts_with("name = \"Billing\"\ncolor = \"#2f6fed\"\npattern = \"dots\"\n"),
+            "{text}"
+        );
+        let again = Project::open(dir.path()).unwrap();
+        assert_eq!(again.config, project.config);
+        assert_eq!(again.name(), "Billing");
+    }
+
+    #[test]
+    fn blank_name_falls_back_to_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project::open(dir.path()).unwrap();
+        project.config.name = Some("  ".into());
+        assert_eq!(project.name(), folder_name(project.root()));
+        project.config.name = Some(" Shop ".into());
+        assert_eq!(project.name(), "Shop");
     }
 
     #[test]
@@ -339,6 +472,82 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn delete_removes_deadlock_data_and_keeps_the_folder_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let root = project.root().to_owned();
+        save_text(&console_path(&root, "a").unwrap(), "select 1;").unwrap();
+        fs::write(root.join("query.sql"), "select 2;").unwrap();
+        let mut history = History::open(&data.path().join("history.sqlite3")).unwrap();
+        let mut cache = SchemaCache::open(&data.path().join("cache.sqlite3")).unwrap();
+        let other = Path::new("/elsewhere");
+        cache.save(&root, "a", &[], &[]).unwrap();
+        cache.save(other, "a", &[], &[]).unwrap();
+
+        let mut forgotten = Vec::new();
+        let ids = ["a".to_owned(), "b".to_owned()];
+        delete_with(&root, &ids, &mut history, &cache, |r, id| {
+            // Secrets go before `.deadlock/`.
+            assert!(r.join(DIR).is_dir());
+            forgotten.push(id.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(forgotten, ["a", "a#ssh", "b", "b#ssh"]);
+        assert!(!root.join(DIR).exists());
+        assert_eq!(
+            fs::read_to_string(root.join("query.sql")).unwrap(),
+            "select 2;"
+        );
+        assert!(cache.load(&root, "a").unwrap().is_empty());
+        assert_eq!(cache.load(other, "a").unwrap().len(), 1);
+        // Deleting again finds nothing to remove.
+        delete_with(&root, &ids, &mut history, &cache, |_, _| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn delete_stops_at_the_first_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let mut history = History::open(&data.path().join("history.sqlite3")).unwrap();
+        let cache = SchemaCache::open(&data.path().join("cache.sqlite3")).unwrap();
+        let err = delete_with(
+            project.root(),
+            &["a".to_owned()],
+            &mut history,
+            &cache,
+            |_, _| Err(keyring::Error::NoStorageAccess("locked".into())),
+        );
+        assert!(matches!(err, Err(Error::Keychain(_))));
+        assert!(project.root().join(DIR).join(CONFIG).is_file());
+    }
+
+    #[test]
+    fn delete_without_a_keychain_service_still_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let mut history = History::open(&data.path().join("history.sqlite3")).unwrap();
+        let cache = SchemaCache::open(&data.path().join("cache.sqlite3")).unwrap();
+        let mut calls = 0;
+        delete_with(
+            project.root(),
+            &["a".to_owned(), "b".to_owned()],
+            &mut history,
+            &cache,
+            |_, _| {
+                calls += 1;
+                Err(keyring::Error::PlatformFailure("no secret service".into()))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(!project.root().join(DIR).exists());
     }
 
     #[test]

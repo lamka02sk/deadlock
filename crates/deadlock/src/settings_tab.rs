@@ -1,9 +1,11 @@
-//! The Settings tab from the design's `Settings` artboard: General (appearance, editor,
-//! results, safety and the first shortcuts) and Shortcuts (every binding). Each change
-//! is saved and applied at once.
+//! The Settings tab from the design's `Settings` artboard: Project (this project's name,
+//! color, pattern, connections and Delete project), General (appearance, editor, results, safety and the first
+//! shortcuts) and Shortcuts (every binding). Each change is saved and applied at once.
 
 use std::path::PathBuf;
 
+use deadlock_core::connection::{ConnectionConfig, Engine, Environment};
+use deadlock_core::project::Pattern;
 use deadlock_core::settings::{
     EDITOR_SIZES, Indent, KeywordCase, PAGE_SIZES, ResultsPlace, Settings, Theme, TxDefault,
     UI_SIZES,
@@ -15,19 +17,23 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    div, px, relative,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    WeakEntity, Window, div, px, relative, white,
 };
 
+use crate::assets::{Icon, icon};
 use crate::keymap::{self, ENTRIES, Entry};
 use crate::settings::{self, get};
+use crate::shell::{Shell, pattern_layer};
 use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
 use crate::ui::Clickable as _;
 
 type Choice = Entity<SelectState<Vec<SharedString>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
+pub(crate) enum Section {
+    /// This project's own settings, kept in its `project.toml`.
+    Project,
     General,
     Shortcuts,
 }
@@ -56,6 +62,12 @@ pub struct SettingsTab {
     focus: gpui_kit::FocusHandle,
     /// The project whose history Clear history deletes.
     root: PathBuf,
+    /// The window's shell, which holds the project's `project.toml`.
+    shell: WeakEntity<Shell>,
+    /// The project's display name, saved as it is typed.
+    name: Entity<InputState>,
+    /// The last Project change could not be written.
+    look_error: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -81,7 +93,15 @@ fn case_row(k: KeywordCase) -> usize {
 }
 
 impl SettingsTab {
-    pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `name` is the project's display name as saved; the tab is made inside an update
+    /// of `shell`, so it cannot read it there.
+    pub fn new(
+        root: PathBuf,
+        shell: WeakEntity<Shell>,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let s = get(cx).clone();
         let mut subs = Vec::new();
         let mut choice = |labels: Vec<SharedString>,
@@ -169,6 +189,20 @@ impl SettingsTab {
                 settings::update(cx, |s| s.null_text = text);
             }
         }));
+        let folder = deadlock_core::project::folder_name(&root);
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(folder)
+                .default_value(name.unwrap_or_default())
+        });
+        subs.push(
+            cx.subscribe_in(&name, window, |this, _, e: &InputEvent, window, cx| {
+                // Saved on every change: a window closed right after typing keeps it.
+                if matches!(e, InputEvent::Change) {
+                    this.set_look(|_, _| {}, window, cx);
+                }
+            }),
+        );
         Self {
             section: Section::General,
             ui_size,
@@ -179,9 +213,48 @@ impl SettingsTab {
             null_text,
             capture: None,
             root,
+            shell,
+            name,
+            look_error: None,
             focus: cx.focus_handle(),
             _subs: subs,
         }
+    }
+
+    pub(crate) fn show(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        cx.notify();
+    }
+
+    /// The project's name, color and pattern as saved.
+    fn look(&self, cx: &App) -> Option<(Option<String>, Option<String>, Pattern)> {
+        let config = &self.shell.upgrade()?.read(cx).project().config;
+        Some((config.name.clone(), config.color.clone(), config.pattern))
+    }
+
+    /// Saves the typed name with the saved color and pattern, `change` applied, through
+    /// the shell; a failed write is shown in the section. Nothing changed: no write.
+    fn set_look(
+        &mut self,
+        change: impl FnOnce(&mut Option<String>, &mut Pattern),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(shell), Some(saved)) = (self.shell.upgrade(), self.look(cx)) else {
+            return;
+        };
+        let (mut color, mut pattern) = (saved.1.clone(), saved.2);
+        change(&mut color, &mut pattern);
+        let typed = self.name.read(cx).value().trim().to_owned();
+        let typed = (!typed.is_empty()).then_some(typed);
+        if (&typed, &color, pattern) == (&saved.0, &saved.1, saved.2) {
+            return;
+        }
+        let saved = shell.update(cx, |s, cx| s.set_look(typed, color, pattern, window, cx));
+        self.look_error = saved
+            .err()
+            .map(|e| format!("The project settings cannot be saved: {e}"));
+        cx.notify();
     }
 
     /// Keeps the selects in step with settings changed elsewhere (another window).
@@ -284,10 +357,10 @@ impl SettingsTab {
     }
 
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self
-            .root
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = self.shell.upgrade().map_or_else(
+            || deadlock_core::project::folder_name(&self.root),
+            |s| s.read(cx).project().name(),
+        );
         let answer = crate::dialog::ask(
             window,
             cx,
@@ -476,7 +549,325 @@ fn checkbox(id: &'static str, on: bool, set: fn(&mut Settings, bool)) -> Checkbo
         })
 }
 
+/// A Pattern tile: the pattern in `color` over its tint, the label under it, ringed
+/// while chosen.
+fn pattern_tile(pattern: Pattern, color: gpui_kit::Hsla, on: bool, p: &Palette) -> gpui_kit::Div {
+    let preview = div()
+        .relative()
+        .w(px(64.))
+        .h(px(32.))
+        .overflow_hidden()
+        .rounded(RADIUS)
+        .border_2()
+        .border_color(if on { p.tx } else { p.line2 })
+        .bg(crate::color::over(color, crate::shell::BAND_ALPHA, p.panel))
+        .children(pattern_layer(pattern, color, p).map(|l| l.right_0()));
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(4.))
+        .text_size(small_size())
+        .text_color(if on { p.tx } else { p.tx2 })
+        .child(preview)
+        .child(pattern.label())
+}
+
+/// `user@host:port` as the Connections block shows it; Redis and a blank user leave
+/// the user out.
+fn short_address(c: &ConnectionConfig) -> String {
+    if c.engine == Engine::Redis || c.user.is_empty() {
+        format!("{}:{}", c.host, c.port)
+    } else {
+        format!("{}@{}:{}", c.user, c.host, c.port)
+    }
+}
+
+/// A grey tag beside a connection's name (`Read-only`).
+fn tag(text: &'static str, p: &Palette) -> gpui_kit::Div {
+    div()
+        .flex_none()
+        .px(px(6.))
+        .py(px(1.))
+        .border_1()
+        .border_color(p.line2)
+        .rounded(px(4.))
+        .text_size(small_size())
+        .text_color(p.tx2)
+        .child(text)
+}
+
 impl SettingsTab {
+    /// Runs `f` on the window's shell.
+    fn on_shell(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Shell, &mut Window, &mut Context<Shell>),
+    ) {
+        if let Some(shell) = self.shell.upgrade() {
+            shell.update(cx, |s, cx| f(s, window, cx));
+        }
+    }
+
+    /// The Connections block: New connection, then each connection in sidebar order
+    /// with Edit, Duplicate and Delete.
+    fn connections(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let p = *cx.global::<Palette>();
+        let Some(shell) = self.shell.upgrade() else {
+            return div();
+        };
+        let list = shell.read(cx).project().config.connections.clone();
+        let head = row(&p)
+            .child(label(
+                "Servers this project connects to",
+                Some("Saved in project.toml; passwords stay in the system keychain.".into()),
+                None,
+                &p,
+            ))
+            .child(
+                small_button("project-new-connection", "New connection".into(), &p).clickable(
+                    cx.listener(|this, _, window, cx| {
+                        this.on_shell(window, cx, |s, window, cx| s.new_connection(window, cx));
+                    }),
+                ),
+            );
+        let empty = list
+            .is_empty()
+            .then(|| row(&p).text_color(p.tx3).child("No connections yet."));
+        let rows = list.into_iter().enumerate().map(|(i, c)| {
+            let color = c.color.as_deref().and_then(crate::color::parse_hex);
+            let action =
+                |id: &'static str,
+                 text: &'static str,
+                 run: fn(&mut Shell, &str, &mut Window, &mut Context<Shell>)| {
+                    let conn = c.id.clone();
+                    small_button((id, i), text.into(), &p).clickable(cx.listener(
+                        move |this, _, window, cx| {
+                            let conn = conn.clone();
+                            this.on_shell(window, cx, move |s, window, cx| {
+                                run(s, &conn, window, cx)
+                            });
+                        },
+                    ))
+                };
+            row(&p)
+                .child(
+                    div()
+                        .flex_grow(1.)
+                        .flex_basis(px(260.))
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(crate::ui::dot(color.unwrap_or(p.tx3)))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(c.name.clone()),
+                                )
+                                .when(c.environment == Environment::Production, |d| {
+                                    d.child(crate::dialog::production_badge(&p))
+                                })
+                                .when(c.read_only, |d| d.child(tag("Read-only", &p))),
+                        )
+                        .child(
+                            div()
+                                .pl(px(14.))
+                                .text_size(small_size())
+                                .text_color(p.tx3)
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(format!("{} · {}", c.engine.label(), short_address(&c))),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .child(action("project-conn-edit", "Edit", |s, id, w, cx| {
+                            s.edit_connection(id, true, w, cx);
+                        }))
+                        .child(action(
+                            "project-conn-duplicate",
+                            "Duplicate",
+                            |s, id, w, cx| {
+                                s.edit_connection(id, false, w, cx);
+                            },
+                        ))
+                        .child(
+                            action("project-conn-delete", "Delete", |s, id, w, cx| {
+                                s.delete_connection(id, w, cx);
+                            })
+                            .text_color(p.danger),
+                        ),
+                )
+        });
+        let mut all: Vec<gpui_kit::Div> = std::iter::once(head).chain(empty).chain(rows).collect();
+        if let Some(last) = all.pop() {
+            all.push(last.border_b_0());
+        }
+        fieldset(
+            "Connections",
+            all.into_iter().map(IntoElement::into_any_element).collect(),
+        )
+    }
+
+    /// The Danger zone: Delete project….
+    fn danger_zone(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let p = *cx.global::<Palette>();
+        fieldset(
+            "Danger zone",
+            vec![
+                row(&p)
+                    .border_b_0()
+                    .child(label(
+                        "Delete project",
+                        Some(
+                            "Removes Deadlock's data for this folder: connections, saved \
+                             passwords, query history, schema cache, diagrams and consoles. \
+                             The folder and your files stay."
+                                .into(),
+                        ),
+                        None,
+                        &p,
+                    ))
+                    .child(
+                        small_button("project-delete", "Delete project…".into(), &p)
+                            .text_color(p.danger)
+                            .clickable(cx.listener(|this, _, window, cx| {
+                                this.on_shell(window, cx, |s, window, cx| {
+                                    s.delete_project(window, cx);
+                                });
+                            })),
+                    )
+                    .into_any_element(),
+            ],
+        )
+    }
+
+    /// The Project section: name, color and pattern, connections, Delete project.
+    fn project(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let p = *cx.global::<Palette>();
+        let Some((_, color, pattern)) = self.look(cx) else {
+            return Vec::new();
+        };
+        let swatches = std::iter::once(("None", None)).chain(
+            crate::color::PALETTE
+                .iter()
+                .map(|(name, hex)| (*name, Some(*hex))),
+        );
+        let swatches =
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .children(swatches.map(|(label, hex)| {
+                    let on = color.as_deref().map(str::to_lowercase).as_deref() == hex;
+                    let fill = hex.and_then(crate::color::parse_hex);
+                    div()
+                        .id(SharedString::from(format!("project-color-{label}")))
+                        .size(px(24.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_2()
+                        .border_color(if on { p.tx } else { p.line2 })
+                        .when(hex.is_none(), |d| {
+                            d.child(icon(Icon::Close, p.tx3).size(px(12.)))
+                        })
+                        .when_some(fill, |d, c| {
+                            d.bg(c)
+                                .when(on, |d| d.child(icon(Icon::Commit, white()).size(px(12.))))
+                        })
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                        })
+                        .clickable(cx.listener(move |this, _, window, cx| {
+                            this.set_look(|c, _| *c = hex.map(str::to_owned), window, cx);
+                        }))
+                }));
+        // Without a color the tiles show the pattern in grey; it shows once a color is set.
+        let tint = color
+            .as_deref()
+            .and_then(crate::color::parse_hex)
+            .unwrap_or(p.tx3);
+        let tiles = div().flex().gap(px(8.)).children(Pattern::ALL.map(|pat| {
+            div()
+                .id(SharedString::from(format!(
+                    "project-pattern-{}",
+                    pat.label()
+                )))
+                .child(pattern_tile(pat, tint, pat == pattern, &p))
+                .clickable(cx.listener(move |this, _, window, cx| {
+                    this.set_look(|_, p| *p = pat, window, cx);
+                }))
+        }));
+        let look = fieldset(
+            "Name and color",
+            vec![
+                row(&p)
+                    .child(label(
+                        "Name",
+                        Some("Shown in the title bar, the window title and recent projects. The folder keeps its name.".into()),
+                        None,
+                        &p,
+                    ))
+                    .child(div().w(px(240.)).child(
+                        gpui_kit::Styled::h(Input::new(&self.name), row_height()),
+                    ))
+                    .into_any_element(),
+                row(&p)
+                    .child(label(
+                        "Color",
+                        Some("Tints the title bar, so this project's windows stand out.".into()),
+                        None,
+                        &p,
+                    ))
+                    .child(swatches)
+                    .into_any_element(),
+                row(&p)
+                    .border_b_0()
+                    .child(label(
+                        "Pattern",
+                        Some(if color.is_some() {
+                            "Laid over the color at the left of the title bar.".into()
+                        } else {
+                            "Shows once the project has a color.".into()
+                        }),
+                        None,
+                        &p,
+                    ))
+                    .child(tiles)
+                    .into_any_element(),
+            ],
+        );
+        let error = self
+            .look_error
+            .clone()
+            .map(|e| crate::ui::warning_band(div().child(e), &p).into_any_element());
+        error
+            .into_iter()
+            .chain([
+                look.into_any_element(),
+                self.connections(cx).into_any_element(),
+                self.danger_zone(cx).into_any_element(),
+            ])
+            .collect()
+    }
+
     fn shortcut_row(&self, e: &'static Entry, cx: &mut Context<Self>) -> AnyElement {
         let p = *cx.global::<Palette>();
         let keys = keymap::keys(e.id, cx);
@@ -808,8 +1199,13 @@ impl Render for SettingsTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync(window, cx);
         let p = *cx.global::<Palette>();
+        let project_name = SharedString::from(
+            self.shell
+                .upgrade()
+                .map_or_else(String::new, |s| s.read(cx).project().name()),
+        );
         let nav_item =
-            |id: &'static str, label: &'static str, s: Section, cx: &mut Context<Self>| {
+            |id: &'static str, label: SharedString, s: Section, cx: &mut Context<Self>| {
                 let on = self.section == s;
                 div()
                     .id(id)
@@ -842,14 +1238,20 @@ impl Render for SettingsTab {
             .border_r_1()
             .border_color(p.line)
             .child(nav_item(
+                "settings-project",
+                project_name.clone(),
+                Section::Project,
+                cx,
+            ))
+            .child(nav_item(
                 "settings-general",
-                "General",
+                "General".into(),
                 Section::General,
                 cx,
             ))
             .child(nav_item(
                 "settings-shortcuts",
-                "Shortcuts",
+                "Shortcuts".into(),
                 Section::Shortcuts,
                 cx,
             ))
@@ -860,11 +1262,15 @@ impl Render for SettingsTab {
                     .text_size(small_size())
                     .text_color(p.tx3)
                     .line_height(relative(1.5))
-                    .child(
-                        "Settings apply to every project on this computer and take effect at once.",
-                    ),
+                    .child(if self.section == Section::Project {
+                        "Project settings are saved in the folder's .deadlock/project.toml, \
+                         for everyone who opens it."
+                    } else {
+                        "Settings apply to every project on this computer and take effect at once."
+                    }),
             );
         let body = match self.section {
+            Section::Project => self.project(cx),
             Section::General => self.general(cx),
             Section::Shortcuts => self.shortcuts(cx),
         };
@@ -921,8 +1327,9 @@ impl Render for SettingsTab {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .line_height(relative(1.2))
                                         .child(match self.section {
-                                            Section::General => "Settings",
-                                            Section::Shortcuts => "Shortcuts",
+                                            Section::Project => project_name,
+                                            Section::General => "Settings".into(),
+                                            Section::Shortcuts => "Shortcuts".into(),
                                         }),
                                 )
                                 .children(error)
@@ -930,5 +1337,30 @@ impl Render for SettingsTab {
                         ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses_leave_out_a_redis_or_blank_user() {
+        let mysql = ConnectionConfig {
+            user: "app".into(),
+            host: "db.local".into(),
+            ..ConnectionConfig::new(Engine::Mysql)
+        };
+        assert_eq!(short_address(&mysql), "app@db.local:3306");
+        let anonymous = ConnectionConfig {
+            user: String::new(),
+            ..mysql
+        };
+        assert_eq!(short_address(&anonymous), "db.local:3306");
+        let redis = ConnectionConfig {
+            user: "default".into(),
+            ..ConnectionConfig::new(Engine::Redis)
+        };
+        assert_eq!(short_address(&redis), "localhost:6379");
     }
 }

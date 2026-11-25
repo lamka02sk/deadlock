@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, NaiveDate};
+use deadlock_core::recent::RecentProject;
 use gpui_kit::{
     Context, Div, FocusHandle, Font, FontWeight, InteractiveElement, IntoElement, ParentElement,
     Render, Stateful, StatefulInteractiveElement, Styled, StyledText, TextRun, Window, div, img,
@@ -44,7 +45,7 @@ impl Render for Welcome {
             .enumerate()
             .map(|(ix, e)| {
                 let open = registry.projects.contains_key(&e.path);
-                recent_row(ix, &e.path, open, day_label(e.opened_at, today), &p)
+                recent_row(ix, e, open, day_label(e.opened_at, today), &p)
             })
             .collect();
 
@@ -134,8 +135,11 @@ impl Render for Welcome {
     }
 }
 
-fn recent_row(ix: usize, path: &Path, open: bool, day: String, p: &Palette) -> Stateful<Div> {
+/// A recent project: its folder icon in the project color, its name and its path.
+fn recent_row(ix: usize, e: &RecentProject, open: bool, day: String, p: &Palette) -> Stateful<Div> {
+    let path = &e.path;
     let target = path.to_owned();
+    let tint = e.color.as_deref().and_then(crate::color::parse_hex);
     let trailing = if open {
         div()
             .flex()
@@ -161,12 +165,12 @@ fn recent_row(ix: usize, path: &Path, open: bool, day: String, p: &Palette) -> S
         .whitespace_nowrap()
         .hover(|s| s.bg(p.hover))
         .clickable(move |_, _, cx| open_from_welcome(&target, cx))
-        .child(icon(Icon::Folder, p.tx3))
+        .child(icon(Icon::Folder, tint.unwrap_or(p.tx3)))
         .child(
             div()
                 .flex_none()
                 .font_weight(FontWeight::MEDIUM)
-                .child(deadlock_core::project::folder_name(path)),
+                .child(e.label()),
         )
         .child(
             div()

@@ -14,6 +14,19 @@ pub struct RecentProject {
     pub path: PathBuf,
     /// Unix time in seconds.
     pub opened_at: u64,
+    /// The project's display name when it has one, copied from its `project.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The project's color (`#rrggbb`), copied from its `project.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+impl RecentProject {
+    /// The display name, or the folder's name when it has none.
+    pub fn label(&self) -> String {
+        crate::project::display_name(self.name.as_deref(), &self.path)
+    }
 }
 
 /// Most recent first, unique by canonical path.
@@ -61,12 +74,38 @@ impl RecentProjects {
         write_json(file, self)
     }
 
-    /// Moves `path` to the top, adding it if new.
+    /// Moves `path` to the top, adding it if new. A known entry keeps its name and color.
     pub fn touch(&mut self, path: &Path, opened_at: u64) {
         let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-        self.entries.retain(|e| e.path != path);
-        self.entries.insert(0, RecentProject { path, opened_at });
+        let entry = match self.entries.iter().position(|e| e.path == path) {
+            Some(i) => RecentProject {
+                opened_at,
+                ..self.entries.remove(i)
+            },
+            None => RecentProject {
+                path,
+                opened_at,
+                name: None,
+                color: None,
+            },
+        };
+        self.entries.insert(0, entry);
         self.entries.truncate(MAX);
+    }
+
+    /// Sets the name and color shown for `path`; nothing when it is not in the list.
+    pub fn set_look(&mut self, path: &Path, name: Option<String>, color: Option<String>) {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path) {
+            entry.name = name;
+            entry.color = color;
+        }
+    }
+
+    /// Drops `path` from the list; nothing when it is not in it.
+    pub fn remove(&mut self, path: &Path) {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        self.entries.retain(|e| e.path != path);
     }
 
     pub fn entries(&self) -> &[RecentProject] {
@@ -77,6 +116,7 @@ impl RecentProjects {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::folder_name;
 
     #[test]
     fn touch_orders_most_recent_first_and_dedupes() {
@@ -126,6 +166,8 @@ mod tests {
         list.entries.push(RecentProject {
             path: kept.join("."),
             opened_at: 0,
+            name: None,
+            color: None,
         });
         list.save(&file).unwrap();
         fs::remove_dir(&gone).unwrap();
@@ -135,8 +177,48 @@ mod tests {
             loaded.entries(),
             [RecentProject {
                 path: fs::canonicalize(&kept).unwrap(),
-                opened_at: 1
+                opened_at: 1,
+                name: None,
+                color: None,
             }]
+        );
+    }
+
+    #[test]
+    fn look_survives_touch_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("recent.json");
+        let canon = fs::canonicalize(dir.path()).unwrap();
+        // A file from before names and colors.
+        let old = serde_json::json!({ "entries": [{ "path": canon, "opened_at": 5 }] });
+        fs::write(&file, old.to_string()).unwrap();
+        let mut list = RecentProjects::load(&file).unwrap();
+        assert_eq!(list.entries()[0].name, None);
+        assert_eq!(list.entries()[0].label(), folder_name(&canon));
+        assert_eq!(list.entries()[0].opened_at, 5);
+
+        list.set_look(dir.path(), Some("Shop".into()), Some("#e5484d".into()));
+        list.touch(dir.path(), 6);
+        list.save(&file).unwrap();
+        let entry = &RecentProjects::load(&file).unwrap().entries[0];
+        assert_eq!(entry.name.as_deref(), Some("Shop"));
+        assert_eq!(entry.color.as_deref(), Some("#e5484d"));
+        assert_eq!(entry.opened_at, 6);
+        assert_eq!(entry.label(), "Shop");
+    }
+
+    #[test]
+    fn remove_drops_only_that_folder() {
+        let mut list = RecentProjects::default();
+        for i in 0..3 {
+            list.touch(Path::new(&format!("/nonexistent/{i}")), i);
+        }
+        list.remove(Path::new("/nonexistent/1"));
+        list.remove(Path::new("/nonexistent/9"));
+        let paths: Vec<_> = list.entries().iter().map(|e| e.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [Path::new("/nonexistent/2"), Path::new("/nonexistent/0")]
         );
     }
 

@@ -79,7 +79,7 @@ impl Shell {
         .detach();
     }
 
-    fn remove_config(&mut self, i: usize, cx: &mut Context<Self>) {
+    pub(super) fn remove_config(&mut self, i: usize, cx: &mut Context<Self>) {
         drop(self.configs.remove(i));
         self.front = match self.front {
             Front::Config(f) if f == i => {

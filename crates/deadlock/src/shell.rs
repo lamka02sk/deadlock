@@ -2,6 +2,7 @@
 
 mod complete;
 mod config;
+mod delete;
 mod diagram;
 mod edit;
 mod everywhere;
@@ -22,13 +23,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deadlock_core::connection::{ConnectionConfig, Environment, keychain, new_id};
+use deadlock_core::connection::keychain::{self, ssh_entry};
+use deadlock_core::connection::{ConnectionConfig, Environment, new_id};
 use deadlock_core::driver::{Driver, Link};
 use deadlock_core::ssh::{SshAuth, TunnelError};
 
 use crate::connection_form::{Failure, ask_trust, try_connect};
 use crate::ui::Clickable as _;
-use deadlock_core::project::Project;
+use deadlock_core::project::{Pattern, Project};
 use deadlock_core::schema::{Load, NodeId, Row, Tree};
 use gpui_kit::component::Selectable;
 use gpui_kit::component::checkbox::Checkbox;
@@ -37,10 +39,11 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Pixels, Render, RenderOnce, SharedString,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, FontWeight,
+    Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Render, RenderOnce, SharedString,
     Stateful, StatefulInteractiveElement, Styled, Subscription, Task, TextRun,
-    UniformListScrollHandle, Window, actions, black, div, font, hsla, img, px,
+    UniformListScrollHandle, Window, actions, black, canvas, checkerboard, div, fill, font, hsla,
+    img, linear_color_stop, linear_gradient, pattern_slash, point, px, relative, size,
 };
 
 pub(crate) use sidebar::Cache;
@@ -112,6 +115,15 @@ enum Conn {
 /// Bounds are written this long after the last move or resize.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 
+/// What the window does once its close checks pass.
+enum CloseThen {
+    Close,
+    /// Shows this project in the window instead.
+    Switch(PathBuf),
+    /// Deletes the project's Deadlock data, then closes.
+    Delete,
+}
+
 /// What the main area shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Front {
@@ -141,8 +153,10 @@ pub struct Shell {
     focus: FocusHandle,
     save: Option<Task<()>>,
     conns: HashMap<String, Conn>,
-    /// The project to switch this window to once the close checks pass.
-    switch_to: Option<std::path::PathBuf>,
+    /// What happens once the close checks pass.
+    close_then: CloseThen,
+    /// Delete project is removing `.deadlock/`: nothing writes into it any more.
+    deleted: bool,
     /// Passwords typed this session, for connections that keep none in the keychain.
     passwords: HashMap<String, String>,
     /// The New connection tab, while open.
@@ -217,6 +231,9 @@ impl Shell {
         });
         // Closing the window drops the view; flush a save that is still waiting.
         cx.on_release(|this, cx| {
+            if this.deleted {
+                return;
+            }
             this.flush_consoles(cx);
             this.save_now(cx);
             // Drivers close their sockets on the runtime, not the UI thread.
@@ -246,7 +263,8 @@ impl Shell {
             focus,
             save: None,
             conns: HashMap::new(),
-            switch_to: None,
+            close_then: CloseThen::Close,
+            deleted: false,
             passwords: HashMap::new(),
             form: None,
             tabs: Vec::new(),
@@ -308,15 +326,17 @@ impl Shell {
 
     /// The close button and Quit: closes the window rather than switching it.
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.switch_to = None;
+        self.close_then = CloseThen::Close;
         self.should_close(window, cx)
     }
 
-    /// Ends the close checks: switches the window to the chosen project, or closes it.
+    /// Ends the close checks: switches the window to the chosen project, deletes the
+    /// project, or closes the window.
     fn finish_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.switch_to.take() else {
-            window.remove_window();
-            return;
+        let path = match std::mem::replace(&mut self.close_then, CloseThen::Close) {
+            CloseThen::Close => return window.remove_window(),
+            CloseThen::Delete => return self.finish_delete(cx),
+            CloseThen::Switch(path) => path,
         };
         let handle = self.window;
         // Deferred: replacing the window's root cannot happen inside its own update.
@@ -328,9 +348,9 @@ impl Shell {
     }
 
     /// Opens a project picked in the project menu: in this window, or in a new one.
-    fn pick_project(
+    pub(crate) fn pick_project(
         &mut self,
-        path: std::path::PathBuf,
+        path: PathBuf,
         new_window: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -350,7 +370,7 @@ impl Shell {
             });
             return;
         }
-        self.switch_to = Some(path);
+        self.close_then = CloseThen::Switch(path);
         if self.should_close(window, cx) {
             self.finish_close(window, cx);
         }
@@ -480,12 +500,12 @@ impl Shell {
     }
 
     /// Opens the New connection tab, or keeps the one that is open.
-    fn new_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_form(None, false, window, cx);
     }
 
     /// Opens the form on saved connection `id`: an edit, or a new copy (`editing` off).
-    pub(super) fn edit_connection(
+    pub(crate) fn edit_connection(
         &mut self,
         id: &str,
         editing: bool,
@@ -761,6 +781,13 @@ impl Shell {
         result: Result<(Arc<dyn Driver>, String), String>,
         cx: &mut Context<Self>,
     ) {
+        if self.config(&id).is_none() {
+            // Deleted while it connected.
+            if let Ok((driver, _)) = result {
+                drop(cx.global::<Db>().0.spawn(async move { drop(driver) }));
+            }
+            return;
+        }
         let keep = self.prompted.remove(&id);
         match result {
             Ok((driver, password)) => {
@@ -948,6 +975,9 @@ impl Shell {
 
     fn save_now(&mut self, cx: &App) {
         self.save = None;
+        if self.deleted {
+            return;
+        }
         self.sync_tabs(cx);
         if let Err(e) = self.project.save_state() {
             eprintln!("deadlock: {e}");
@@ -1217,11 +1247,6 @@ fn password_prompt(shell: &Shell, prompt: &Prompt, cx: &mut Context<Shell>) -> i
         )
 }
 
-/// The keychain entry of a connection's SSH password or passphrase.
-fn ssh_entry(id: &str) -> String {
-    format!("{id}#ssh")
-}
-
 fn separator(p: &Palette) -> impl IntoElement {
     div().w(px(1.)).h(px(20.)).mx(px(4.)).flex_none().bg(p.line)
 }
@@ -1298,21 +1323,26 @@ fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> 
         ));
 
     let root = shell.project.root();
-    let items: Vec<(PathBuf, bool)> = cx
+    let items: Vec<(PathBuf, String, Option<Hsla>, bool)> = cx
         .global::<crate::app::Registry>()
         .recent
         .entries()
         .iter()
-        .map(|e| (e.path.clone(), e.path == root))
+        .map(|e| {
+            let color = e.color.as_deref().and_then(crate::color::parse_hex);
+            (e.path.clone(), e.label(), color, e.path == root)
+        })
         .collect();
-    let new_window = format!(
-        "Open in a new window ({}+click)",
-        if cfg!(target_os = "macos") {
-            "Cmd"
-        } else {
-            "Ctrl"
-        }
-    );
+    let modifier = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    };
+    let new_window = format!("Open in a new window ({modifier}+click)");
+    let new_window_tip = SharedString::from(format!(
+        "Pick or make a folder. {modifier}+click opens it in a new window."
+    ));
+    let window_handle = shell.window;
     let this = cx.entity().downgrade();
     Popover::new("switcher")
         .p(px(4.))
@@ -1324,47 +1354,85 @@ fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> 
         }))
         .trigger(Trigger(trigger, shell.switcher_open, "Switch project"))
         .content(move |_, _, cx| {
-            let rows = items.iter().enumerate().map(|(ix, (path, current))| {
-                let name = deadlock_core::project::folder_name(path);
-                let place = crate::welcome::tilde(path);
-                let (this, pick) = (this.clone(), path.clone());
-                let (that, path) = (this.clone(), path.clone());
-                let open_new = icon_button(
-                    "new-window",
-                    Icon::Export,
-                    None,
-                    Kind::Ghost,
-                    true,
-                    new_window.clone(),
-                    cx,
-                )
-                .clickable(move |_, window, cx| {
-                    cx.stop_propagation();
-                    let _ = that.update(cx, |this, cx| {
-                        this.pick_project(path.clone(), true, window, cx);
+            let rows = items
+                .iter()
+                .enumerate()
+                .map(|(ix, (path, name, color, current))| {
+                    let place = crate::welcome::tilde(path);
+                    let (this, pick) = (this.clone(), path.clone());
+                    let (that, path) = (this.clone(), path.clone());
+                    let open_new = icon_button(
+                        "new-window",
+                        Icon::Export,
+                        None,
+                        Kind::Ghost,
+                        true,
+                        new_window.clone(),
+                        cx,
+                    )
+                    .clickable(move |_, window, cx| {
+                        cx.stop_propagation();
+                        let _ = that.update(cx, |this, cx| {
+                            this.pick_project(path.clone(), true, window, cx);
+                        });
                     });
+                    div()
+                        .id(("switch", ix))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(row_height())
+                        .pl(px(8.))
+                        .rounded(RADIUS)
+                        .whitespace_nowrap()
+                        .when(*current, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
+                        .when(!*current, |d| d.hover(|s| s.bg(p.hover)))
+                        .clickable(move |e, window, cx| {
+                            let new = e.modifiers().control || e.modifiers().platform;
+                            let _ = this.update(cx, |this, cx| {
+                                this.pick_project(pick.clone(), new, window, cx);
+                            });
+                        })
+                        // Every row keeps the dot's place, so the names line up.
+                        .child(dot(color.unwrap_or_else(gpui_kit::transparent_black)))
+                        .child(SharedString::from(name.clone()))
+                        .child(type_label(&place, &p))
+                        .child(open_new)
                 });
+            let action = |id: &'static str, icon: Icon, label: &'static str| {
                 div()
-                    .id(("switch", ix))
+                    .id(id)
                     .flex()
                     .items_center()
                     .gap(px(6.))
                     .h(row_height())
-                    .pl(px(8.))
+                    .px(px(8.))
                     .rounded(RADIUS)
                     .whitespace_nowrap()
-                    .when(*current, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
-                    .when(!*current, |d| d.hover(|s| s.bg(p.hover)))
-                    .clickable(move |e, window, cx| {
-                        let new = e.modifiers().control || e.modifiers().platform;
-                        let _ = this.update(cx, |this, cx| {
-                            this.pick_project(pick.clone(), new, window, cx);
-                        });
-                    })
-                    .child(SharedString::from(name))
-                    .child(type_label(&place, &p))
-                    .child(open_new)
-            });
+                    .hover(|s| s.bg(p.hover))
+                    .child(crate::assets::icon(icon, p.tx2))
+                    .child(label)
+            };
+            let (that, handle) = (this.clone(), window_handle);
+            let tip = new_window_tip.clone();
+            let new_project = action("new-project", Icon::Plus, "New project…")
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .clickable(move |e, _, cx| {
+                    let new = e.modifiers().control || e.modifiers().platform;
+                    let _ = that.update(cx, |this, cx| {
+                        this.switcher_open = false;
+                        cx.notify();
+                    });
+                    crate::app::new_project(handle, new, cx);
+                });
+            let that = this.clone();
+            let settings = action("project-settings", Icon::Config, "Project settings…").clickable(
+                move |_, window, cx| {
+                    let _ = that.update(cx, |this, cx| this.open_project_settings(window, cx));
+                },
+            );
             div()
                 .flex()
                 .flex_col()
@@ -1378,6 +1446,9 @@ fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> 
                     )
                 })
                 .children(rows)
+                .child(div().my(px(3.)).h(px(1.)).bg(p.line))
+                .child(new_project)
+                .child(settings)
         })
 }
 
@@ -1725,7 +1796,10 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
         Item::TxMode => tx_menu(shell, has_tab && sql && !running, tx_mode, cx).into_any_element(),
     });
     let children: Vec<_> = children.collect();
+    let config = &shell.project.config;
+    let look = config.color.as_deref().and_then(crate::color::parse_hex);
     div()
+        .relative()
         .flex()
         .flex_none()
         .items_center()
@@ -1736,6 +1810,7 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
         .bg(p.panel)
         .border_b_1()
         .border_color(p.line)
+        .when_some(look, |d, c| title_band(d, c, config.pattern, &p))
         .child(
             div()
                 .id("app-logo")
@@ -1751,6 +1826,77 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
         .child(switcher(shell, cx))
         .child(separator(&p))
         .children(children)
+}
+
+/// The project color as a gradient from the left edge, with `pattern` over its left
+/// part fading out. The toolbar's items, added after, paint on top.
+fn title_band(d: Div, c: Hsla, pattern: Pattern, p: &Palette) -> Div {
+    let reach = 0.4;
+    // The gradient's own tint where the pattern ends, so the fade lands on it.
+    let end = crate::color::over(c, BAND_ALPHA * (1. - reach / BAND_REACH), p.panel);
+    d.bg(linear_gradient(
+        90.,
+        linear_color_stop(crate::color::over(c, BAND_ALPHA, p.panel), 0.),
+        linear_color_stop(p.panel, BAND_REACH),
+    ))
+    .when_some(pattern_layer(pattern, c, p), |d, layer| {
+        d.child(layer.w(relative(reach))).child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(relative(reach))
+                .bg(linear_gradient(
+                    90.,
+                    linear_color_stop(end.alpha(0.), 0.),
+                    linear_color_stop(end, 1.),
+                )),
+        )
+    })
+}
+
+/// How strong the title bar's color starts at the left edge, and where it has faded out.
+pub(crate) const BAND_ALPHA: f32 = 0.22;
+const BAND_REACH: f32 = 0.55;
+
+/// `pattern` in the project color `c`, as an absolute layer over the left of its parent;
+/// the caller sets its width. `None` for [`Pattern::None`].
+pub(crate) fn pattern_layer(pattern: Pattern, c: Hsla, p: &Palette) -> Option<Div> {
+    let layer = div().absolute().top_0().bottom_0().left_0();
+    // Dark panels need more of the color for the pattern to show.
+    let strength = if p.panel.l < 0.5 { 1.6 } else { 1. };
+    Some(match pattern {
+        Pattern::None => return None,
+        Pattern::Stripes => layer.bg(pattern_slash(c.alpha(0.18 * strength), 1., 6.)),
+        Pattern::Checks => layer.bg(checkerboard(c.alpha(0.10 * strength), 6.)),
+        Pattern::Dots => {
+            let dot = c.alpha(0.26 * strength);
+            layer.child(
+                canvas(
+                    |_, _, _| {},
+                    move |b, _, window, _| {
+                        // 2 px round dots on an 8 px grid; GPUI ships no dot pattern.
+                        let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+                        let mut y = 3.;
+                        while y < h {
+                            let mut x = 3.;
+                            while x < w {
+                                let at = b.origin + point(px(x), px(y));
+                                window.paint_quad(
+                                    fill(Bounds::new(at, size(px(2.), px(2.))), dot)
+                                        .corner_radii(px(1.)),
+                                );
+                                x += 8.;
+                            }
+                            y += 8.;
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    })
 }
 
 /// The Export button and its menu, for the front tab's table or result.
