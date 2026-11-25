@@ -467,18 +467,33 @@ impl Shell {
             self.open_key(&id, window, cx);
             return true;
         }
-        // Procedures, triggers, events…: the object editor. Views keep their data tab.
-        if row.kind == RowKind::Node(NodeKind::Routine)
-            && self.flavor(&row.id[0]).is_some()
-            && let Some(object) = deadlock_core::objects::ObjectRef::from_node(&row.id)
+        let RowKind::Node(kind) = row.kind else {
+            return false;
+        };
+        let id = row.id.clone();
+        self.open_node(&id, kind, window, cx)
+    }
+
+    /// Opens the tree object `id` (`[conn, schema, group, name]`, or a trigger under
+    /// its table) of `kind`: procedures, triggers, events… in the object editor;
+    /// tables and views (which keep their data tab) on Data. Returns whether it was
+    /// one of those.
+    pub(super) fn open_node(
+        &mut self,
+        id: &[String],
+        kind: NodeKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if kind == NodeKind::Routine
+            && self.flavor(&id[0]).is_some()
+            && let Some(object) = deadlock_core::objects::ObjectRef::from_node(id)
         {
-            let conn = row.id[0].clone();
+            let conn = id[0].clone();
             self.open_object(&conn, object, None, window, cx);
             return true;
         }
-        let (RowKind::Node(NodeKind::Table | NodeKind::View), [conn, db, _, table]) =
-            (row.kind, row.id.as_slice())
-        else {
+        let (NodeKind::Table | NodeKind::View, [conn, db, _, table]) = (kind, id) else {
             return false;
         };
         let (conn, table) = (

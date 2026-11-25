@@ -381,13 +381,17 @@ impl Shell {
         if self.may_close {
             return true;
         }
+        let what = match self.close_then {
+            CloseThen::Switch(_) => "switching projects",
+            CloseThen::Close | CloseThen::Delete => "closing the window",
+        };
         let tabs: Vec<_> = self.tabs.iter().map(|(t, _)| t.clone()).collect();
         if tabs.iter().any(|t| t.read(cx).pending_changes(cx) > 0)
             && !std::mem::take(&mut self.pending_settled)
         {
             self.settle_pending(
                 tabs,
-                "Submit the pending changes before closing the window?".into(),
+                format!("Submit the pending changes before {what}?"),
                 cx,
                 |this, window, cx| {
                     this.pending_settled = true;
@@ -403,7 +407,7 @@ impl Shell {
             let tabs = self.tabs.iter().map(|(t, _)| t.clone()).collect();
             self.settle(
                 tabs,
-                "Commit or roll back before closing the window?".into(),
+                format!("Commit or roll back before {what}?"),
                 cx,
                 |this, window, cx| {
                     this.tx_settled = true;

@@ -2,7 +2,6 @@
 //! runs statements on its own server session, so a long query never blocks the schema
 //! tree, and shows their results in a resizable panel under the editor.
 
-use std::cell::Cell;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,10 +22,9 @@ use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Context, Entity, EventEmitter,
-    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, canvas,
-    div, px,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, div, px,
 };
 
 mod binds;
@@ -201,8 +199,6 @@ pub struct QueryTab {
     took: Option<Duration>,
     running_mark: RangeDecorationCollection,
     _gutter: GutterDecorationCollection,
-    /// The editor area in window coordinates, from the last paint.
-    area: Rc<Cell<Bounds<Pixels>>>,
     window: AnyWindowHandle,
     quiet: Option<Task<()>>,
     grid_subs: Vec<Subscription>,
@@ -284,8 +280,15 @@ impl QueryTab {
             }
             cx.emit(TabEvent::Changed);
         });
-        // The gutter icons follow the editor's scrolling and layout.
+        // What the tab shows from the editor (the caret's place) follows it.
         let observe = cx.observe(&editor, |_, _, cx| cx.notify());
+        let tab = cx.entity().downgrade();
+        editor.update(cx, |e, cx| {
+            e.set_gutter_widgets(
+                Some(Rc::new(move |lines, _, cx| run_icons(&tab, lines, cx))),
+                cx,
+            );
+        });
         let mut this = Self {
             kind,
             untitled: 0,
@@ -306,7 +309,6 @@ impl QueryTab {
             took: None,
             running_mark,
             _gutter: gutter,
-            area: Rc::default(),
             window: window.window_handle(),
             quiet: None,
             grid_subs: Vec::new(),
@@ -348,6 +350,28 @@ impl QueryTab {
     /// A statement or an export runs on the tab's session.
     pub fn is_running(&self) -> bool {
         self.running.is_some() || self.exporting()
+    }
+
+    /// The session may hold an open transaction: it had one when it last answered,
+    /// or a statement runs in Manual mode.
+    pub fn may_hold_tx(&self) -> bool {
+        self.tx_open || (self.tx_mode == TxMode::Manual && self.is_running())
+    }
+
+    /// The transaction check got no answer in time; the caller went on as if
+    /// nothing was left to commit. Says so in Messages.
+    pub fn tx_unanswered(&mut self, wait: Duration, cx: &mut Context<Self>) {
+        self.note(
+            "Transaction",
+            format!(
+                "The session did not answer the transaction check within {} s (a statement \
+                 is running, or the server does not respond). It had no open transaction \
+                 when it last answered, so nothing was committed or rolled back.",
+                wait.as_secs()
+            ),
+            false,
+        );
+        cx.notify();
     }
 
     pub fn needs_session(&self) -> bool {
@@ -1878,37 +1902,31 @@ impl Render for QueryTab {
     }
 }
 
-impl QueryTab {
-    fn render_editor(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
-        let p = *cx.global::<Palette>();
-        let area = Rc::clone(&self.area);
-        let origin = area.get().origin;
-        let editor = self.editor.read(cx);
-        let visible = editor.visible_row_range().unwrap_or(0..0);
-        let icons: Vec<_> = if self.running.is_some() {
-            Vec::new()
-        } else {
-            self.statements
-                .iter()
-                .filter(|(_, row)| visible.contains(row))
-                .filter_map(|(r, _)| {
-                    let b = editor.range_to_bounds(&(r.start..r.start))?;
-                    Some((r.start, b.top() - origin.y, b.size.height))
-                })
-                .collect()
-        };
-        let icons = icons.into_iter().map(|(start, top, h)| {
-            div()
+/// The ▶ of each statement starting on `lines`, drawn by the editor in its gutter in
+/// the same frame as the text. None while the tab runs.
+fn run_icons(
+    tab: &WeakEntity<QueryTab>,
+    lines: Range<usize>,
+    cx: &mut App,
+) -> Vec<(usize, gpui_kit::AnyElement)> {
+    let Some(entity) = tab.upgrade() else {
+        return Vec::new();
+    };
+    let t = entity.read(cx);
+    if t.running.is_some() {
+        return Vec::new();
+    }
+    let p = *cx.global::<Palette>();
+    t.statements
+        .iter()
+        .filter(|(_, row)| lines.contains(row))
+        .map(|(r, row)| {
+            let (start, row, tab) = (r.start, *row, tab.clone());
+            let icon = div()
                 .id(("run-statement", start))
-                .absolute()
-                .left(px(2.))
-                .top(top)
-                .h(h)
+                .ml(px(2.))
                 .w(px(16.))
+                .h_full()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1917,8 +1935,22 @@ impl QueryTab {
                     gpui_kit::component::tooltip::Tooltip::new("Run this statement")
                         .build(window, cx)
                 })
-                .clickable(cx.listener(move |this, _, _, cx| this.run(Scope::At(start), cx)))
-        });
+                .clickable(move |_, _, cx| {
+                    let _ = tab.update(cx, |t, cx| t.run(Scope::At(start), cx));
+                })
+                .into_any_element();
+            (row, icon)
+        })
+        .collect()
+}
+
+impl QueryTab {
+    fn render_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let p = *cx.global::<Palette>();
         let editor_area = div()
             .relative()
             .size_full()
@@ -1947,15 +1979,7 @@ impl QueryTab {
                     .text_size(editor_size())
                     .line_height(px(22.))
                     .py(px(10.)),
-            )
-            .child(
-                canvas(move |bounds, _, _| area.set(bounds), |_, _, _, _| {})
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-            )
-            .children(icons);
+            );
 
         let many = self.results.len() > 1;
         let tabs = self.results.iter().enumerate().map(|(i, _)| {

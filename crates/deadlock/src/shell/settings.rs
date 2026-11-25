@@ -66,6 +66,27 @@ impl Shell {
         Ok(())
     }
 
+    /// Moves the connection at `from` to `to`: `project.toml` first (a failed write
+    /// keeps the old order), then the sidebar.
+    pub(crate) fn move_connection(
+        &mut self,
+        from: usize,
+        to: usize,
+        cx: &mut Context<Self>,
+    ) -> deadlock_core::Result<()> {
+        let old = self.project.config.connections.clone();
+        if !self.project.config.move_connection(from, to) {
+            return Ok(());
+        }
+        if let Err(e) = self.project.save_config() {
+            self.project.config.connections = old;
+            return Err(e);
+        }
+        self.tree_connections();
+        self.rebuild(cx);
+        Ok(())
+    }
+
     pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_tab = None;
         if self.front == Front::Settings {

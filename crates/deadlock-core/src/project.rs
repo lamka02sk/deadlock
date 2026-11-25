@@ -149,6 +149,21 @@ pub struct Project {
     pub state: ProjectState,
 }
 
+impl ProjectConfig {
+    /// Moves the connection at `from` to index `to`, shifting the ones between: the
+    /// order `project.toml` keeps and the sidebar shows. Out of range or in place:
+    /// nothing changes and `false` comes back.
+    pub fn move_connection(&mut self, from: usize, to: usize) -> bool {
+        let n = self.connections.len();
+        if from == to || from >= n || to >= n {
+            return false;
+        }
+        let c = self.connections.remove(from);
+        self.connections.insert(to, c);
+        true
+    }
+}
+
 impl Project {
     /// Opens the folder at `path`, creating `.deadlock/` and its files on first open.
     ///
@@ -330,6 +345,31 @@ pub fn folder_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connections_move_and_keep_the_rest_in_order() {
+        let mut config = ProjectConfig::default();
+        for id in ["a", "b", "c", "d"] {
+            config.connections.push(ConnectionConfig {
+                id: id.into(),
+                ..ConnectionConfig::new(crate::connection::Engine::Mysql)
+            });
+        }
+        let ids = |c: &ProjectConfig| {
+            c.connections
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(config.move_connection(0, 2));
+        assert_eq!(ids(&config), ["b", "c", "a", "d"]);
+        assert!(config.move_connection(3, 0));
+        assert_eq!(ids(&config), ["d", "b", "c", "a"]);
+        assert!(!config.move_connection(1, 1));
+        assert!(!config.move_connection(4, 0));
+        assert!(!config.move_connection(0, 4));
+        assert_eq!(ids(&config), ["d", "b", "c", "a"]);
+    }
 
     #[test]
     fn first_open_creates_files_and_state_round_trips() {

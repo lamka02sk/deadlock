@@ -31,6 +31,11 @@ pub(crate) trait Lines {
 /// Builds a block's element. Called on every frame the block is visible.
 pub type RenderBlock = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
+/// Deadlock patch: builds the gutter widgets for the visible buffer lines given,
+/// as `(buffer line, element)`. Called on every frame the editor is drawn.
+pub type GutterWidgets =
+    Rc<dyn Fn(std::ops::Range<usize>, &mut Window, &mut App) -> Vec<(usize, AnyElement)>>;
+
 /// Identifies a block for [`crate::input::EditorState::set_block_height`] and friends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(u64);
