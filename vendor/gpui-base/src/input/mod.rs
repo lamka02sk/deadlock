@@ -102,7 +102,8 @@ pub use diagnostics::{
     DiagnosticSummary, DiagnosticTag, RelatedInformation,
 };
 pub use display_map::{
-    BlockId, BufferPoint, DisplayMap, DisplayPoint, FoldRange, RenderBlock, WrappingIndent,
+    BlockId, BufferPoint, DisplayMap, DisplayPoint, FoldRange, GutterWidgets, RenderBlock,
+    WrappingIndent,
 };
 pub use editor::{Editor, EditorLineNumberRenderer, EditorState};
 pub use highlighting::{

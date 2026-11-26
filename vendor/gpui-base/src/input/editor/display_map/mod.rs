@@ -17,7 +17,7 @@ mod text_wrapper;
 mod wrap_map;
 
 // Re-export public API
-pub use self::block_map::{BlockId, RenderBlock};
+pub use self::block_map::{BlockId, GutterWidgets, RenderBlock};
 pub(crate) use self::block_map::BlockLayout;
 pub use self::display_map::{DisplayMap, WrappingIndent};
 pub(crate) use self::text_wrapper::LineLayout;

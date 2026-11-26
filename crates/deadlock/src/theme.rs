@@ -118,7 +118,7 @@ impl Palette {
             panel: c(0x111111),
             line: c(0x262626),
             line2: c(0x3D3D3D),
-            tx: c(0xFAFAFA),
+            tx: c(0xE5E5E5),
             tx2: c(0xA3A3A3),
             tx3: c(0x999999),
             hover: c(0x1F1F1F),
@@ -287,6 +287,8 @@ fn editor_theme(
                 "comment": comment,
                 "comment.doc": comment,
                 "number": { "color": c(p.warn) },
+                // Ctrl/Cmd-hovered object names, underlined.
+                "link_text": { "color": c(p.link) },
             },
         },
     }))

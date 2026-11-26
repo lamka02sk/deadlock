@@ -2,18 +2,44 @@
 //! `state.json`.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use deadlock_core::connection::ConnectionConfig;
 use deadlock_core::project::{TabState, console_path, load_text, save_text};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, px,
+    App, AppContext as _, Context, Entity, FontWeight, FutureExt as _, InteractiveElement,
+    IntoElement, ParentElement, PathPromptOptions, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, px,
 };
 
 use super::{Conn, Front, Shell};
+
+/// How long closing, switching or moving waits for a tab's transaction check.
+const TX_CHECK_WAIT: Duration = Duration::from_secs(3);
+
+/// What a tab's transaction check means for a close, a switch or a move.
+#[derive(Debug, PartialEq, Eq)]
+enum TxAnswer {
+    /// An open transaction: Commit / Roll back / Cancel.
+    Open,
+    /// Nothing to commit: none open, or the connection was lost (the tab says so).
+    Nothing,
+    /// No answer in time, and the session may hold a transaction.
+    Busy,
+}
+
+/// `answer` is the check's result, `None` when it did not come in time; `maybe_open`
+/// is what the tab last knew ([`QueryTab::may_hold_tx`]).
+fn tx_answer(answer: Option<&Result<bool, String>>, maybe_open: bool) -> TxAnswer {
+    match answer {
+        Some(Ok(true)) => TxAnswer::Open,
+        Some(_) => TxAnswer::Nothing,
+        None if maybe_open => TxAnswer::Busy,
+        None => TxAnswer::Nothing,
+    }
+}
 use crate::assets::{Icon, icon};
 use crate::query::{Kind, QueryTab, Scope, TabEvent, TxMode, View};
 use crate::theme::{Palette, tab_height};
@@ -36,13 +62,14 @@ impl Shell {
         let saved = std::mem::take(&mut self.project.state.tabs);
         let front = self.project.state.active_tab;
         for tab in saved {
-            let (kind, connection, text) = match tab {
+            let (kind, connection, text, schema) = match tab {
                 TabState::File {
                     path: Some(path),
                     connection,
+                    schema,
                     ..
                 } => match std::fs::read_to_string(&path) {
-                    Ok(text) => (Kind::File(Some(path)), connection, text),
+                    Ok(text) => (Kind::File(Some(path)), connection, text, schema),
                     Err(e) => {
                         eprintln!("deadlock: {}: {e}", path.display());
                         continue;
@@ -52,7 +79,13 @@ impl Shell {
                     path: None,
                     connection,
                     text,
-                } => (Kind::File(None), connection, text.unwrap_or_default()),
+                    schema,
+                } => (
+                    Kind::File(None),
+                    connection,
+                    text.unwrap_or_default(),
+                    schema,
+                ),
                 TabState::Table {
                     connection,
                     database,
@@ -61,6 +94,7 @@ impl Shell {
                     Kind::Table(TableRef { database, table }),
                     Some(connection),
                     String::new(),
+                    None,
                 ),
                 TabState::Object {
                     connection,
@@ -76,11 +110,11 @@ impl Shell {
                     }
                     continue;
                 }
-                TabState::Console { connection } => {
+                TabState::Console { connection, schema } => {
                     match console_path(self.project.root(), &connection)
                         .and_then(|p| load_text(&p).map(|t| (p, t)))
                     {
-                        Ok((path, text)) => (Kind::Console(path), Some(connection), text),
+                        Ok((path, text)) => (Kind::Console(path), Some(connection), text, schema),
                         Err(e) => {
                             eprintln!("deadlock: console: {e}");
                             continue;
@@ -89,7 +123,8 @@ impl Shell {
                 }
             };
             let binding = self.binding(connection.as_deref());
-            self.add_tab(kind, binding, text, window, cx);
+            let i = self.add_tab(kind, binding, text, window, cx);
+            self.tabs[i].0.update(cx, |t, _| t.restore_schema(schema));
         }
         self.front = match front {
             Some(i) if i < self.tabs.len() => Front::Query(i),
@@ -215,6 +250,10 @@ impl Shell {
                 }
             }
             TabEvent::Recorded => self.history_changed(cx),
+            TabEvent::SchemaSet => {
+                self.schedule_save(cx);
+                cx.notify();
+            }
             TabEvent::Changed => {
                 if matches!(tab.read(cx).kind, Kind::File(None)) {
                     self.schedule_save(cx);
@@ -315,6 +354,7 @@ impl Shell {
 
     pub(super) fn show_tab(&mut self, front: Front, window: &mut Window, cx: &mut Context<Self>) {
         self.front = front;
+        self.sidebar_last = false;
         if let Some(tab) = self.front_tab().cloned() {
             if tab.read(cx).table.is_some() {
                 tab.update(cx, |t, cx| {
@@ -369,9 +409,13 @@ impl Shell {
         self.show_tab(Front::Query(i), window, cx);
     }
 
-    /// Ctrl+Shift+N: the active connection's console, opened or brought forward.
+    /// Ctrl+Shift+N: the console of what was clicked last (a sidebar row or the front
+    /// tab), opened or brought forward, on that row's or tab's schema when it has one.
     pub(super) fn open_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(binding) = self.binding(self.active(cx).as_deref()) else {
+        let Some(target) = self.console_target(cx) else {
+            return;
+        };
+        let Some(binding) = self.binding(Some(&target.connection)) else {
             return;
         };
         let open = self.tabs.iter().position(|(t, _)| {
@@ -393,6 +437,12 @@ impl Shell {
                 }
             },
         };
+        if let Some(schema) = target.schema {
+            let tab = self.tabs[i].0.clone();
+            if tab.read(cx).schema() != Some(schema.as_str()) {
+                tab.update(cx, |t, cx| t.switch_schema(schema, cx));
+            }
+        }
         self.show_tab(Front::Query(i), window, cx);
     }
 
@@ -654,6 +704,11 @@ impl Shell {
     /// Asks Commit / Roll back / Cancel when any of `tabs` holds an open transaction,
     /// ends it as answered, then runs `then`. Cancel, or a failed commit or rollback,
     /// stops there: the transaction stays as it is.
+    ///
+    /// Each check waits at most [`TX_CHECK_WAIT`]: a session busy with a statement, or
+    /// a server that does not respond, never answers sooner. Such a tab that may hold
+    /// a transaction is asked about (Continue / Cancel); one that had none goes on,
+    /// and its Messages say so.
     pub(super) fn settle(
         &mut self,
         tabs: Vec<Entity<QueryTab>>,
@@ -668,11 +723,53 @@ impl Shell {
             .collect();
         let titles: Vec<String> = tabs.iter().map(|t| self.tab_title(t.read(cx))).collect();
         cx.spawn(async move |this, cx| {
-            let mut open = Vec::new();
-            for ((tab, check), title) in tabs.into_iter().zip(checks).zip(titles) {
-                // A lost connection has nothing left to commit; the tab says so.
-                if check.await == Ok(true) {
-                    open.push((tab, title));
+            let deadline = Instant::now() + TX_CHECK_WAIT;
+            let (mut open, mut busy) = (Vec::new(), Vec::new());
+            for ((tab, mut check), title) in tabs.into_iter().zip(checks).zip(titles) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let answer = (&mut check)
+                    .with_timeout(left, cx.background_executor())
+                    .await
+                    .ok();
+                if answer.is_none() {
+                    // A late answer still updates the tab.
+                    check.detach();
+                }
+                let maybe = tab.read_with(cx, |t, _| t.may_hold_tx());
+                match tx_answer(answer.as_ref(), maybe) {
+                    TxAnswer::Open => open.push((tab, title)),
+                    TxAnswer::Busy => busy.push(title),
+                    TxAnswer::Nothing if answer.is_none() => {
+                        tab.update(cx, |t, cx| t.tx_unanswered(TX_CHECK_WAIT, cx));
+                    }
+                    TxAnswer::Nothing => {}
+                }
+            }
+            if !busy.is_empty() {
+                let (who, verb) = match busy.as_slice() {
+                    [one] => (one.clone(), "does"),
+                    _ => (busy.join(", "), "do"),
+                };
+                let detail = format!(
+                    "{who} {verb} not answer (a statement is still running, or the server \
+                     does not respond) and may hold an open transaction. Continuing leaves \
+                     it as it is: not committed."
+                );
+                let Ok(answer) = cx.update_window(handle, |_, window, cx| {
+                    crate::dialog::ask(
+                        window,
+                        cx,
+                        crate::dialog::Ask::new(
+                            "Continue without committing?",
+                            &["Continue", "Cancel"],
+                        )
+                        .text(detail),
+                    )
+                }) else {
+                    return;
+                };
+                if answer.await != Some(0) {
+                    return;
                 }
             }
             if !open.is_empty() {
@@ -901,14 +998,17 @@ impl Shell {
             .map(|(t, _)| {
                 let t = t.read(cx);
                 let connection = t.connection.as_ref().map(|c| c.id.clone());
+                let schema = t.picked_schema().map(str::to_owned);
                 match &t.kind {
                     Kind::File(path) => TabState::File {
                         path: path.clone(),
                         text: path.is_none().then(|| t.text(cx)),
                         connection,
+                        schema,
                     },
                     Kind::Console(_) => TabState::Console {
                         connection: connection.unwrap_or_default(),
+                        schema,
                     },
                     Kind::Table(r) => TabState::Table {
                         connection: connection.unwrap_or_default(),
@@ -1001,7 +1101,8 @@ fn write(tab: &Entity<QueryTab>, path: &Path, cx: &mut gpui_kit::App) -> bool {
 
 /// The tab strip: editor tabs, then the New connection tab.
 /// A connection's tint on its tab: a tinted background (stronger in front), a 2 px
-/// accent along the top and, behind the front tab's blue underline, along the bottom.
+/// accent along the top and the front tab's blue underline; a tab behind keeps its
+/// bottom border in its own background.
 pub(super) fn tinted(
     tab: gpui_kit::Stateful<gpui_kit::Div>,
     color: Option<gpui_kit::Hsla>,
@@ -1009,9 +1110,10 @@ pub(super) fn tinted(
     p: &Palette,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let Some(c) = color else { return tab };
+    let bg = crate::color::over(c, if on { 0.32 } else { 0.14 }, p.bg);
     tab.relative()
-        .bg(crate::color::over(c, if on { 0.32 } else { 0.14 }, p.bg))
-        .border_color(if on { p.blue } else { c })
+        .bg(bg)
+        .border_color(if on { p.blue } else { bg })
         .child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(c))
 }
 
@@ -1338,4 +1440,22 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
         .children(import)
         .children(settings)
         .children(form)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unanswered_checks_ask_only_when_a_transaction_may_be_open() {
+        assert_eq!(tx_answer(Some(&Ok(true)), false), TxAnswer::Open);
+        assert_eq!(tx_answer(Some(&Ok(false)), true), TxAnswer::Nothing);
+        // A lost connection has nothing left to commit; the tab says so.
+        assert_eq!(
+            tx_answer(Some(&Err("gone".into())), true),
+            TxAnswer::Nothing
+        );
+        assert_eq!(tx_answer(None, true), TxAnswer::Busy);
+        assert_eq!(tx_answer(None, false), TxAnswer::Nothing);
+    }
 }

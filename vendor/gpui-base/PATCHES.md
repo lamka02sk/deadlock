@@ -82,3 +82,24 @@ workspace `[patch]`; only `src/menu/popup_menu.rs` differs (grep `Deadlock patch
 the container `p_1p5`/`min_w(px(180.))`, separator `my_1`, and `gap_2` after icons): 6 px
 container padding, 30 px items with 12 px side padding, 180 px minimum width, 16 px
 item icons. Its `Cargo.toml` has the workspace-inherited fields written out.
+
+## 4. Gutter widgets and Ctrl/Cmd links without a mouse move
+
+`src/input/editor/blocks.rs` (`EditorState::set_gutter_widgets`),
+`display_map/block_map.rs` (`GutterWidgets`), `display_map/display_map.rs` (the
+callback is kept on the `DisplayMap`), `base/element.rs` (`prepaint_gutter_widgets`,
+painted after the fold icons; the modifiers listener in `paint_mouse_listeners`).
+Grep `Deadlock patch`.
+
+- `set_gutter_widgets(Some(render))`: on every frame the editor calls `render` with the
+  visible buffer lines and lays out each returned `(line, element)` at that line's
+  first display row, from this frame's layout (block-aware `local_row_y`), in a box
+  the gutter's width and one line high, after the text's hitbox so it takes clicks and
+  hovers. Deadlock's run ▶ icons used to be absolutely positioned overlays read from
+  last frame's `range_to_bounds`, so they trailed a scroll by a frame and only caught up
+  when the tab re-rendered; now they move with the text.
+- Pressing or releasing Cmd/Ctrl over the text runs the mouse-move hover path with the
+  pointer's position, so the definition underline shows and goes without moving the
+  mouse. Modifier events reach the listener only when the editor is on the focus path.
+  Not observable under Xvfb (XTEST modifier presses produce no `ModifiersChanged` there);
+  the mouse-move path was checked.

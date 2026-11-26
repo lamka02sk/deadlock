@@ -101,9 +101,18 @@ pub enum TabState {
         connection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// The schema picked or typed (`USE`) on the tab, when not the connection's
+        /// default: set again when the tab's session opens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
     },
     /// The connection's console; its buffer lives in `.deadlock/consoles/`.
-    Console { connection: String },
+    Console {
+        connection: String,
+        /// As a file tab's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+    },
     /// A table's or view's data.
     Table {
         connection: String,
@@ -147,6 +156,21 @@ pub struct Project {
     root: PathBuf,
     pub config: ProjectConfig,
     pub state: ProjectState,
+}
+
+impl ProjectConfig {
+    /// Moves the connection at `from` to index `to`, shifting the ones between: the
+    /// order `project.toml` keeps and the sidebar shows. Out of range or in place:
+    /// nothing changes and `false` comes back.
+    pub fn move_connection(&mut self, from: usize, to: usize) -> bool {
+        let n = self.connections.len();
+        if from == to || from >= n || to >= n {
+            return false;
+        }
+        let c = self.connections.remove(from);
+        self.connections.insert(to, c);
+        true
+    }
 }
 
 impl Project {
@@ -332,6 +356,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connections_move_and_keep_the_rest_in_order() {
+        let mut config = ProjectConfig::default();
+        for id in ["a", "b", "c", "d"] {
+            config.connections.push(ConnectionConfig {
+                id: id.into(),
+                ..ConnectionConfig::new(crate::connection::Engine::Mysql)
+            });
+        }
+        let ids = |c: &ProjectConfig| {
+            c.connections
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(config.move_connection(0, 2));
+        assert_eq!(ids(&config), ["b", "c", "a", "d"]);
+        assert!(config.move_connection(3, 0));
+        assert_eq!(ids(&config), ["d", "b", "c", "a"]);
+        assert!(!config.move_connection(1, 1));
+        assert!(!config.move_connection(4, 0));
+        assert!(!config.move_connection(0, 4));
+        assert_eq!(ids(&config), ["d", "b", "c", "a"]);
+    }
+
+    #[test]
     fn first_open_creates_files_and_state_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let mut project = Project::open(dir.path()).unwrap();
@@ -431,14 +480,17 @@ mod tests {
                 path: Some(dir.path().join("a.sql")),
                 connection: Some("local".into()),
                 text: None,
+                schema: Some("shop_test".into()),
             },
             TabState::File {
                 path: None,
                 connection: None,
                 text: Some("SELECT 1".into()),
+                schema: None,
             },
             TabState::Console {
                 connection: "local".into(),
+                schema: Some("HR".into()),
             },
             TabState::Object {
                 connection: "local".into(),
@@ -456,6 +508,28 @@ mod tests {
         let json = fs::read_to_string(dir.path().join(DIR).join(STATE)).unwrap();
         assert!(json.contains(r#""kind": "console""#), "{json}");
         assert!(json.contains(r#""object": "trigger""#), "{json}");
+        assert!(json.contains(r#""schema": "shop_test""#), "{json}");
+    }
+
+    #[test]
+    fn tabs_saved_before_schemas_load() {
+        let old = r#"[{"kind":"console","connection":"local"},{"kind":"file","text":"x"}]"#;
+        let tabs: Vec<TabState> = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            tabs,
+            [
+                TabState::Console {
+                    connection: "local".into(),
+                    schema: None
+                },
+                TabState::File {
+                    path: None,
+                    connection: None,
+                    text: Some("x".into()),
+                    schema: None
+                }
+            ]
+        );
     }
 
     #[test]

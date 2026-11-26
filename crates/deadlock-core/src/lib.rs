@@ -25,6 +25,7 @@ pub mod redis_driver;
 mod redis_driver_admin;
 pub mod schema;
 pub mod search;
+pub mod session_schema;
 pub mod sessions;
 pub mod settings;
 pub mod split;

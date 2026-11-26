@@ -4,9 +4,19 @@ use gpui::{AnyElement, App, Context, Pixels, Window};
 use std::rc::Rc;
 
 use super::EditorState;
-use crate::input::BlockId;
+use crate::input::{BlockId, GutterWidgets};
 
 impl EditorState {
+    /// Draw elements in the gutter, each on the first display row of its buffer
+    /// line, laid out in the same frame as the text (so they never trail a scroll).
+    /// `render` gets the visible buffer lines and returns `(line, element)`; each
+    /// element gets the gutter's width and one line's height, and sits above the
+    /// text's hitbox, so it takes clicks and hovers. `None` removes them.
+    pub fn set_gutter_widgets(&mut self, render: Option<GutterWidgets>, cx: &mut Context<Self>) {
+        self.display_map.gutter_widgets = render;
+        cx.notify();
+    }
+
     /// Draw an element `height` tall under buffer line `row`, across the text
     /// area (not the gutter). Later rows move down by `height`.
     ///

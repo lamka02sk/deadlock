@@ -2,7 +2,6 @@
 //! runs statements on its own server session, so a long query never blocks the schema
 //! tree, and shows their results in a resizable panel under the editor.
 
-use std::cell::Cell;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -13,6 +12,7 @@ use deadlock_core::classify::{Kind as StatementKind, Statement};
 use deadlock_core::connection::{ConnectionConfig, Engine, Environment};
 use deadlock_core::driver::{Driver, ResultStream, Runtime, connect, page_size};
 use deadlock_core::history::{self, Outcome};
+use deadlock_core::session_schema::{default_schema, switch_sql, switched_to};
 use deadlock_core::split;
 use gpui_kit::base::input::BlockId;
 use gpui_kit::component::input::{
@@ -23,10 +23,9 @@ use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Context, Entity, EventEmitter,
-    FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, canvas,
-    div, px,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, div, px,
 };
 
 mod binds;
@@ -123,6 +122,8 @@ pub enum TabEvent {
     TableDropped(deadlock_core::edit::TableRef),
     /// A New table draft's Discard: the tab closes without asking.
     Discard,
+    /// The tab's schema changed (picked, typed `USE`, or reset): the tab list saves.
+    SchemaSet,
     /// The user chose where results go: inline (`true`) or the bottom panel. The
     /// project remembers it and every tab follows.
     ResultsInline(bool),
@@ -170,6 +171,8 @@ enum Pending {
     Run(Vec<(Range<usize>, String)>),
     /// A statement to explain, and whether to measure it.
     Explain(Range<usize>, String, bool),
+    /// A picked schema to switch the session to.
+    Use(String),
 }
 
 /// Delay between the last keystroke and the gutter refresh or the console save.
@@ -187,6 +190,11 @@ pub struct QueryTab {
     pub tx_mode: TxMode,
     /// The session holds an open transaction, as the server last reported it.
     pub tx_open: bool,
+    /// The schema statements run in: the connection's default until one is picked or
+    /// a typed `USE` ran. `None`: no default and none picked.
+    schema: Option<String>,
+    /// A picked schema's statement is on its way to the server.
+    switching: bool,
     pub editor: Entity<EditorState>,
     pub dirty: bool,
     /// The statements as the gutter shows them: byte range and first row.
@@ -201,8 +209,6 @@ pub struct QueryTab {
     took: Option<Duration>,
     running_mark: RangeDecorationCollection,
     _gutter: GutterDecorationCollection,
-    /// The editor area in window coordinates, from the last paint.
-    area: Rc<Cell<Bounds<Pixels>>>,
     window: AnyWindowHandle,
     quiet: Option<Task<()>>,
     grid_subs: Vec<Subscription>,
@@ -284,8 +290,15 @@ impl QueryTab {
             }
             cx.emit(TabEvent::Changed);
         });
-        // The gutter icons follow the editor's scrolling and layout.
+        // What the tab shows from the editor (the caret's place) follows it.
         let observe = cx.observe(&editor, |_, _, cx| cx.notify());
+        let tab = cx.entity().downgrade();
+        editor.update(cx, |e, cx| {
+            e.set_gutter_widgets(
+                Some(Rc::new(move |lines, _, cx| run_icons(&tab, lines, cx))),
+                cx,
+            );
+        });
         let mut this = Self {
             kind,
             untitled: 0,
@@ -293,6 +306,8 @@ impl QueryTab {
                 .as_ref()
                 .map_or(TxMode::Auto, |c| TxMode::default_for(c, cx)),
             tx_open: false,
+            schema: connection.as_ref().and_then(default_schema),
+            switching: false,
             connection,
             editor,
             dirty: false,
@@ -306,7 +321,6 @@ impl QueryTab {
             took: None,
             running_mark,
             _gutter: gutter,
-            area: Rc::default(),
             window: window.window_handle(),
             quiet: None,
             grid_subs: Vec::new(),
@@ -350,6 +364,117 @@ impl QueryTab {
         self.running.is_some() || self.exporting()
     }
 
+    /// The schema unqualified names resolve in: the picked one, else the connection's
+    /// default (MySQL `database`, the Oracle user, Redis `db<n>`).
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    /// The schema as `state.json` keeps it: only one that differs from the default.
+    pub fn picked_schema(&self) -> Option<&str> {
+        let default = self.connection.as_ref().and_then(default_schema);
+        self.schema().filter(|s| default.as_deref() != Some(*s))
+    }
+
+    /// A schema saved in `state.json`: the session switches to it when it opens.
+    pub fn restore_schema(&mut self, schema: Option<String>) {
+        if let Some(s) = schema.filter(|_| self.has_schema()) {
+            self.schema = Some(s);
+        }
+    }
+
+    /// Files and consoles bound to a connection have a schema to pick; table tabs
+    /// name theirs in every statement.
+    pub fn has_schema(&self) -> bool {
+        self.connection.is_some() && !matches!(self.kind, Kind::Table(_))
+    }
+
+    /// A picked schema's statement is on its way.
+    pub fn is_switching(&self) -> bool {
+        self.switching
+    }
+
+    /// Switches the tab's session to `schema` (opening the session first when there
+    /// is none). The chip follows once the server agreed; an error goes to Messages.
+    pub fn switch_schema(&mut self, schema: String, cx: &mut Context<Self>) {
+        if !self.has_schema() || self.is_running() || self.switching || self.pending.is_some() {
+            return;
+        }
+        self.switching = true;
+        cx.emit(TabEvent::Changed);
+        cx.notify();
+        self.when_ready(Pending::Use(schema), cx);
+    }
+
+    fn start_use(&mut self, schema: String, cx: &mut Context<Self>) {
+        let (Session::Ready(driver), Some(engine)) =
+            (&self.session, self.connection.as_ref().map(|c| c.engine))
+        else {
+            self.switching = false;
+            return;
+        };
+        let Some(sql) = switch_sql(engine, &schema) else {
+            self.switching = false;
+            return;
+        };
+        let d = Arc::clone(driver);
+        // A grid still paging holds the session.
+        self.close_grids(cx);
+        let text = sql.clone();
+        let rx = cx
+            .global::<Db>()
+            .0
+            .spawn(async move { d.execute(&text).await?.collect().await });
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |t, cx| {
+                t.switching = false;
+                match result {
+                    Ok(Ok(_)) => t.set_schema(Some(schema), cx),
+                    Ok(Err(e)) => t.switch_failed(&sql, e.to_string()),
+                    Err(_) => t.switch_failed(&sql, "the query task stopped".into()),
+                }
+                cx.emit(TabEvent::Changed);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn switch_failed(&mut self, sql: &str, error: String) {
+        self.note(sql, error, true);
+        self.show_panel(Panel::Messages);
+    }
+
+    fn set_schema(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
+        if self.schema != schema {
+            self.schema = schema;
+            cx.emit(TabEvent::SchemaSet);
+        }
+    }
+
+    /// The session may hold an open transaction: it had one when it last answered,
+    /// or a statement runs in Manual mode.
+    pub fn may_hold_tx(&self) -> bool {
+        self.tx_open || (self.tx_mode == TxMode::Manual && self.is_running())
+    }
+
+    /// The transaction check got no answer in time; the caller went on as if
+    /// nothing was left to commit. Says so in Messages.
+    pub fn tx_unanswered(&mut self, wait: Duration, cx: &mut Context<Self>) {
+        self.note(
+            "Transaction",
+            format!(
+                "The session did not answer the transaction check within {} s (a statement \
+                 is running, or the server does not respond). It had no open transaction \
+                 when it last answered, so nothing was committed or rolled back.",
+                wait.as_secs()
+            ),
+            false,
+        );
+        cx.notify();
+    }
+
     pub fn needs_session(&self) -> bool {
         (self.pending.is_some() || self.table.as_ref().is_some_and(|t| t.waiting))
             && matches!(self.session, Session::None)
@@ -371,6 +496,7 @@ impl QueryTab {
             .as_ref()
             .map_or(TxMode::Auto, |c| TxMode::default_for(c, cx));
         self.tx_open = false;
+        self.schema = connection.as_ref().and_then(default_schema);
         self.connection = connection;
         self.close_session(cx);
         self.split_now(cx);
@@ -495,6 +621,7 @@ impl QueryTab {
         match work {
             Pending::Run(plan) => self.start(plan, cx),
             Pending::Explain(range, text, analyze) => self.start_explain(range, text, analyze, cx),
+            Pending::Use(schema) => self.start_use(schema, cx),
         }
     }
 
@@ -610,30 +737,57 @@ impl QueryTab {
             return;
         }
         self.session = Session::Connecting;
-        // A Redis key tab's session selects the key's database.
-        let config = match (&self.kind, config.engine) {
-            (Kind::Table(t), Engine::Redis) => ConnectionConfig {
-                database: t.database.trim_start_matches("db").to_owned(),
+        // A Redis key tab's session selects the key's database, a console its picked
+        // one: the connection manager selects it again after a reconnect.
+        let redis_db = match &self.kind {
+            Kind::Table(t) => Some(t.database.as_str()),
+            _ => self.picked_schema(),
+        };
+        let config = match (redis_db, config.engine) {
+            (Some(db), Engine::Redis) => ConnectionConfig {
+                database: db.trim_start_matches("db").to_owned(),
                 ..config
             },
             _ => config,
         };
         let auto = self.tx_mode == TxMode::Auto;
+        // A schema picked before (or saved in `state.json`) is set again; through the
+        // healing session, so a reconnect sets it too.
+        let restore = self
+            .picked_schema()
+            .and_then(|s| switch_sql(config.engine, s))
+            .filter(|_| self.has_schema() && config.engine != Engine::Redis);
         let rx = cx.global::<Db>().0.spawn(async move {
             let driver = connect(&config, &password).await?;
             if driver.capabilities().transactions {
                 driver.set_auto_commit(auto).await?;
             }
-            Ok::<_, deadlock_core::driver::DriverError>(driver)
+            let restored = match restore {
+                Some(sql) => match driver.execute(&sql).await {
+                    Ok(s) => s.collect().await.err().map(|e| (sql, e.to_string())),
+                    Err(e) => Some((sql, e.to_string())),
+                },
+                None => None,
+            };
+            Ok::<_, deadlock_core::driver::DriverError>((driver, restored))
         });
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(Ok(driver)) => {
+                    Ok(Ok((driver, restored))) => {
                         this.session = Session::Ready(driver);
+                        // The session stayed on the default schema.
+                        let default = this.connection.as_ref().and_then(default_schema);
+                        if restored.is_some() {
+                            this.set_schema(default, cx);
+                        }
                         if let Some(work) = this.pending.take() {
                             this.start_pending(work, cx);
+                        }
+                        // After the waiting run started: it clears Messages.
+                        if let Some((sql, e)) = restored {
+                            this.switch_failed(&sql, e);
                         }
                         this.table_session(None, cx);
                     }
@@ -650,6 +804,7 @@ impl QueryTab {
     /// The session could not be opened; the waiting run is dropped with a message.
     pub fn fail_session(&mut self, error: String, cx: &mut Context<Self>) {
         self.session = Session::None;
+        self.switching = false;
         self.table_session(Some(error.clone()), cx);
         self.pending = None;
         self.messages.clear();
@@ -768,6 +923,7 @@ impl QueryTab {
                     })
                     .then(|| (text.clone(), binds.clone()));
                 let statement = text.clone();
+                let switched = engine.and_then(|e| switched_to(e, &text));
                 let head = rt.spawn(async move { d.execute_bound(&text, &binds).await });
                 let outcome = match head.await {
                     Ok(Ok(stream)) => {
@@ -780,6 +936,9 @@ impl QueryTab {
                 failed_any |= failed;
                 let took = started.elapsed();
                 let Ok(stop) = this.update(cx, |t, cx| {
+                    if !failed && t.has_schema() && switched.is_some() {
+                        t.set_schema(switched, cx);
+                    }
                     t.record(statement, took, &outcome, cx);
                     t.finish_statement(label, outcome.map(|(parts, _)| parts), took, cx)
                 }) else {
@@ -1878,37 +2037,31 @@ impl Render for QueryTab {
     }
 }
 
-impl QueryTab {
-    fn render_editor(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
-        let p = *cx.global::<Palette>();
-        let area = Rc::clone(&self.area);
-        let origin = area.get().origin;
-        let editor = self.editor.read(cx);
-        let visible = editor.visible_row_range().unwrap_or(0..0);
-        let icons: Vec<_> = if self.running.is_some() {
-            Vec::new()
-        } else {
-            self.statements
-                .iter()
-                .filter(|(_, row)| visible.contains(row))
-                .filter_map(|(r, _)| {
-                    let b = editor.range_to_bounds(&(r.start..r.start))?;
-                    Some((r.start, b.top() - origin.y, b.size.height))
-                })
-                .collect()
-        };
-        let icons = icons.into_iter().map(|(start, top, h)| {
-            div()
+/// The ▶ of each statement starting on `lines`, drawn by the editor in its gutter in
+/// the same frame as the text. None while the tab runs.
+fn run_icons(
+    tab: &WeakEntity<QueryTab>,
+    lines: Range<usize>,
+    cx: &mut App,
+) -> Vec<(usize, gpui_kit::AnyElement)> {
+    let Some(entity) = tab.upgrade() else {
+        return Vec::new();
+    };
+    let t = entity.read(cx);
+    if t.running.is_some() {
+        return Vec::new();
+    }
+    let p = *cx.global::<Palette>();
+    t.statements
+        .iter()
+        .filter(|(_, row)| lines.contains(row))
+        .map(|(r, row)| {
+            let (start, row, tab) = (r.start, *row, tab.clone());
+            let icon = div()
                 .id(("run-statement", start))
-                .absolute()
-                .left(px(2.))
-                .top(top)
-                .h(h)
+                .ml(px(2.))
                 .w(px(16.))
+                .h_full()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1917,8 +2070,22 @@ impl QueryTab {
                     gpui_kit::component::tooltip::Tooltip::new("Run this statement")
                         .build(window, cx)
                 })
-                .clickable(cx.listener(move |this, _, _, cx| this.run(Scope::At(start), cx)))
-        });
+                .clickable(move |_, _, cx| {
+                    let _ = tab.update(cx, |t, cx| t.run(Scope::At(start), cx));
+                })
+                .into_any_element();
+            (row, icon)
+        })
+        .collect()
+}
+
+impl QueryTab {
+    fn render_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let p = *cx.global::<Palette>();
         let editor_area = div()
             .relative()
             .size_full()
@@ -1947,15 +2114,7 @@ impl QueryTab {
                     .text_size(editor_size())
                     .line_height(px(22.))
                     .py(px(10.)),
-            )
-            .child(
-                canvas(move |bounds, _, _| area.set(bounds), |_, _, _, _| {})
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-            )
-            .children(icons);
+            );
 
         let many = self.results.len() > 1;
         let tabs = self.results.iter().enumerate().map(|(i, _)| {
