@@ -783,7 +783,11 @@ mod table_edits {
     }
 
     fn all(rt: &Runtime, d: &dyn Driver, t: &TableRef, i: &TableInfo) -> Vec<Vec<Value>> {
-        rows(rt, d, &edit::select_sql(t, i, "", "").unwrap())
+        rows(
+            rt,
+            d,
+            &edit::select_sql(t, i, "", &i.key_order().unwrap_or_default()).unwrap(),
+        )
     }
 
     fn apply(rt: &Runtime, d: &dyn Driver, changes: &[Change], auto: bool) -> Result<(), String> {
@@ -3034,7 +3038,11 @@ mod oracle {
         }
 
         fn all(rt: &Runtime, d: &dyn Driver, t: &TableRef, i: &TableInfo) -> Vec<Vec<Value>> {
-            rows(rt, d, &edit::select_sql(t, i, "", "").unwrap())
+            rows(
+                rt,
+                d,
+                &edit::select_sql(t, i, "", &i.key_order().unwrap_or_default()).unwrap(),
+            )
         }
 
         fn apply(rt: &Runtime, d: &dyn Driver, c: &[Change], auto: bool) -> Result<(), String> {

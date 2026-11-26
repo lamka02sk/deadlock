@@ -60,6 +60,22 @@ pub static ENTRIES: &[Entry] = &[
         crate::shell::NewQuery
     ),
     entry!(
+        "close-tab",
+        "Window",
+        "Close tab",
+        secondary!("w"),
+        SHELL,
+        crate::shell::CloseTab
+    ),
+    entry!(
+        "reopen-tab",
+        "Window",
+        "Reopen closed tab",
+        secondary!("shift-t"),
+        SHELL,
+        crate::shell::ReopenTab
+    ),
+    entry!(
         "open-file",
         "Window",
         "Open file",
@@ -331,6 +347,14 @@ pub static ENTRIES: &[Entry] = &[
         "delete",
         &[Some("TableData")],
         crate::query::DeleteRows
+    ),
+    entry!(
+        "transposed",
+        "Table data",
+        "Transposed view",
+        secondary!("t"),
+        &[Some("TableData")],
+        crate::query::ToggleTransposed
     ),
     entry!(
         "undo-change",

@@ -1,5 +1,6 @@
 //! A project is a folder. Its settings live in `.deadlock/` inside it.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,53 @@ pub struct ProjectState {
     /// The Files panel's width, once the user changed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_width: Option<f32>,
+    /// Column widths set by hand in tables' Data views.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub column_widths: Vec<TableWidths>,
+}
+
+/// One table's Data view column widths, by column name, in logical pixels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableWidths {
+    pub connection: String,
+    pub database: String,
+    pub table: String,
+    pub widths: BTreeMap<String, f32>,
+}
+
+impl ProjectState {
+    /// The widths saved for a table, if any.
+    #[must_use]
+    pub fn widths(
+        &self,
+        connection: &str,
+        database: &str,
+        table: &str,
+    ) -> Option<&BTreeMap<String, f32>> {
+        self.column_widths
+            .iter()
+            .find(|w| w.connection == connection && w.database == database && w.table == table)
+            .map(|w| &w.widths)
+    }
+
+    /// Saves a table's widths, replacing what it had.
+    pub fn set_widths(
+        &mut self,
+        connection: &str,
+        database: &str,
+        table: &str,
+        widths: BTreeMap<String, f32>,
+    ) {
+        self.column_widths.retain(|w| {
+            !(w.connection == connection && w.database == database && w.table == table)
+        });
+        self.column_widths.push(TableWidths {
+            connection: connection.to_owned(),
+            database: database.to_owned(),
+            table: table.to_owned(),
+            widths,
+        });
+    }
 }
 
 /// An editor tab as saved in `state.json`. Every tab is bound to a connection.
@@ -354,6 +402,20 @@ pub fn folder_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widths_replace_per_table() {
+        let mut s = ProjectState::default();
+        let w = |n: f32| BTreeMap::from([("id".to_owned(), n)]);
+        s.set_widths("c", "db", "t", w(80.));
+        s.set_widths("c", "db", "u", w(90.));
+        s.set_widths("c", "db", "t", w(120.));
+        assert_eq!(s.column_widths.len(), 2);
+        assert_eq!(s.widths("c", "db", "t"), Some(&w(120.)));
+        assert_eq!(s.widths("c", "other", "t"), None);
+        let back: ProjectState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
 
     #[test]
     fn connections_move_and_keep_the_rest_in_order() {

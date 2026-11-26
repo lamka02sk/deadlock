@@ -10,6 +10,7 @@ use deadlock_core::connection::Environment;
 use deadlock_core::driver::{Value, page_size};
 use deadlock_core::redis::{self as rk, Command, KeyType, Part};
 use deadlock_core::redis_driver::{KeyFacts, KeyText};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{self, Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::tooltip::Tooltip;
@@ -1066,10 +1067,14 @@ pub(super) fn header(
         .child(div().flex_none().text_color(p.tx3).child("match"))
         .child(
             div().flex_1().min_w_0().child(
-                Input::new(&t.filter)
+                Editor::new(&t.filter)
+                    .xsmall()
                     .appearance(false)
+                    .font_family(MONO_FONT)
+                    .text_size(data_size())
+                    .line_height(px(26.))
                     .h(px(26.))
-                    .px_0()
+                    .p_0()
                     .disabled(!matching),
             ),
         );
