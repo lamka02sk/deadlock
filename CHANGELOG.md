@@ -6,6 +6,27 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-26
+
+### Added
+
+- Schema picker for consoles and SQL files in the toolbar: switches the tab's session,
+  follows a typed `USE`, and is remembered per tab after a restart.
+- The console opens on the connection and schema last clicked in the sidebar or tab strip.
+- Ctrl+click (Cmd+click on macOS) on a table, view or routine name in SQL opens it.
+- Reorder connections in Settings → Project.
+
+### Changed
+
+- Dark theme text is a soft grey instead of white.
+- Tabs behind the front one no longer have a bottom border in the connection's color.
+
+### Fixed
+
+- Run icons in the editor gutter move with the text while scrolling.
+- Switching projects from the toolbar menu or closing the window sometimes did nothing
+  while a tab's session was busy or unreachable.
+
 ## [0.1.3] - 2026-11-25
 
 ### Added
@@ -74,7 +95,8 @@ First tagged version.
   shortcuts.
 - Linux packages (`.deb`, AppImage) and a macOS `.dmg`, attached to the release by CI.
 
-[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/lamka02sk/deadlock/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lamka02sk/deadlock/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lamka02sk/deadlock/compare/v0.1.0...v0.1.1
