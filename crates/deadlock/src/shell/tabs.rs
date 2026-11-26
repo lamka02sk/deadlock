@@ -2,18 +2,44 @@
 //! `state.json`.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use deadlock_core::connection::ConnectionConfig;
 use deadlock_core::project::{TabState, console_path, load_text, save_text};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, px,
+    App, AppContext as _, Context, Entity, FontWeight, FutureExt as _, InteractiveElement,
+    IntoElement, ParentElement, PathPromptOptions, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, px,
 };
 
 use super::{Conn, Front, Shell};
+
+/// How long closing, switching or moving waits for a tab's transaction check.
+const TX_CHECK_WAIT: Duration = Duration::from_secs(3);
+
+/// What a tab's transaction check means for a close, a switch or a move.
+#[derive(Debug, PartialEq, Eq)]
+enum TxAnswer {
+    /// An open transaction: Commit / Roll back / Cancel.
+    Open,
+    /// Nothing to commit: none open, or the connection was lost (the tab says so).
+    Nothing,
+    /// No answer in time, and the session may hold a transaction.
+    Busy,
+}
+
+/// `answer` is the check's result, `None` when it did not come in time; `maybe_open`
+/// is what the tab last knew ([`QueryTab::may_hold_tx`]).
+fn tx_answer(answer: Option<&Result<bool, String>>, maybe_open: bool) -> TxAnswer {
+    match answer {
+        Some(Ok(true)) => TxAnswer::Open,
+        Some(_) => TxAnswer::Nothing,
+        None if maybe_open => TxAnswer::Busy,
+        None => TxAnswer::Nothing,
+    }
+}
 use crate::assets::{Icon, icon};
 use crate::query::{Kind, QueryTab, Scope, TabEvent, TxMode, View};
 use crate::theme::{Palette, tab_height};
@@ -678,6 +704,11 @@ impl Shell {
     /// Asks Commit / Roll back / Cancel when any of `tabs` holds an open transaction,
     /// ends it as answered, then runs `then`. Cancel, or a failed commit or rollback,
     /// stops there: the transaction stays as it is.
+    ///
+    /// Each check waits at most [`TX_CHECK_WAIT`]: a session busy with a statement, or
+    /// a server that does not respond, never answers sooner. Such a tab that may hold
+    /// a transaction is asked about (Continue / Cancel); one that had none goes on,
+    /// and its Messages say so.
     pub(super) fn settle(
         &mut self,
         tabs: Vec<Entity<QueryTab>>,
@@ -692,11 +723,53 @@ impl Shell {
             .collect();
         let titles: Vec<String> = tabs.iter().map(|t| self.tab_title(t.read(cx))).collect();
         cx.spawn(async move |this, cx| {
-            let mut open = Vec::new();
-            for ((tab, check), title) in tabs.into_iter().zip(checks).zip(titles) {
-                // A lost connection has nothing left to commit; the tab says so.
-                if check.await == Ok(true) {
-                    open.push((tab, title));
+            let deadline = Instant::now() + TX_CHECK_WAIT;
+            let (mut open, mut busy) = (Vec::new(), Vec::new());
+            for ((tab, mut check), title) in tabs.into_iter().zip(checks).zip(titles) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let answer = (&mut check)
+                    .with_timeout(left, cx.background_executor())
+                    .await
+                    .ok();
+                if answer.is_none() {
+                    // A late answer still updates the tab.
+                    check.detach();
+                }
+                let maybe = tab.read_with(cx, |t, _| t.may_hold_tx());
+                match tx_answer(answer.as_ref(), maybe) {
+                    TxAnswer::Open => open.push((tab, title)),
+                    TxAnswer::Busy => busy.push(title),
+                    TxAnswer::Nothing if answer.is_none() => {
+                        tab.update(cx, |t, cx| t.tx_unanswered(TX_CHECK_WAIT, cx));
+                    }
+                    TxAnswer::Nothing => {}
+                }
+            }
+            if !busy.is_empty() {
+                let (who, verb) = match busy.as_slice() {
+                    [one] => (one.clone(), "does"),
+                    _ => (busy.join(", "), "do"),
+                };
+                let detail = format!(
+                    "{who} {verb} not answer (a statement is still running, or the server \
+                     does not respond) and may hold an open transaction. Continuing leaves \
+                     it as it is: not committed."
+                );
+                let Ok(answer) = cx.update_window(handle, |_, window, cx| {
+                    crate::dialog::ask(
+                        window,
+                        cx,
+                        crate::dialog::Ask::new(
+                            "Continue without committing?",
+                            &["Continue", "Cancel"],
+                        )
+                        .text(detail),
+                    )
+                }) else {
+                    return;
+                };
+                if answer.await != Some(0) {
+                    return;
                 }
             }
             if !open.is_empty() {
@@ -1367,4 +1440,22 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
         .children(import)
         .children(settings)
         .children(form)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unanswered_checks_ask_only_when_a_transaction_may_be_open() {
+        assert_eq!(tx_answer(Some(&Ok(true)), false), TxAnswer::Open);
+        assert_eq!(tx_answer(Some(&Ok(false)), true), TxAnswer::Nothing);
+        // A lost connection has nothing left to commit; the tab says so.
+        assert_eq!(
+            tx_answer(Some(&Err("gone".into())), true),
+            TxAnswer::Nothing
+        );
+        assert_eq!(tx_answer(None, true), TxAnswer::Busy);
+        assert_eq!(tx_answer(None, false), TxAnswer::Nothing);
+    }
 }

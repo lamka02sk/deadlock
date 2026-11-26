@@ -287,6 +287,8 @@ fn editor_theme(
                 "comment": comment,
                 "comment.doc": comment,
                 "number": { "color": c(p.warn) },
+                // Ctrl/Cmd-hovered object names, underlined.
+                "link_text": { "color": c(p.link) },
             },
         },
     }))

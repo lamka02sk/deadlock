@@ -190,11 +190,13 @@ impl Shell {
         let shell = cx.entity().downgrade();
         let binding = config.clone();
         let complete: crate::object::Complete = Rc::new(move |editor, cx| {
+            let schema = deadlock_core::session_schema::default_schema(&binding);
             let binding = binding.clone();
             super::complete::install_editor(
                 shell.clone(),
                 editor,
                 Rc::new(move |_| Some(binding.clone())),
+                Rc::new(move |_| schema.clone()),
                 cx,
             );
         });

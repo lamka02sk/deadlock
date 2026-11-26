@@ -989,6 +989,23 @@ impl<M: InputModeKind, R: EditorLineNumberRenderer> TextElement<M, R> {
                 }
             }
         });
+        // Deadlock patch: pressing or releasing Cmd/Ctrl over the text shows or
+        // hides the definition link at once, not on the next mouse move.
+        window.on_modifiers_changed({
+            let state = self.state.clone();
+            let hitbox = hitbox.clone();
+            move |event, window, cx| {
+                if !hitbox.is_hovered(window) {
+                    return;
+                }
+                let event = MouseMoveEvent {
+                    position: window.mouse_position(),
+                    pressed_button: None,
+                    modifiers: event.modifiers,
+                };
+                state.update(cx, |state, cx| state.on_mouse_move(&event, window, cx));
+            }
+        });
 
         window.on_mouse_event({
             let state = self.state.clone();
@@ -1987,6 +2004,55 @@ impl<M: InputModeKind, R: EditorLineNumberRenderer> TextElement<M, R> {
             }
             let mut element = wrapper.child((block.render)(window, cx)).into_any_element();
             element.prepaint_as_root(point(x, top), size(width, block.height).into(), window, cx);
+            elements.push(element);
+        }
+        elements
+    }
+
+    /// Deadlock patch: lay out the gutter widgets of the visible lines, each at
+    /// its line's first row in this frame's layout, after the text's hitbox so
+    /// they take the pointer.
+    fn prepaint_gutter_widgets(
+        &self,
+        origin: Point<Pixels>,
+        last_layout: &LastLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let Some(render) = self.state.read(cx).display_map.gutter_widgets.clone() else {
+            return Vec::new();
+        };
+        let lines = &last_layout.visible_buffer_lines;
+        let (Some(&first), Some(&last)) = (lines.first(), lines.last()) else {
+            return Vec::new();
+        };
+        let mut tops = Vec::with_capacity(lines.len());
+        let mut row_offset: isize = 0;
+        for line in last_layout.lines.iter() {
+            tops.push(last_layout.local_row_y(row_offset));
+            row_offset += line.wrapped_lines.len() as isize;
+        }
+        let (width, height) = (last_layout.line_number_width, last_layout.line_height);
+        let mut elements = Vec::new();
+        for (line, element) in render(first..last + 1, window, cx) {
+            let Some(top) = lines
+                .binary_search(&line)
+                .ok()
+                .and_then(|ix| tops.get(ix))
+            else {
+                continue;
+            };
+            let mut element = gpui::div()
+                .w(width)
+                .h(height)
+                .child(element)
+                .into_any_element();
+            element.prepaint_as_root(
+                point(origin.x, origin.y + *top),
+                size(width, height).into(),
+                window,
+                cx,
+            );
             elements.push(element);
         }
         elements
@@ -3232,6 +3298,8 @@ pub(super) struct PrepaintState {
     ghost_lines_height: Pixels,
     /// Deadlock patch: the block widgets in the viewport, prepainted.
     block_elements: Vec<AnyElement>,
+    /// Deadlock patch: the gutter widgets of the visible lines, prepainted.
+    gutter_widgets: Vec<AnyElement>,
 }
 
 impl PrepaintState {
@@ -4055,6 +4123,12 @@ impl<M: InputModeKind, R: EditorLineNumberRenderer> Element for TextElement<M, R
             window,
             cx,
         );
+        let gutter_widgets = self.prepaint_gutter_widgets(
+            point(original_x, bounds.origin.y),
+            &last_layout,
+            window,
+            cx,
+        );
         self.request_reveal(
             input_bounds,
             &cursor_infos,
@@ -4173,6 +4247,7 @@ impl<M: InputModeKind, R: EditorLineNumberRenderer> Element for TextElement<M, R
             ghost_lines,
             ghost_lines_height,
             block_elements,
+            gutter_widgets,
         }
     }
 
@@ -4518,6 +4593,10 @@ impl<M: InputModeKind, R: EditorLineNumberRenderer> Element for TextElement<M, R
             window,
             cx,
         );
+        // Deadlock patch: gutter widgets, above the gutter's background.
+        for widget in &mut prepaint.gutter_widgets {
+            widget.paint(window, cx);
+        }
 
         if let Some(hitbox) = prepaint.hover_definition_hitbox.as_ref()
             && !window.modifiers().alt

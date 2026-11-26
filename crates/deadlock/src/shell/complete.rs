@@ -1,7 +1,10 @@
 //! The SQL editor's completion provider: suggestions from the sidebar's schema tree for
 //! the tab's connection. A schema a statement names that is not loaded yet loads in the
-//! background, and the open popup refreshes when it lands.
+//! background, and the open popup refreshes when it lands. Also the object links:
+//! Ctrl/Cmd over a table, view or routine name underlines it, and the click opens it
+//! as the sidebar does.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -10,7 +13,7 @@ use deadlock_core::complete::{self, Catalog, ItemKind};
 use deadlock_core::connection::{ConnectionConfig, Engine};
 use deadlock_core::schema::{Load, NodeId};
 use gpui_kit::component::input::{
-    CompletionProvider, EditorState, Rope, RopeExt as _, highlight_contains,
+    CompletionProvider, DefinitionProvider, EditorState, Rope, RopeExt as _, highlight_contains,
 };
 use gpui_kit::{AnyWindowHandle, App, Entity, Focusable as _, Task, WeakEntity, Window};
 use lsp_types::{
@@ -27,19 +30,54 @@ const WINDOW: usize = 64 * 1024;
 /// The connection an editor completes for, read at each request.
 type Connection = Rc<dyn Fn(&App) -> Option<ConnectionConfig>>;
 
+/// The schema unqualified names resolve in, read at each request.
+type Schema = Rc<dyn Fn(&App) -> Option<String>>;
+
 struct Sql {
     shell: WeakEntity<Shell>,
     connection: Connection,
+    schema: Schema,
     editor: WeakEntity<EditorState>,
+}
+
+/// The object the pointer names, found while Ctrl/Cmd hovers: its connection and link.
+type Target = Rc<RefCell<Option<(String, complete::Link)>>>;
+
+/// Object links for Ctrl/Cmd-click.
+struct Links {
+    shell: WeakEntity<Shell>,
+    connection: Connection,
+    schema: Schema,
+    target: Target,
+}
+
+/// `rope` around `offset` as a string, and where it starts: a statement starting more
+/// than [`WINDOW`] bytes before is read from the middle.
+fn around(rope: &Rope, offset: usize) -> (String, usize) {
+    // shortcut: fine for hand-written SQL, upgrade if huge scripts misdetect.
+    let mut start = offset.saturating_sub(WINDOW);
+    while !rope.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (offset + WINDOW / 4).min(rope.len());
+    while !rope.is_char_boundary(end) {
+        end += 1;
+    }
+    (rope.slice(start..end).to_string(), start)
 }
 
 /// Gives the tab's editor SQL completions.
 pub(super) fn install(shell: WeakEntity<Shell>, tab: &Entity<QueryTab>, cx: &mut App) {
     let editor = tab.read(cx).editor.clone();
     let tab = tab.downgrade();
+    let t = tab.clone();
     let connection: Connection =
-        Rc::new(move |cx| tab.upgrade().and_then(|t| t.read(cx).connection.clone()));
-    install_editor(shell, &editor, connection, cx);
+        Rc::new(move |cx| t.upgrade().and_then(|t| t.read(cx).connection.clone()));
+    let schema: Schema = Rc::new(move |cx| {
+        tab.upgrade()
+            .and_then(|t| t.read(cx).schema().map(str::to_owned))
+    });
+    install_editor(shell, &editor, connection, schema, cx);
 }
 
 /// Gives `editor` SQL completions for the connection `connection` returns.
@@ -47,16 +85,28 @@ pub(super) fn install_editor(
     shell: WeakEntity<Shell>,
     editor: &Entity<EditorState>,
     connection: Connection,
+    schema: Schema,
     cx: &mut App,
 ) {
+    let target: Target = Rc::default();
+    let links = Links {
+        shell: shell.clone(),
+        connection: Rc::clone(&connection),
+        schema: Rc::clone(&schema),
+        target: Rc::clone(&target),
+    };
+    let show = open_target(shell.clone(), target);
     let provider = Sql {
         shell,
         connection,
+        schema,
         editor: editor.downgrade(),
     };
     editor.update(cx, |e, _| {
         let lsp = e.lsp_mut();
         lsp.completion_provider = Some(Rc::new(provider));
+        lsp.definition_provider = Some(Rc::new(links));
+        lsp.show_document = Some(show);
         // The editor's query can start at a `.`; paint the part after it.
         lsp.set_completion_highlighter(Rc::new(|query: &str, item: &CompletionItem| {
             highlight_contains(query.rsplit('.').next().unwrap_or(query), item)
@@ -73,9 +123,10 @@ impl CompletionProvider for Sql {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
-        let (shell, connection, editor) = (
+        let (shell, connection, schema, editor) = (
             self.shell.clone(),
             Rc::clone(&self.connection),
+            Rc::clone(&self.schema),
             self.editor.clone(),
         );
         let text = text.clone();
@@ -85,7 +136,9 @@ impl CompletionProvider for Sql {
         cx.spawn(async move |cx| {
             let items = cx.update(|cx| {
                 let config = connection(cx);
-                let (items, load) = suggest(&shell, config.as_ref(), &text, offset, invoked, cx);
+                let current = schema(cx);
+                let (items, load) =
+                    suggest(&shell, config.as_ref(), current, &text, offset, invoked, cx);
                 if let Some((conn, missing)) = load {
                     load_then_refresh(&shell, &conn, missing, editor, handle, offset, cx);
                 }
@@ -107,6 +160,7 @@ impl CompletionProvider for Sql {
 fn suggest(
     shell: &WeakEntity<Shell>,
     config: Option<&ConnectionConfig>,
+    current: Option<String>,
     rope: &Rope,
     offset: usize,
     invoked: bool,
@@ -121,29 +175,12 @@ fn suggest(
     }
     let shell = shell.read(cx);
     let tree = config.and_then(|c| shell.tree.connections.iter().find(|t| t.id == c.id));
-    let current = config.map(|c| {
-        if engine == Engine::Oracle {
-            c.user.to_uppercase()
-        } else {
-            c.database.clone()
-        }
-    });
     let catalog = Catalog {
         schemas: tree.and_then(|t| t.nodes.as_deref()).unwrap_or_default(),
         hidden: tree.map_or(&[], |t| &t.hidden),
-        current: current.as_deref().filter(|c| !c.is_empty()),
+        current: current.as_deref(),
     };
-    // shortcut: a statement starting more than WINDOW bytes before the caret is read
-    // from the middle; fine for hand-written SQL, upgrade if huge scripts misdetect.
-    let mut start = offset.saturating_sub(WINDOW);
-    while !rope.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut end = (offset + WINDOW / 4).min(rope.len());
-    while !rope.is_char_boundary(end) {
-        end += 1;
-    }
-    let text = rope.slice(start..end).to_string();
+    let (text, start) = around(rope, offset);
     let case = crate::settings::get(cx).keyword_case;
     let Some(found) = complete::complete(&text, offset - start, engine, &catalog, case) else {
         return (Vec::new(), None);
@@ -188,21 +225,18 @@ fn suggest(
     (items, load)
 }
 
-/// Loads the schemas of `conn` that are not loaded, if it is connected, then asks the
-/// editor again while the caret has not moved.
-fn load_then_refresh(
+/// Starts loading the schemas of `conn` that are not loaded, if it is connected; the
+/// ids that load.
+fn load_missing(
     shell: &WeakEntity<Shell>,
     conn: &str,
     missing: Vec<String>,
-    editor: WeakEntity<EditorState>,
-    window: AnyWindowHandle,
-    offset: usize,
     cx: &mut App,
-) {
+) -> Vec<NodeId> {
     let Some(entity) = shell.upgrade() else {
-        return;
+        return Vec::new();
     };
-    let ids: Vec<NodeId> = entity.update(cx, |s, cx| {
+    entity.update(cx, |s, cx| {
         if !matches!(s.conns.get(conn), Some(Conn::Connected(_))) {
             return Vec::new();
         }
@@ -216,7 +250,21 @@ fn load_then_refresh(
             s.load(id.clone(), cx);
         }
         ids
-    });
+    })
+}
+
+/// Loads the schemas of `conn` that are not loaded, if it is connected, then asks the
+/// editor again while the caret has not moved.
+fn load_then_refresh(
+    shell: &WeakEntity<Shell>,
+    conn: &str,
+    missing: Vec<String>,
+    editor: WeakEntity<EditorState>,
+    window: AnyWindowHandle,
+    offset: usize,
+    cx: &mut App,
+) {
+    let ids = load_missing(shell, conn, missing, cx);
     if ids.is_empty() {
         return;
     }
@@ -245,4 +293,102 @@ fn load_then_refresh(
         });
     })
     .detach();
+}
+
+impl DefinitionProvider for Links {
+    fn definitions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Vec<lsp_types::LocationLink>>> {
+        let (shell, connection, schema, target) = (
+            self.shell.clone(),
+            Rc::clone(&self.connection),
+            Rc::clone(&self.schema),
+            Rc::clone(&self.target),
+        );
+        let rope = text.clone();
+        // On the next turn: the shell or the tab may be mid-update while the editor asks.
+        cx.spawn(async move |cx| {
+            let link = cx.update(|cx| {
+                let config = connection(cx)?;
+                let current = schema(cx);
+                let (link, missing) = link_at(&shell, &config, current, &rope, offset, cx);
+                if !missing.is_empty() {
+                    // The next hover finds it once it has loaded.
+                    load_missing(&shell, &config.id, missing, cx);
+                }
+                link.map(|l| (config.id, l))
+            });
+            *target.borrow_mut() = link.clone();
+            let Some((_, link)) = link else {
+                return Ok(Vec::new());
+            };
+            let origin = lsp_types::Range {
+                start: rope.offset_to_position(link.range.start),
+                end: rope.offset_to_position(link.range.end),
+            };
+            Ok(vec![lsp_types::LocationLink {
+                origin_selection_range: Some(origin),
+                target_uri: "deadlock:object".parse()?,
+                target_range: lsp_types::Range::default(),
+                target_selection_range: lsp_types::Range::default(),
+            }])
+        })
+    }
+}
+
+/// The object named at `offset` (its range in `rope`), and the schemas to load first.
+fn link_at(
+    shell: &WeakEntity<Shell>,
+    config: &ConnectionConfig,
+    current: Option<String>,
+    rope: &Rope,
+    offset: usize,
+    cx: &App,
+) -> (Option<complete::Link>, Vec<String>) {
+    let mut missing = Vec::new();
+    let Some(shell) = shell.upgrade() else {
+        return (None, missing);
+    };
+    let tree = shell
+        .read(cx)
+        .tree
+        .connections
+        .iter()
+        .find(|t| t.id == config.id);
+    let catalog = Catalog {
+        schemas: tree.and_then(|t| t.nodes.as_deref()).unwrap_or_default(),
+        hidden: tree.map_or(&[], |t| &t.hidden),
+        current: current.as_deref(),
+    };
+    let (text, start) = around(rope, offset);
+    let link = complete::link_at(&text, offset - start, config.engine, &catalog, &mut missing).map(
+        |mut l| {
+            l.range = start + l.range.start..start + l.range.end;
+            l
+        },
+    );
+    (link, missing)
+}
+
+/// The click on a link: opens the object found while hovering, as the sidebar does.
+fn open_target(
+    shell: WeakEntity<Shell>,
+    target: Target,
+) -> gpui_kit::component::input::ShowDocumentHandler {
+    Rc::new(move |_, window, cx| {
+        let Some((conn, link)) = target.borrow().clone() else {
+            return false;
+        };
+        let shell = shell.clone();
+        // Outside the editor's update: opening a tab moves focus and redraws.
+        window.defer(cx, move |window, cx| {
+            let id = [conn, link.schema, link.group, link.name];
+            let _ = shell.update(cx, |s, cx| s.open_node(&id, link.kind, window, cx));
+        });
+        true
+    })
 }

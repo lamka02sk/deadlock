@@ -9,7 +9,7 @@ use std::ops::Range;
 use gpui::{App, Font, Pixels};
 use ropey::Rope;
 
-use super::block_map::{BlockLayout, BlockMap, Lines};
+use super::block_map::{BlockLayout, BlockMap, GutterWidgets, Lines};
 use super::fold_map::FoldMap;
 use super::folding::FoldRange;
 pub use super::text_wrapper::WrappingIndent;
@@ -32,6 +32,8 @@ pub struct DisplayMap {
     fold_map: FoldMap,
     // Deadlock patch: block widgets between rows.
     pub(crate) blocks: BlockMap,
+    // Deadlock patch: widgets in the gutter, on their lines.
+    pub(crate) gutter_widgets: Option<GutterWidgets>,
 }
 
 impl DisplayMap {
@@ -40,6 +42,7 @@ impl DisplayMap {
             wrap_map: WrapMap::new(font, font_size, wrap_width),
             fold_map: FoldMap::new(),
             blocks: BlockMap::default(),
+            gutter_widgets: None,
         }
     }
 

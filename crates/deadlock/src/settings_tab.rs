@@ -10,6 +10,7 @@ use deadlock_core::settings::{
     EDITOR_SIZES, Indent, KeywordCase, PAGE_SIZES, ResultsPlace, Settings, Theme, TxDefault,
     UI_SIZES,
 };
+use gpui_kit::base::Button;
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -18,7 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    WeakEntity, Window, div, px, relative, white,
+    Transformation, WeakEntity, Window, div, px, radians, relative, white,
 };
 
 use crate::assets::{Icon, icon};
@@ -597,7 +598,80 @@ fn tag(text: &'static str, p: &Palette) -> gpui_kit::Div {
         .child(text)
 }
 
+/// A connection row being dragged by its grip in the Connections block.
+#[derive(Clone)]
+struct DragConn {
+    from: usize,
+    name: SharedString,
+}
+
+impl Render for DragConn {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *cx.global::<Palette>();
+        div()
+            .px(px(10.))
+            .py(px(4.))
+            .border_1()
+            .border_color(p.line2)
+            .rounded(RADIUS)
+            .bg(p.panel)
+            .text_color(p.tx)
+            .font_weight(FontWeight::MEDIUM)
+            .child(self.name.clone())
+    }
+}
+
+/// The six dots a row is dragged by.
+fn grip(p: &Palette) -> gpui_kit::Div {
+    let dots = || {
+        div()
+            .flex()
+            .gap(px(2.))
+            .children((0..2).map(|_| div().size(px(2.)).rounded_full().bg(p.tx3)))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .children((0..3).map(|_| dots()))
+}
+
+/// A square button with a chevron, for Move up (`up`) and Move down.
+fn move_button(id: SharedString, up: bool, on: bool, p: &Palette) -> Button {
+    let chevron = icon(Icon::ChevronDown, if on { p.tx2 } else { p.tx3 }).when(up, |i| {
+        i.with_transformation(Transformation::rotate(radians(std::f32::consts::PI)))
+    });
+    Button::new(gpui_kit::ElementId::Name(id))
+        .size(row_height())
+        .flex_none()
+        .border_1()
+        .border_color(if on { p.line2 } else { p.line })
+        .rounded(RADIUS)
+        .when(on, |b| b.cursor_pointer().hover(|s| s.bg(p.hover)))
+        .focus(|s| s.border_color(p.blue))
+        .disabled(!on)
+        .accessibility_label(if up { "Move up" } else { "Move down" })
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(if up { "Move up" } else { "Move down" })
+                .build(window, cx)
+        })
+        .child(chevron)
+}
+
 impl SettingsTab {
+    /// Moves a connection in `project.toml` through the shell; a failed write is
+    /// shown at the top of the section and the order stays.
+    fn move_connection(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(shell) = self.shell.upgrade() else {
+            return;
+        };
+        let saved = shell.update(cx, |s, cx| s.move_connection(from, to, cx));
+        self.look_error = saved
+            .err()
+            .map(|e| format!("The connection order cannot be saved: {e}"));
+        cx.notify();
+    }
+
     /// Runs `f` on the window's shell.
     fn on_shell(
         &self,
@@ -611,7 +685,7 @@ impl SettingsTab {
     }
 
     /// The Connections block: New connection, then each connection in sidebar order
-    /// with Edit, Duplicate and Delete.
+    /// with a grip to drag it, Move up / Move down, Edit, Duplicate and Delete.
     fn connections(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
         let p = *cx.global::<Palette>();
         let Some(shell) = self.shell.upgrade() else {
@@ -635,7 +709,21 @@ impl SettingsTab {
         let empty = list
             .is_empty()
             .then(|| row(&p).text_color(p.tx3).child("No connections yet."));
+        let last = list.len().saturating_sub(1);
         let rows = list.into_iter().enumerate().map(|(i, c)| {
+            let mover = |up: bool| {
+                let to = if up { i.wrapping_sub(1) } else { i + 1 };
+                let on = if up { i > 0 } else { i < last };
+                // Keyed by connection: focus stays on the button as its row moves.
+                let id = format!("project-conn-{}-{}", if up { "up" } else { "down" }, c.id);
+                move_button(id.into(), up, on, &p).on_click(cx.listener(move |this, _, _, cx| {
+                    this.move_connection(i, to, cx);
+                }))
+            };
+            let drag = DragConn {
+                from: i,
+                name: c.name.clone().into(),
+            };
             let color = c.color.as_deref().and_then(crate::color::parse_hex);
             let action =
                 |id: &'static str,
@@ -652,6 +740,21 @@ impl SettingsTab {
                     ))
                 };
             row(&p)
+                .drag_over::<DragConn>(move |s, _, _, _| s.bg(p.hover))
+                .on_drop(cx.listener(move |this, d: &DragConn, _, cx| {
+                    this.move_connection(d.from, i, cx);
+                }))
+                .child(
+                    div()
+                        .id(("project-conn-grip", i))
+                        .flex_none()
+                        .px(px(4.))
+                        .py(px(6.))
+                        .mr(px(-16.))
+                        .cursor_grab()
+                        .child(grip(&p))
+                        .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone())),
+                )
                 .child(
                     div()
                         .flex_grow(1.)
@@ -695,6 +798,8 @@ impl SettingsTab {
                     div()
                         .flex()
                         .gap(px(6.))
+                        .child(mover(true))
+                        .child(mover(false))
                         .child(action("project-conn-edit", "Edit", |s, id, w, cx| {
                             s.edit_connection(id, true, w, cx);
                         }))

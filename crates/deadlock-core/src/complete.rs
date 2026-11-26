@@ -576,6 +576,117 @@ fn columns(t: &ObjectNode) -> Vec<&ObjectNode> {
         .collect()
 }
 
+/// A schema object a Ctrl/Cmd-click on its name opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// Byte range of the name in the text.
+    pub range: Range<usize>,
+    pub schema: String,
+    /// The tree group it is listed in (`Tables`, `Views`, `Procedures`…).
+    pub group: String,
+    pub name: String,
+    pub kind: NodeKind,
+}
+
+impl Catalog<'_> {
+    /// The table, view or routine `name` in `schema` (else the current schema), with
+    /// the schema and group it is listed under. A schema not loaded goes to `missing`.
+    fn object(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        missing: &mut Vec<String>,
+    ) -> Option<(&ObjectNode, &ObjectNode, &ObjectNode)> {
+        let s = self.schema(schema.or(self.current)?)?;
+        let Some(groups) = s.children.as_deref() else {
+            missing.push(s.name.clone());
+            return None;
+        };
+        let objects = || {
+            groups.iter().flat_map(|g| {
+                g.children
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|o| {
+                        matches!(o.kind, NodeKind::Table | NodeKind::View | NodeKind::Routine)
+                    })
+                    .map(move |o| (g, o))
+            })
+        };
+        objects()
+            .find(|(_, o)| o.name == name)
+            .or_else(|| objects().find(|(_, o)| o.name.eq_ignore_ascii_case(name)))
+            .map(|(g, o)| (s, g, o))
+    }
+}
+
+/// The object whose name is under `offset` in `text`: `schema.name`, or `name` in
+/// the current schema, else the table a statement alias stands for (`FROM orders o`:
+/// `o` and `o.id`'s `o` are `orders`). Columns, schemas, keywords, strings and
+/// comments are not links. A schema to look in that is not loaded goes to `missing`.
+pub fn link_at(
+    text: &str,
+    offset: usize,
+    engine: Engine,
+    catalog: &Catalog,
+    missing: &mut Vec<String>,
+) -> Option<Link> {
+    if engine == Engine::Redis {
+        return None;
+    }
+    let stmt = statement(text, offset, engine);
+    let sql = &text[stmt.clone()];
+    let at = offset - stmt.start;
+    let toks = split::tokens(sql, engine);
+    let tok = |i: usize| toks.get(i).map(|r| &sql[r.clone()]);
+    let name = |i: usize| tok(i).filter(|t| plain_name(engine, t));
+    // The pointer on a name's last half character sits at its end.
+    let k = toks
+        .iter()
+        .position(|r| r.start <= at && at < r.end)
+        .filter(|&i| name(i).is_some())
+        .or_else(|| toks.iter().position(|r| r.end == at))
+        .filter(|&i| name(i).is_some())?;
+    // The dotted chain the name is part of: `schema.table.column`.
+    let mut first = k;
+    while first >= 2 && tok(first - 1) == Some(".") && name(first - 2).is_some() {
+        first -= 2;
+    }
+    let mut last = k;
+    while tok(last + 1) == Some(".") && name(last + 2).is_some() {
+        last += 2;
+    }
+    let parts: Vec<String> = (first..=last)
+        .step_by(2)
+        .map(|i| unquote(engine, &sql[toks[i].clone()]))
+        .collect();
+    let found = match (k - first) / 2 {
+        0 => catalog.object(None, &parts[0], missing).or_else(|| {
+            let r = references(sql, engine).into_iter().find(|r| {
+                r.alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(&parts[0]))
+            })?;
+            catalog.object(r.schema.as_deref(), &r.name, missing)
+        }),
+        // `schema.name`; after a table or an alias it is a column.
+        1 if catalog.schema(&parts[0]).is_some() => {
+            catalog.object(Some(&parts[0]), &parts[1], missing)
+        }
+        _ => None,
+    };
+    let (schema, group, object) = found?;
+    let r = &toks[k];
+    Some(Link {
+        range: stmt.start + r.start..stmt.start + r.end,
+        schema: schema.name.clone(),
+        group: group.name.clone(),
+        name: object.name.clone(),
+        kind: object.kind,
+    })
+}
+
 /// Suggestions for the caret at `offset` in `text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -984,6 +1095,120 @@ mod tests {
             }),
             ..ObjectNode::new(name, NodeKind::Database)
         }
+    }
+
+    #[test]
+    fn links_name_tables_views_and_routines() {
+        let mut app = schema(
+            "app",
+            Some(vec![table("orders", &["id"]), table("users", &["id"])]),
+        );
+        if let Some(groups) = app.children.as_mut() {
+            groups.push(ObjectNode {
+                children: Some(vec![ObjectNode::new("recent", NodeKind::View)]),
+                ..ObjectNode::new("Views", NodeKind::Group)
+            });
+            groups.push(ObjectNode {
+                children: Some(vec![ObjectNode::new("bump", NodeKind::Routine)]),
+                ..ObjectNode::new("Procedures", NodeKind::Group)
+            });
+        }
+        let schemas = vec![
+            app,
+            schema("log", Some(vec![table("events", &[])])),
+            schema("cold", None),
+        ];
+        let cat = Catalog {
+            schemas: &schemas,
+            hidden: &[],
+            current: Some("app"),
+        };
+        // `|` marks the pointer.
+        let link = |marked: &str| {
+            let at = marked.find('|').unwrap();
+            let text = marked.replace('|', "");
+            let mut missing = Vec::new();
+            let found = link_at(&text, at, MY, &cat, &mut missing).map(|l| {
+                let target = format!("{}.{}.{}", l.schema, l.group, l.name);
+                (text[l.range].to_owned(), target)
+            });
+            (found, missing)
+        };
+        let hit = |n: &str, t: &str| (Some((n.to_owned(), t.to_owned())), Vec::<String>::new());
+        let none = (None, Vec::<String>::new());
+        assert_eq!(
+            link("SELECT * FROM ord|ers"),
+            hit("orders", "app.Tables.orders")
+        );
+        assert_eq!(
+            link("SELECT * FROM |ORDERS"),
+            hit("ORDERS", "app.Tables.orders")
+        );
+        assert_eq!(
+            link("SELECT * FROM orders|"),
+            hit("orders", "app.Tables.orders")
+        );
+        assert_eq!(
+            link("SELECT * FROM log.ev|ents"),
+            hit("events", "log.Tables.events")
+        );
+        assert_eq!(
+            link("SELECT * FROM `log`.`ev|ents`"),
+            hit("`events`", "log.Tables.events")
+        );
+        assert_eq!(
+            link("SELECT * FROM rec|ent"),
+            hit("recent", "app.Views.recent")
+        );
+        assert_eq!(link("CALL bu|mp(1)"), hit("bump", "app.Procedures.bump"));
+        // Aliases stand for their table, alone or before a column.
+        assert_eq!(
+            link("SELECT o|.id FROM orders o"),
+            hit("o", "app.Tables.orders")
+        );
+        assert_eq!(
+            link("SELECT e|.id FROM log.events AS e"),
+            hit("e", "log.Tables.events")
+        );
+        // Columns, schemas, keywords, strings and comments are not links.
+        assert_eq!(link("SELECT o.i|d FROM orders o"), none);
+        assert_eq!(link("SELECT orders.i|d FROM orders"), none);
+        assert_eq!(link("SELECT * FROM lo|g.events"), none);
+        assert_eq!(link("SEL|ECT 1"), none);
+        assert_eq!(link("SELECT 'ord|ers'"), none);
+        assert_eq!(link("SELECT 1 -- ord|ers"), none);
+        assert_eq!(link("SELECT * FROM nowh|ere"), none);
+        // A schema that is not loaded yet is asked for.
+        assert_eq!(
+            link("SELECT * FROM cold.t|1"),
+            (None, vec!["cold".to_owned()])
+        );
+        // The statement under the pointer, not the one before it.
+        assert_eq!(
+            link("SELECT 1 FROM users u; SELECT u|.id FROM orders u"),
+            hit("u", "app.Tables.orders")
+        );
+    }
+
+    #[test]
+    fn oracle_links_follow_upper_case_names() {
+        let schemas = vec![schema("APP", Some(vec![table("ORDERS", &[])]))];
+        let cat = Catalog {
+            schemas: &schemas,
+            hidden: &[],
+            current: Some("APP"),
+        };
+        let at =
+            |text: &str, n: usize| link_at(text, n, ORA, &cat, &mut Vec::new()).map(|l| l.name);
+        assert_eq!(at("select * from orders", 16).as_deref(), Some("ORDERS"));
+        assert_eq!(
+            at("select * from app.orders", 20).as_deref(),
+            Some("ORDERS")
+        );
+        assert_eq!(
+            at(r#"select * from "APP"."ORDERS""#, 23).as_deref(),
+            Some("ORDERS")
+        );
     }
 
     fn labels(text: &str, cat: &Catalog) -> Vec<String> {
