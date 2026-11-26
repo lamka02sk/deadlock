@@ -190,6 +190,17 @@ impl TableInfo {
         }
     }
 
+    /// The key's columns as an order by list: `` `id` ``, `"A", "B"`, `ROWID`.
+    pub fn key_order(&self) -> Option<String> {
+        let key = self.key.as_ref().filter(|k| !k.is_empty())?;
+        Some(
+            key.iter()
+                .map(|&i| self.column(i))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
     fn qualified(&self, t: &TableRef) -> String {
         format!("{}.{}", self.ident(&t.database), self.ident(&t.table))
     }
@@ -1052,15 +1063,15 @@ pub fn select_sql(
     if !filter.trim().is_empty() {
         let _ = write!(sql, "\nwhere (\n{}\n)", filter.trim());
     }
-    let mut order_by: Vec<String> = Vec::new();
+    // No order typed: no order by at all. Sorting by the key makes Oracle read the
+    // rows one by one through the key's index, which is slow on a big table; in
+    // storage order it reads them in large blocks. Typed: the key breaks ties, so
+    // pages do not overlap.
     if !order.trim().is_empty() {
-        order_by.push(format!("\n{}\n", order.trim()));
-    }
-    if let Some(key) = &info.key {
-        order_by.extend(key.iter().map(|&i| info.column(i)));
-    }
-    if !order_by.is_empty() {
-        let _ = write!(sql, "\norder by {}", order_by.join(", "));
+        let _ = write!(sql, "\norder by \n{}\n", order.trim());
+        if let Some(key) = info.key_order() {
+            let _ = write!(sql, ", {key}");
+        }
     }
     one_statement(&sql, info)?;
     Ok(sql)
@@ -1520,9 +1531,10 @@ mod tests {
     #[test]
     fn selects_wrap_user_text_and_end_with_the_key() {
         let (t, info) = orders();
+        // Nothing typed: no order by, so Oracle can read in storage order.
         assert_eq!(
             select_sql(&t, &info, "", "").unwrap(),
-            "select `id`, `status`, `total` from `shop`.`orders`\norder by `id`"
+            "select `id`, `status`, `total` from `shop`.`orders`"
         );
         let sql = select_sql(&t, &info, "status = 'paid' -- note", "total desc").unwrap();
         assert_eq!(
@@ -1635,7 +1647,7 @@ mod tests {
         let sql = select_sql(&t, &info, "", "").unwrap();
         assert_eq!(
             sql,
-            "select \"N\", \"D\", \"R\", ROWID from \"APP\".\"Or\"\"ders\"\norder by ROWID"
+            "select \"N\", \"D\", \"R\", ROWID from \"APP\".\"Or\"\"ders\""
         );
         assert_eq!(oracle_literal(&Value::Bool(true)).unwrap(), "TRUE");
         assert_eq!(oracle_literal(&Value::Bytes(vec![])).unwrap(), "NULL");

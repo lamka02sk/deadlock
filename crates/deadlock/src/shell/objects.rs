@@ -8,6 +8,7 @@ use std::sync::Arc;
 use deadlock_core::driver::{DriverError, NodeKind};
 use deadlock_core::edit::TableRef;
 use deadlock_core::objects::{Flavor, ObjectKind, ObjectRef, Properties, template};
+use deadlock_core::project::TabState;
 use deadlock_core::schema::{Row, RowKind};
 use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -332,7 +333,16 @@ impl Shell {
         if i >= self.objects.len() {
             return;
         }
-        drop(self.objects.remove(i));
+        let (tab, _) = self.objects.remove(i);
+        let t = tab.read(cx);
+        if !t.new {
+            self.remember_closed(TabState::Object {
+                connection: t.connection.id.clone(),
+                schema: t.object.schema.clone(),
+                name: t.object.name.clone(),
+                object: t.object.kind.label().to_owned(),
+            });
+        }
         self.front = match self.front {
             Front::Object(f) if f == i => match (self.objects.len(), self.tabs.len()) {
                 (0, 0) => Front::None,
@@ -443,7 +453,7 @@ impl Shell {
         let read_only = self.config(&conn).is_some_and(|c| c.read_only);
         let new_item = |kind: ObjectKind, schema: String, table: Option<String>| {
             let (shell, conn) = (shell.clone(), conn.clone());
-            menu_item(format!("New {}…", kind.label()), Icon::Plus)
+            menu_item(format!("New {}…", kind.label()), kind_icon(kind))
                 .disabled(read_only)
                 .on_click(move |_, window, cx| {
                     let table = table.clone();
@@ -454,7 +464,7 @@ impl Shell {
         };
         let new_table = |schema: String| {
             let (shell, conn) = (shell.clone(), conn.clone());
-            menu_item("New table…", Icon::Plus)
+            menu_item("New table…", Icon::Table)
                 .disabled(read_only)
                 .on_click(move |_, window, cx| {
                     shell.update(cx, |s, cx| s.new_table(&conn, &schema, window, cx));
@@ -780,6 +790,22 @@ pub(super) fn object_tabs(shell: &Shell, cx: &mut Context<Shell>) -> Vec<impl In
                 .map(|d| super::tabs::tinted(d, tint, on, &p))
         })
         .collect()
+}
+
+/// The icon of an object kind in the New menu.
+fn kind_icon(kind: ObjectKind) -> Icon {
+    match kind {
+        ObjectKind::View => Icon::Eye,
+        ObjectKind::MaterializedView => Icon::Layers,
+        ObjectKind::Procedure => Icon::Procedure,
+        ObjectKind::Function => Icon::Routine,
+        ObjectKind::Package => Icon::Package,
+        ObjectKind::Trigger => Icon::Trigger,
+        ObjectKind::Event => Icon::Calendar,
+        ObjectKind::Sequence => Icon::Sequence,
+        ObjectKind::Synonym => Icon::Link,
+        ObjectKind::Type => Icon::ObjectType,
+    }
 }
 
 #[cfg(test)]

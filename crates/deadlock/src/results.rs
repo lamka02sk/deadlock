@@ -17,9 +17,10 @@ use gpui_kit::component::table::{self, ColumnSort, TableDelegate, TableEvent, Ta
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, ClipboardItem, Context, Div, Entity, Focusable as _, FontWeight, InteractiveElement,
-    IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, actions, div, px,
+    App, ClipboardItem, Context, DispatchPhase, Div, Entity, Focusable as _, FontWeight,
+    InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, SharedString, StatefulInteractiveElement, Styled,
+    Window, actions, canvas, div, px,
 };
 use tokio::sync::oneshot;
 
@@ -222,6 +223,8 @@ pub struct Grid {
     pub sel: Option<Sel>,
     /// A left drag over the cells is extending the selection.
     dragging: bool,
+    /// Where the pointer is during that drag, in window coordinates.
+    drag_at: Option<Point<Pixels>>,
     rt: Arc<Runtime>,
     took: Duration,
 }
@@ -259,6 +262,7 @@ impl Grid {
             row_offset: 0,
             sel: None,
             dragging: false,
+            drag_at: None,
             rt,
             took,
         }
@@ -340,12 +344,25 @@ impl Grid {
     }
 
     /// The selection as TSV, with a header line when asked; else the table's own
-    /// selection (a whole column).
+    /// selection (a whole column). A table tab's plain copy is one `a, b, c` line.
     pub fn copy(&self, selection: table::TableSelection, headers: bool) -> Option<String> {
         match self.sel_table() {
-            Some((names, rows)) => Some(tsv(headers.then_some(&names[..]), &rows)),
+            Some((_, rows)) if !headers => Some(self.plain(&rows)),
+            Some((names, rows)) => Some(tsv(Some(&names[..]), &rows)),
             None => self.copy_text(selection),
         }
+    }
+
+    /// Copy without headers: TSV, or on a table tab every value on one line.
+    fn plain(&self, rows: &[Vec<Option<&Value>>]) -> String {
+        if self.edit.is_none() {
+            return tsv(None, rows);
+        }
+        rows.iter()
+            .flatten()
+            .map(|v| v.map_or_else(String::new, tsv_cell))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// `6 cells selected · sum 21 · avg 3.5`, for two cells and more. The sum and
@@ -400,6 +417,20 @@ impl Grid {
                 cx,
             );
         }
+    }
+
+    /// Data column `c`'s width until the user sets one.
+    pub fn default_width(&self, c: usize) -> f32 {
+        let default: f32 = if self.numeric[c] { 110. } else { 190. };
+        // Room for the name and, on a sorted column, its arrow and key number.
+        let sort_slot = self
+            .edit
+            .as_ref()
+            .filter(|e| e.sort.iter().any(|(s, _)| *s == c))
+            .map_or(0., |e| if e.sort.len() > 1 { 32. } else { 22. });
+        #[allow(clippy::cast_precision_loss)] // a width estimate
+        let fit = 24. + 7. * self.columns[c].name.chars().count() as f32 + sort_slot;
+        default.max(fit.min(320.))
     }
 
     /// Columns before the data: the row number, and on a table tab the mark.
@@ -962,7 +993,7 @@ impl Grid {
         };
         let (names, cells) = self.sel_table().unwrap_or_default();
         let menu = menu
-            .item(menu_item("Copy", Icon::Copy).on_click(copy(tsv(None, &cells))))
+            .item(menu_item("Copy", Icon::Copy).on_click(copy(self.plain(&cells))))
             .item(
                 menu_item("Copy with headers", Icon::Copy)
                     .on_click(copy(tsv(Some(&names), &cells))),
@@ -992,7 +1023,7 @@ impl Grid {
     }
 
     /// Rows drawn: fetched plus added.
-    fn rows_count_now(&self) -> usize {
+    pub fn rows_count_now(&self) -> usize {
         self.rows.len() + self.edit.as_ref().map_or(0, |e| e.pending.added_len())
     }
 }
@@ -1040,13 +1071,106 @@ pub fn grid_actions(d: Div, table: &Entity<TableState<Grid>>) -> Div {
         }
     });
     let (plain, headers) = (copy(false), copy(true));
-    d.on_action(move |_: &crate::query::CopySelection, _, cx| plain(cx))
+    d.child(drag_scroll(table))
+        .on_action(move |_: &crate::query::CopySelection, _, cx| plain(cx))
         .on_action(move |_: &CopyWithHeaders, _, cx| headers(cx))
         .on_action(move |_: &SelectAll, _, cx| all(cx))
         .on_action(move |_: &ExtendUp, _, cx| up(cx))
         .on_action(move |_: &ExtendDown, _, cx| down(cx))
         .on_action(move |_: &ExtendLeft, _, cx| left(cx))
         .on_action(move |_: &ExtendRight, _, cx| right(cx))
+}
+
+/// While a drag picks cells, a pointer above or below the rows scrolls them and takes
+/// the selection to the edge row, frame after frame until it comes back or lets go.
+fn drag_scroll(table: &Entity<TableState<Grid>>) -> impl IntoElement {
+    let table = table.clone();
+    canvas(
+        |_, _, _| {},
+        move |_, (), window, cx| {
+            let t = table.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                t.update(cx, |t, cx| {
+                    let g = t.delegate_mut();
+                    if !g.dragging {
+                        return;
+                    }
+                    if e.pressed_button == Some(MouseButton::Left) {
+                        g.drag_at = Some(e.position);
+                    } else {
+                        g.dragging = false;
+                        g.drag_at = None;
+                    }
+                    cx.notify();
+                });
+            });
+            let t = table.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                t.update(cx, |t, cx| {
+                    let g = t.delegate_mut();
+                    g.drag_at = None;
+                    // Let go off the rows: the cursor goes where the selection ended.
+                    if std::mem::take(&mut g.dragging)
+                        && let Some((r, c)) = g.sel.map(|s| s.head)
+                    {
+                        let gc = g.grid_col(c);
+                        t.set_selected_cell(r, gc, cx);
+                    }
+                });
+            });
+            if table.update(cx, autoscroll) {
+                window.request_animation_frame();
+            }
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
+/// One frame of [`drag_scroll`]: whether the pointer is past the rows.
+fn autoscroll(t: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) -> bool {
+    let g = t.delegate();
+    let Some(at) = g.drag_at.filter(|_| g.dragging) else {
+        return false;
+    };
+    let handle = t.vertical_scroll_handle.0.borrow().base_handle.clone();
+    let body = handle.bounds();
+    let past = if at.y < body.top() {
+        at.y - body.top()
+    } else if at.y > body.bottom() {
+        at.y - body.bottom()
+    } else {
+        return false;
+    };
+    // Faster the further out, at most two rows a frame.
+    let step = (past / 2.).clamp(px(-64.), px(64.));
+    let mut offset = handle.offset();
+    offset.y = (offset.y - step).clamp(-handle.max_offset().y, px(0.));
+    handle.set_offset(offset);
+    let rows = t.visible_range().rows().clone();
+    let edge = if past < px(0.) {
+        rows.start
+    } else {
+        rows.end.saturating_sub(1)
+    };
+    let g = t.delegate_mut();
+    if let Some(s) = g.sel {
+        g.set_sel(
+            Some(Sel {
+                anchor: s.anchor,
+                head: (edge, s.head.1),
+            }),
+            cx,
+        );
+    }
+    cx.notify();
+    true
 }
 
 /// A number cell's value, for the selection's sum.
@@ -1250,21 +1374,12 @@ impl TableDelegate for Grid {
                 .text_right();
         };
         let name = &self.columns[c].name;
-        let default: f32 = if self.numeric[c] { 110. } else { 190. };
-        // Room for the name and, on a sorted column, its arrow and key number.
-        let sort_slot = self
-            .edit
-            .as_ref()
-            .filter(|e| e.sort.iter().any(|(s, _)| *s == c))
-            .map_or(0., |e| if e.sort.len() > 1 { 32. } else { 22. });
-        #[allow(clippy::cast_precision_loss)] // a width estimate
-        let fit = 24. + 7. * name.chars().count() as f32 + sort_slot;
         let base = table::Column::new(SharedString::from(format!("c{col}")), name.clone())
             .width(px(self
                 .widths
                 .get(c)
                 .copied()
-                .unwrap_or(default.max(fit.min(320.)))))
+                .unwrap_or_else(|| self.default_width(c))))
             .movable(false)
             .p_0();
         let base = if self.numeric[c] {
@@ -1600,6 +1715,8 @@ mod tests {
         });
         let s = table::TableSelection::None;
         assert_eq!(g.copy(s, false).unwrap(), "1\ta b\n2\t");
+        g.edit = Some(EditOverlay::new(TableInfo::default(), None));
+        assert_eq!(g.copy(s, false).unwrap(), "1, a b, 2, ");
         assert_eq!(g.copy(s, true).unwrap(), "id\tnote\n1\ta b\n2\t");
         assert_eq!(
             g.sel_status().unwrap(),

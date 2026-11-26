@@ -6,6 +6,33 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Autocomplete in the data view's `where` and `order by` fields, the table's columns first.
+- Refresh button in the data view's pager: reloads the page and keeps the scroll position.
+  Its icon spins while rows load, and the time the last load took shows beside it.
+- Transposed data view (`Ctrl+T` or the pager button): one row as a column / value list,
+  stepped with the arrow keys; edits go through the cell dialog into the pending changes.
+- Copy query button in the data view: the `select` the where and order by fields make.
+- Resized column widths are remembered per table.
+- `Ctrl+W` closes the tab in front; `Ctrl+Shift+T` reopens the last of 25 closed tabs.
+- The schema menu's New items each have their own icon.
+
+### Changed
+
+- Copying several cells in the data view joins the values with `, ` on one line.
+- The Delete row button is gone from the data view toolbar; the `Delete` key and the row
+  menu still delete rows. Rows per page moved next to the page buttons.
+
+### Fixed
+
+- The data view no longer sorts by the table's key when the order by field is empty. On a
+  big Oracle table that sort read every row through the key's index (seconds instead of
+  milliseconds); rows now come in storage order, as in DataGrip. A typed order by still
+  ends with the key, so pages do not overlap.
+- Dragging a selection past the top or bottom of a grid scrolls it.
+- Shortcuts stopped working after closing a tab until something was clicked.
+
 ## [0.1.4] - 2026-11-26
 
 ### Added

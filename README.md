@@ -143,6 +143,7 @@ passwords. Per-machine state (open tabs, window size) lives in `.deadlock/state.
 | Action | Shortcut |
 |---|---|
 | New query / open file / save | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` |
+| Close tab / reopen closed tab | `Ctrl+W` / `Ctrl+Shift+T` |
 | Run statement / run file / stop | `Ctrl+Enter` / `Ctrl+Shift+Enter` / `Ctrl+F2` |
 | Console | `Ctrl+Shift+N` |
 | Format SQL | `Ctrl+Alt+L` |
@@ -159,7 +160,8 @@ passwords. Per-machine state (open tabs, window size) lives in `.deadlock/state.
 
 In the data grid: `Enter` edits a cell, `Alt+Insert` adds a row, `Delete` deletes the
 selected rows, `Ctrl+Z` undoes a pending change, `Shift`+arrows extend the selection,
-`Ctrl+Alt+N` sets NULL and `Ctrl+Alt+D` sets DEFAULT.
+`Ctrl+Alt+N` sets NULL, `Ctrl+Alt+D` sets DEFAULT and `Ctrl+T` switches to the transposed
+view (one row as a column / value list).
 
 ## Project layout
 

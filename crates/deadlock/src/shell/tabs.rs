@@ -16,6 +16,9 @@ use gpui_kit::{
 
 use super::{Conn, Front, Shell};
 
+/// How many closed tabs Ctrl+Shift+T can bring back.
+const CLOSED_LIMIT: usize = 25;
+
 /// How long closing, switching or moving waits for a tab's transaction check.
 const TX_CHECK_WAIT: Duration = Duration::from_secs(3);
 
@@ -62,65 +65,23 @@ impl Shell {
         let saved = std::mem::take(&mut self.project.state.tabs);
         let front = self.project.state.active_tab;
         for tab in saved {
-            let (kind, connection, text, schema) = match tab {
-                TabState::File {
-                    path: Some(path),
-                    connection,
-                    schema,
-                    ..
-                } => match std::fs::read_to_string(&path) {
-                    Ok(text) => (Kind::File(Some(path)), connection, text, schema),
-                    Err(e) => {
-                        eprintln!("deadlock: {}: {e}", path.display());
-                        continue;
-                    }
-                },
-                TabState::File {
-                    path: None,
-                    connection,
-                    text,
-                    schema,
-                } => (
-                    Kind::File(None),
-                    connection,
-                    text.unwrap_or_default(),
-                    schema,
-                ),
-                TabState::Table {
-                    connection,
-                    database,
-                    table,
-                } => (
-                    Kind::Table(TableRef { database, table }),
-                    Some(connection),
-                    String::new(),
-                    None,
-                ),
-                TabState::Object {
-                    connection,
-                    schema,
-                    name,
-                    object,
-                } => {
-                    if let Some(kind) = ObjectKind::from_label(&object)
-                        && self.config(&connection).is_some()
-                    {
-                        let o = ObjectRef::new(schema, name, kind);
-                        self.restored_objects.push((connection, o));
-                    }
-                    continue;
+            if let TabState::Object {
+                connection,
+                schema,
+                name,
+                object,
+            } = tab
+            {
+                if let Some(kind) = ObjectKind::from_label(&object)
+                    && self.config(&connection).is_some()
+                {
+                    let o = ObjectRef::new(schema, name, kind);
+                    self.restored_objects.push((connection, o));
                 }
-                TabState::Console { connection, schema } => {
-                    match console_path(self.project.root(), &connection)
-                        .and_then(|p| load_text(&p).map(|t| (p, t)))
-                    {
-                        Ok((path, text)) => (Kind::Console(path), Some(connection), text, schema),
-                        Err(e) => {
-                            eprintln!("deadlock: console: {e}");
-                            continue;
-                        }
-                    }
-                }
+                continue;
+            }
+            let Some((kind, connection, text, schema)) = self.saved_tab(tab) else {
+                continue;
             };
             let binding = self.binding(connection.as_deref());
             let i = self.add_tab(kind, binding, text, window, cx);
@@ -142,6 +103,132 @@ impl Shell {
         self.follow_front(cx);
     }
 
+    /// A saved editor tab as a tab to add: its kind, connection, text and schema.
+    /// `None` for an object tab, and for a file or console that cannot be read.
+    fn saved_tab(&self, tab: TabState) -> Option<(Kind, Option<String>, String, Option<String>)> {
+        Some(match tab {
+            TabState::File {
+                path: Some(path),
+                connection,
+                schema,
+                ..
+            } => match std::fs::read_to_string(&path) {
+                Ok(text) => (Kind::File(Some(path)), connection, text, schema),
+                Err(e) => {
+                    eprintln!("deadlock: {}: {e}", path.display());
+                    return None;
+                }
+            },
+            TabState::File {
+                path: None,
+                connection,
+                text,
+                schema,
+            } => (
+                Kind::File(None),
+                connection,
+                text.unwrap_or_default(),
+                schema,
+            ),
+            TabState::Table {
+                connection,
+                database,
+                table,
+            } => (
+                Kind::Table(TableRef { database, table }),
+                Some(connection),
+                String::new(),
+                None,
+            ),
+            TabState::Console { connection, schema } => {
+                match console_path(self.project.root(), &connection)
+                    .and_then(|p| load_text(&p).map(|t| (p, t)))
+                {
+                    Ok((path, text)) => (Kind::Console(path), Some(connection), text, schema),
+                    Err(e) => {
+                        eprintln!("deadlock: console: {e}");
+                        return None;
+                    }
+                }
+            }
+            TabState::Object { .. } => return None,
+        })
+    }
+
+    /// Ctrl+W: closes the tab in front, asking what its own close asks.
+    pub(super) fn close_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.front {
+            Front::Query(i) => self.close_tab(i, window, cx),
+            Front::Object(i) => self.close_object(i, window, cx),
+            Front::Sessions(i) => self.close_sessions(i, cx),
+            Front::Config(i) => self.close_config(i, window, cx),
+            Front::Diagram(i) => self.close_diagram(i, cx),
+            Front::Import => self.close_import(cx),
+            Front::Settings => self.close_settings(cx),
+            Front::Form => self.close_form(cx),
+            Front::None => {}
+        }
+    }
+
+    /// Keeps a closed tab for Ctrl+Shift+T, the last [`CLOSED_LIMIT`] of them.
+    pub(super) fn remember_closed(&mut self, tab: TabState) {
+        self.closed.retain(|t| *t != tab);
+        self.closed.push(tab);
+        if self.closed.len() > CLOSED_LIMIT {
+            self.closed.remove(0);
+        }
+    }
+
+    /// Ctrl+Shift+T: opens the tab closed last again, or brings it forward when it is
+    /// open. One whose connection, file or object is gone is skipped for the one before.
+    pub(super) fn reopen_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(tab) = self.closed.pop() {
+            let connection = match &tab {
+                TabState::File { connection, .. } => connection.clone(),
+                TabState::Console { connection, .. }
+                | TabState::Table { connection, .. }
+                | TabState::Object { connection, .. } => Some(connection.clone()),
+            };
+            if connection
+                .as_deref()
+                .is_some_and(|c| self.config(c).is_none())
+            {
+                continue;
+            }
+            if let TabState::Object {
+                connection,
+                schema,
+                name,
+                object,
+            } = tab
+            {
+                let Some(kind) = ObjectKind::from_label(&object) else {
+                    continue;
+                };
+                let o = ObjectRef::new(schema, name, kind);
+                self.open_object(&connection, o, None, window, cx);
+                return;
+            }
+            let Some((kind, connection, text, schema)) = self.saved_tab(tab) else {
+                continue;
+            };
+            let open = self.tabs.iter().position(|(t, _)| {
+                let t = t.read(cx);
+                t.kind == kind
+                    && !matches!(kind, Kind::File(None))
+                    && t.connection.as_ref().map(|c| &c.id) == connection.as_ref()
+            });
+            let i = open.unwrap_or_else(|| {
+                let binding = self.binding(connection.as_deref());
+                let i = self.add_tab(kind, binding, text, window, cx);
+                self.tabs[i].0.update(cx, |t, _| t.restore_schema(schema));
+                i
+            });
+            self.show_tab(Front::Query(i), window, cx);
+            return;
+        }
+    }
+
     pub(super) fn add_tab(
         &mut self,
         kind: Kind,
@@ -153,10 +240,21 @@ impl Shell {
         let untitled = matches!(kind, Kind::File(None));
         let inline = self.results_inline(cx);
         let root = self.project.root().to_owned();
+        let widths = match (&kind, &binding) {
+            (Kind::Table(r), Some(c)) => self
+                .project
+                .state
+                .widths(&c.id, &r.database, &r.table)
+                .cloned(),
+            _ => None,
+        };
         let tab = cx.new(|cx| {
             let mut t = QueryTab::new(kind, binding, text, window, cx);
             t.inline = inline;
             t.root = root.clone();
+            if let (Some(t), Some(w)) = (&mut t.table, widths) {
+                t.widths = w;
+            }
             t
         });
         if untitled {
@@ -242,6 +340,8 @@ impl Shell {
                 // No prompts: the dialog discarded pending edits, and the DDL committed.
                 if let Some(i) = self.tabs.iter().position(|(t, _)| t == tab) {
                     self.remove_tab(i, cx);
+                    // The table is gone: nothing to reopen.
+                    self.closed.pop();
                 }
             }
             TabEvent::Discard => {
@@ -250,6 +350,15 @@ impl Shell {
                 }
             }
             TabEvent::Recorded => self.history_changed(cx),
+            TabEvent::ColumnWidths(widths) => {
+                if let (Some(conn), Kind::Table(r)) = (conn, &tab.read(cx).kind) {
+                    let widths = widths.clone();
+                    self.project
+                        .state
+                        .set_widths(&conn, &r.database, &r.table, widths);
+                    self.schedule_save(cx);
+                }
+            }
             TabEvent::SchemaSet => {
                 self.schedule_save(cx);
                 cx.notify();
@@ -355,18 +464,26 @@ impl Shell {
     pub(super) fn show_tab(&mut self, front: Front, window: &mut Window, cx: &mut Context<Self>) {
         self.front = front;
         self.sidebar_last = false;
-        if let Some(tab) = self.front_tab().cloned() {
-            if tab.read(cx).table.is_some() {
-                tab.update(cx, |t, cx| {
-                    t.open_table(cx);
-                    t.focus_table(window, cx);
-                });
-            } else {
+        if let Some(tab) = self.front_tab() {
+            tab.clone().update(cx, |t, cx| t.open_table(cx));
+        }
+        self.focus_front(window, cx);
+        self.follow_front(cx);
+    }
+
+    /// Focuses the editor tab in front (its grid or editor), else the window, so the
+    /// window's shortcuts reach it.
+    pub(super) fn focus_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.front_tab().cloned() {
+            Some(tab) if tab.read(cx).table.is_some() => {
+                tab.update(cx, |t, cx| t.focus_table(window, cx));
+            }
+            Some(tab) => {
                 let editor = tab.read(cx).editor.clone();
                 editor.update(cx, |e, cx| e.focus(window, cx));
             }
+            None => window.focus(&self.focus, cx),
         }
-        self.follow_front(cx);
     }
 
     /// Opens a table or view of connection `conn` as a tab, or brings its tab forward;
@@ -679,6 +796,13 @@ impl Shell {
             return;
         }
         let (tab, _) = self.tabs.remove(i);
+        let saved = Self::tab_state(tab.read(cx), cx);
+        if let Some(saved) = saved.filter(|s| {
+            !matches!(s, TabState::File { path: None, text, .. }
+                if text.as_deref().is_none_or(|t| t.trim().is_empty()))
+        }) {
+            self.remember_closed(saved);
+        }
         tab.update(cx, |t, cx| t.close_session(cx));
         self.front = match self.front {
             Front::Query(f) if f == i => match self.tabs.len() {
@@ -987,6 +1111,30 @@ impl Shell {
         }
     }
 
+    /// An editor tab as `state.json` keeps it; `None` for a New table draft.
+    fn tab_state(t: &QueryTab, cx: &gpui_kit::App) -> Option<TabState> {
+        let connection = t.connection.as_ref().map(|c| c.id.clone());
+        let schema = t.picked_schema().map(str::to_owned);
+        Some(match &t.kind {
+            Kind::Table(r) if r.table.is_empty() => return None,
+            Kind::File(path) => TabState::File {
+                path: path.clone(),
+                text: path.is_none().then(|| t.text(cx)),
+                connection,
+                schema,
+            },
+            Kind::Console(_) => TabState::Console {
+                connection: connection.unwrap_or_default(),
+                schema,
+            },
+            Kind::Table(r) => TabState::Table {
+                connection: connection.unwrap_or_default(),
+                database: r.database.clone(),
+                table: r.table.clone(),
+            },
+        })
+    }
+
     /// The tab list as `state.json` keeps it. New table drafts are left out.
     pub(super) fn sync_tabs(&mut self, cx: &gpui_kit::App) {
         let draft =
@@ -994,29 +1142,7 @@ impl Shell {
         self.project.state.tabs = self
             .tabs
             .iter()
-            .filter(|(t, _)| !draft(t))
-            .map(|(t, _)| {
-                let t = t.read(cx);
-                let connection = t.connection.as_ref().map(|c| c.id.clone());
-                let schema = t.picked_schema().map(str::to_owned);
-                match &t.kind {
-                    Kind::File(path) => TabState::File {
-                        path: path.clone(),
-                        text: path.is_none().then(|| t.text(cx)),
-                        connection,
-                        schema,
-                    },
-                    Kind::Console(_) => TabState::Console {
-                        connection: connection.unwrap_or_default(),
-                        schema,
-                    },
-                    Kind::Table(r) => TabState::Table {
-                        connection: connection.unwrap_or_default(),
-                        database: r.database.clone(),
-                        table: r.table.clone(),
-                    },
-                }
-            })
+            .filter_map(|(t, _)| Self::tab_state(t.read(cx), cx))
             .collect();
         let objects = self
             .objects

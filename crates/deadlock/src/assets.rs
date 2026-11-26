@@ -90,6 +90,14 @@ pub enum Icon {
     SelectAll,
     Color,
     Warning,
+    Layers,
+    Sequence,
+    Procedure,
+    Package,
+    Trigger,
+    Link,
+    ObjectType,
+    Transpose,
 }
 
 impl Icon {
@@ -149,6 +157,14 @@ impl Icon {
             Self::SelectAll => "deadlock/icons/select-all.svg",
             Self::Color => "deadlock/icons/color.svg",
             Self::Warning => "deadlock/icons/warning.svg",
+            Self::Layers => "deadlock/icons/layers.svg",
+            Self::Sequence => "deadlock/icons/sequence.svg",
+            Self::Procedure => "deadlock/icons/procedure.svg",
+            Self::Package => "deadlock/icons/package.svg",
+            Self::Trigger => "deadlock/icons/trigger.svg",
+            Self::Link => "deadlock/icons/link.svg",
+            Self::ObjectType => "deadlock/icons/type.svg",
+            Self::Transpose => "deadlock/icons/transpose.svg",
         }
     }
 }
@@ -308,6 +324,14 @@ mod tests {
             Icon::SelectAll,
             Icon::Color,
             Icon::Warning,
+            Icon::Layers,
+            Icon::Sequence,
+            Icon::Procedure,
+            Icon::Package,
+            Icon::Trigger,
+            Icon::Link,
+            Icon::ObjectType,
+            Icon::Transpose,
         ];
         for path in all.iter().map(|i| i.path()).chain([APP_LOGO]) {
             assert!(Assets.load(path).unwrap().is_some(), "{path}");

@@ -92,7 +92,9 @@ actions!(
         ToggleFiles,
         FilterFiles,
         RenameFile,
-        DeleteFile
+        DeleteFile,
+        CloseTab,
+        ReopenTab
     ]
 );
 
@@ -180,6 +182,8 @@ pub struct Shell {
     objects: Vec<(Entity<crate::object::ObjectTab>, Subscription)>,
     /// Object tabs from `state.json`, waiting for their connection to connect.
     restored_objects: Vec<(String, deadlock_core::objects::ObjectRef)>,
+    /// Tabs closed this session, the last one last: Ctrl+Shift+T reopens them.
+    closed: Vec<deadlock_core::project::TabState>,
     /// Sessions waiting on a lock, per connection, from the periodic check.
     waiting: HashMap<String, usize>,
     _watch: Task<()>,
@@ -282,6 +286,7 @@ impl Shell {
             diagrams: Vec::new(),
             objects: Vec::new(),
             restored_objects: Vec::new(),
+            closed: Vec::new(),
             waiting: HashMap::new(),
             _watch: Self::watch_waits(cx),
             front: Front::None,
@@ -1021,6 +1026,11 @@ impl Render for Shell {
         });
         let history_width = px(self.project.state.history_width.unwrap_or(history::WIDTH));
         self.focus_rename(window, cx);
+        // A closed tab took the focus with it: the tab now in front gets it, so the
+        // shortcuts (Ctrl+W, Ctrl+Shift+T…) keep working.
+        if window.focused(cx).is_none() {
+            self.focus_front(window, cx);
+        }
         let files_open = self.project.state.files_open;
         let files_panel = files_open.then(|| files::panel(self, cx));
         let files_width = px(self.project.state.files_width.unwrap_or(files::WIDTH));
@@ -1054,6 +1064,10 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewQuery, window, cx| this.new_query(window, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_front(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ReopenTab, window, cx| this.reopen_closed(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &OpenFile, window, cx| this.open_file(window, cx)))
             .on_action(cx.listener(|this, _: &SaveFile, window, cx| {
                 // In an object editor, Save applies.

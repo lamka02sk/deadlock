@@ -41,7 +41,7 @@ use inline::{BlockEvent, Body, ResultBlock};
 pub(crate) use structure::TableAction;
 pub use table::{
     AddRow, DeleteRows, EditCell, NextCell, PasteCells, PickDate, PrevCell, SetDefault, SetNull,
-    UndoChange, View,
+    ToggleTransposed, UndoChange, View,
 };
 
 use crate::app::{Db, HistoryDb};
@@ -136,6 +136,8 @@ pub enum TabEvent {
         Vec<Vec<u8>>,
         Option<(Vec<u8>, deadlock_core::redis::KeyType)>,
     ),
+    /// The user resized the table's columns: the project keeps the widths by name.
+    ColumnWidths(std::collections::BTreeMap<String, f32>),
 }
 
 enum Session {
@@ -342,7 +344,7 @@ impl QueryTab {
             path_field: None,
         };
         if let Kind::Table(t) = &this.kind {
-            let mut data = table::data(t.clone(), window, cx);
+            let mut data = table::data(t.clone(), redis, window, cx);
             if redis {
                 data.redis = Some(key::KeyState::new(&t.table));
                 let hint = "field or member pattern, for example last_*";

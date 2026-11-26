@@ -33,11 +33,17 @@ type Connection = Rc<dyn Fn(&App) -> Option<ConnectionConfig>>;
 /// The schema unqualified names resolve in, read at each request.
 type Schema = Rc<dyn Fn(&App) -> Option<String>>;
 
+/// The statement a one-line field's text continues (`SELECT * FROM t WHERE `), read at
+/// each request.
+type Prefix = Rc<dyn Fn(&App) -> Option<String>>;
+
 struct Sql {
     shell: WeakEntity<Shell>,
     connection: Connection,
     schema: Schema,
     editor: WeakEntity<EditorState>,
+    /// Set on a table tab's where and order by fields.
+    prefix: Option<Prefix>,
 }
 
 /// The object the pointer names, found while Ctrl/Cmd hovers: its connection and link.
@@ -68,6 +74,7 @@ fn around(rope: &Rope, offset: usize) -> (String, usize) {
 
 /// Gives the tab's editor SQL completions.
 pub(super) fn install(shell: WeakEntity<Shell>, tab: &Entity<QueryTab>, cx: &mut App) {
+    install_filters(&shell, tab, cx);
     let editor = tab.read(cx).editor.clone();
     let tab = tab.downgrade();
     let t = tab.clone();
@@ -78,6 +85,60 @@ pub(super) fn install(shell: WeakEntity<Shell>, tab: &Entity<QueryTab>, cx: &mut
             .and_then(|t| t.read(cx).schema().map(str::to_owned))
     });
     install_editor(shell, &editor, connection, schema, cx);
+}
+
+/// Gives a table tab's where and order by fields completions: the field's text goes on
+/// from `SELECT * FROM <table> WHERE ` (or `ORDER BY `), so the table's columns come
+/// first.
+fn install_filters(shell: &WeakEntity<Shell>, entity: &Entity<QueryTab>, cx: &mut App) {
+    let tab = entity.downgrade();
+    let t = entity.read(cx);
+    // Redis key tabs' match field is not SQL.
+    let Some(data) = t.table.as_ref().filter(|_| {
+        t.connection
+            .as_ref()
+            .is_some_and(|c| c.engine != Engine::Redis)
+    }) else {
+        return;
+    };
+    let fields = [
+        (data.filter.clone(), "WHERE"),
+        (data.order.clone(), "ORDER BY"),
+    ];
+    for (field, clause) in fields {
+        let (tab, t2, t3) = (tab.clone(), tab.clone(), tab.clone());
+        let connection: Connection =
+            Rc::new(move |cx| tab.upgrade().and_then(|t| t.read(cx).connection.clone()));
+        let schema: Schema = Rc::new(move |cx| {
+            t2.upgrade()
+                .and_then(|t| t.read(cx).table.as_ref().map(|d| d.table.database.clone()))
+        });
+        let prefix: Prefix = Rc::new(move |cx| {
+            let t = t3.upgrade()?;
+            let t = t.read(cx);
+            let engine = t.connection.as_ref()?.engine;
+            let r = &t.table.as_ref()?.table;
+            Some(format!(
+                "SELECT * FROM {}.{} {clause} ",
+                complete::ident(engine, &r.database),
+                complete::ident(engine, &r.table)
+            ))
+        });
+        let provider = Sql {
+            shell: shell.clone(),
+            connection,
+            schema,
+            editor: field.downgrade(),
+            prefix: Some(prefix),
+        };
+        field.update(cx, |e, _| {
+            let lsp = e.lsp_mut();
+            lsp.completion_provider = Some(Rc::new(provider));
+            lsp.set_completion_highlighter(Rc::new(|query: &str, item: &CompletionItem| {
+                highlight_contains(query.rsplit('.').next().unwrap_or(query), item)
+            }));
+        });
+    }
 }
 
 /// Gives `editor` SQL completions for the connection `connection` returns.
@@ -101,6 +162,7 @@ pub(super) fn install_editor(
         connection,
         schema,
         editor: editor.downgrade(),
+        prefix: None,
     };
     editor.update(cx, |e, _| {
         let lsp = e.lsp_mut();
@@ -123,11 +185,12 @@ impl CompletionProvider for Sql {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
-        let (shell, connection, schema, editor) = (
+        let (shell, connection, schema, editor, prefix) = (
             self.shell.clone(),
             Rc::clone(&self.connection),
             Rc::clone(&self.schema),
             self.editor.clone(),
+            self.prefix.clone(),
         );
         let text = text.clone();
         let handle = window.window_handle();
@@ -137,8 +200,16 @@ impl CompletionProvider for Sql {
             let items = cx.update(|cx| {
                 let config = connection(cx);
                 let current = schema(cx);
-                let (items, load) =
-                    suggest(&shell, config.as_ref(), current, &text, offset, invoked, cx);
+                let prefix = prefix.and_then(|p| p(cx));
+                let (items, load) = suggest(
+                    &shell,
+                    config.as_ref(),
+                    current,
+                    (&text, prefix.as_deref()),
+                    offset,
+                    invoked,
+                    cx,
+                );
                 if let Some((conn, missing)) = load {
                     load_then_refresh(&shell, &conn, missing, editor, handle, offset, cx);
                 }
@@ -161,7 +232,7 @@ fn suggest(
     shell: &WeakEntity<Shell>,
     config: Option<&ConnectionConfig>,
     current: Option<String>,
-    rope: &Rope,
+    (rope, prefix): (&Rope, Option<&str>),
     offset: usize,
     invoked: bool,
     cx: &App,
@@ -180,11 +251,20 @@ fn suggest(
         hidden: tree.map_or(&[], |t| &t.hidden),
         current: current.as_deref(),
     };
-    let (text, start) = around(rope, offset);
+    // `text` holds the rope from `start`, after `lead` bytes of a field's prefix.
+    let (text, start, lead) = match prefix {
+        Some(p) => (format!("{p}{rope}"), 0, p.len()),
+        None => {
+            let (text, start) = around(rope, offset);
+            (text, start, 0)
+        }
+    };
     let case = crate::settings::get(cx).keyword_case;
-    let Some(found) = complete::complete(&text, offset - start, engine, &catalog, case) else {
+    let Some(found) = complete::complete(&text, lead + offset - start, engine, &catalog, case)
+    else {
         return (Vec::new(), None);
     };
+    let at = |i: usize| start + i.saturating_sub(lead);
     let load = config
         .filter(|_| !found.missing.is_empty())
         .map(|c| (c.id.clone(), found.missing.clone()));
@@ -199,8 +279,8 @@ fn suggest(
         return (Vec::new(), load);
     }
     let range = lsp_types::Range {
-        start: rope.offset_to_position(start + found.replace.start),
-        end: rope.offset_to_position(start + found.replace.end),
+        start: rope.offset_to_position(at(found.replace.start)),
+        end: rope.offset_to_position(at(found.replace.end)),
     };
     let items = found
         .items
