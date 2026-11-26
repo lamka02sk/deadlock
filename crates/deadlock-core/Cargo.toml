@@ -15,7 +15,7 @@ categories.workspace = true
 russh = "0.65"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-dirs = "6"
+dirs = "7"
 # Both already in the tree: CSV import decodes the file's encoding as it streams.
 encoding_rs = "0.8"
 encoding_rs_io = "0.1"
