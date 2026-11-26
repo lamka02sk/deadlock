@@ -469,6 +469,30 @@ pub static ENTRIES: &[Entry] = &[
         crate::shell::EverywhereNext
     ),
     entry!(
+        "schema-prev",
+        "Schema menu",
+        "Previous schema",
+        "up",
+        &[Some("SchemaMenu"), Some("SchemaMenu > Input")],
+        crate::shell::SchemaPrev
+    ),
+    entry!(
+        "schema-next",
+        "Schema menu",
+        "Next schema",
+        "down",
+        &[Some("SchemaMenu"), Some("SchemaMenu > Input")],
+        crate::shell::SchemaNext
+    ),
+    entry!(
+        "schema-pick",
+        "Schema menu",
+        "Pick schema",
+        "enter",
+        &[Some("SchemaMenu")],
+        crate::shell::SchemaPick
+    ),
+    entry!(
         "show-completions",
         "Editor",
         "Show completions",

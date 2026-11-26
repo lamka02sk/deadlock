@@ -384,6 +384,7 @@ impl Shell {
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(row) = self.rows.get(ix) else { return };
         self.selected = Some(row.id.clone());
+        self.sidebar_last = true;
         if row.kind == RowKind::Connection {
             let id = row.id[0].clone();
             self.activate(&id, cx);
