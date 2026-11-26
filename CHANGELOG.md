@@ -6,6 +6,8 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-26
+
 ### Added
 
 - The connection menu lists every schema (database) with a checkbox: tick or untick to
@@ -183,7 +185,8 @@ First tagged version.
   shortcuts.
 - Linux packages (`.deb`, AppImage) and a macOS `.dmg`, attached to the release by CI.
 
-[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/lamka02sk/deadlock/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/lamka02sk/deadlock/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/lamka02sk/deadlock/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...v0.1.3
