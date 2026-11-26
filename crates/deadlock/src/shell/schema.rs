@@ -22,7 +22,7 @@ use gpui_kit::{
 use super::{Conn, Front, Shell, Trigger, text_width};
 use crate::assets::{Icon, icon};
 use crate::query::QueryTab;
-use crate::theme::{MONO_FONT, Palette, UI_FONT, small_size};
+use crate::theme::{Palette, mono_font, small_size, ui_font};
 use crate::ui::{Clickable as _, Kind, button};
 
 actions!(schema_menu, [SchemaPrev, SchemaNext, SchemaPick]);
@@ -475,7 +475,7 @@ fn footer(verb: &str, p: &Palette) -> StyledText {
         "Runs ",
         " on this tab’s session. ↑↓ to move, Enter to pick.",
     );
-    let run = |len, family: &'static str, color| TextRun {
+    let run = |len, family: SharedString, color| TextRun {
         len,
         font: font(family),
         color,
@@ -484,9 +484,9 @@ fn footer(verb: &str, p: &Palette) -> StyledText {
         strikethrough: None,
     };
     StyledText::new(format!("{before}{verb}{after}")).with_runs(vec![
-        run(before.len(), UI_FONT, p.tx3),
-        run(verb.len(), MONO_FONT, p.tx2),
-        run(after.len(), UI_FONT, p.tx3),
+        run(before.len(), ui_font(), p.tx3),
+        run(verb.len(), mono_font(), p.tx2),
+        run(after.len(), ui_font(), p.tx3),
     ])
 }
 

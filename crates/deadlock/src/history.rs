@@ -17,7 +17,7 @@ use gpui_kit::{
 
 use crate::app::{Db, HistoryDb};
 use crate::assets::{Icon, icon};
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, row_height, small_size, tab_height};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button, square_button};
 
@@ -335,7 +335,7 @@ impl HistoryPanel {
                     .when(!on, |d| d.hover(|s| s.bg(p.panel)))
                     .child(
                         div()
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(data_size())
                             .line_height(px(18.))
                             .text_color(p.tx)
@@ -437,7 +437,8 @@ impl Render for HistoryPanel {
                     .flex_none()
                     .items_center()
                     .gap(px(8.))
-                    .h(px(44.))
+                    // Lines up with the tab strip and the sidebar header.
+                    .h(tab_height() + px(1.))
                     .pl(px(16.))
                     .pr(px(8.))
                     .border_b_1()

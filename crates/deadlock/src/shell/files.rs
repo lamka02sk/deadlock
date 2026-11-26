@@ -24,7 +24,7 @@ use crate::app::Db;
 use crate::assets::{Icon, icon};
 use crate::files::{self, Entry, FileRow};
 use crate::query::Kind;
-use crate::theme::{Palette, RADIUS, row_height, small_size};
+use crate::theme::{Palette, RADIUS, row_height, small_size, tab_height};
 use crate::ui::{Clickable as _, Kind as ButtonKind, button, square_button};
 
 /// The panel's width until the user drags it.
@@ -293,6 +293,8 @@ impl Shell {
             .as_deref()
             .and_then(listed)
             .or_else(|| self.front_file(cx).as_deref().and_then(listed))
+            // The Scratches folder itself is the app's: not renamed or deleted.
+            .filter(|r| r.path != files::scratch_dir(self.project.root()))
             .map(|r| (r.path.clone(), r.folder))
     }
 
@@ -440,6 +442,13 @@ impl Shell {
         self.make_entry(dir, true, window, cx);
     }
 
+    /// New scratch file: `scratch.sql` (numbered when taken) in `.deadlock/scratches/`,
+    /// outside the project's own folders, opened, then renamed in place.
+    pub(super) fn new_scratch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = files::scratch_dir(self.project.root());
+        self.make_entry(dir, true, window, cx);
+    }
+
     fn make_entry(
         &mut self,
         dir: PathBuf,
@@ -454,12 +463,16 @@ impl Shell {
         // The new row must not hide behind the filter or a closed folder.
         self.files.filter = None;
         self.files.collapsed.retain(|c| !dir.starts_with(c));
+        let scratch = dir == files::scratch_dir(self.project.root());
         let rx = cx.global::<Db>().0.spawn_blocking(move || {
-            let (stem, ext) = if file {
-                ("query", ".sql")
-            } else {
-                ("folder", "")
+            let (stem, ext) = match (file, scratch) {
+                (true, true) => ("scratch", ".sql"),
+                (true, false) => ("query", ".sql"),
+                (false, _) => ("folder", ""),
             };
+            if scratch {
+                std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create: {e}"))?;
+            }
             let name = files::unique_name(stem, ext, |n| dir.join(n).exists());
             let path = dir.join(name);
             let made = if file {
@@ -629,8 +642,14 @@ impl Shell {
             .item(on(
                 item(Icon::NewFolder, "New folder", None, false),
                 Box::new(move |s, w, cx| s.make_entry(d2.clone(), false, w, cx)),
+            ))
+            .item(on(
+                item(Icon::NewFile, "New scratch file", None, false),
+                Box::new(|s, w, cx| s.new_scratch(w, cx)),
             ));
-        let Some(row) = row else { return menu };
+        let Some(row) = row.filter(|r| r.path != files::scratch_dir(self.project.root())) else {
+            return menu;
+        };
         let k = |id: &str| Some(crate::keymap::label(id, cx));
         let (p1, p2, p3, folder) = (
             row.path.clone(),
@@ -728,6 +747,8 @@ fn render_row(shell: &Shell, ix: usize, row: &FileRow, cx: &mut Context<Shell>) 
         .pb(px(1.))
         .child(
             div()
+                // An id, so GPUI tracks the hover (see the sidebar's rows).
+                .id(("file-cell", ix))
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -880,16 +901,23 @@ pub(super) fn panel(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement 
         .flex()
         .flex_col()
         .gap(px(4.))
-        .p(px(8.))
+        .px(px(8.))
+        .pb(px(8.))
         .bg(p.panel)
+        // The header lines up with the tab strip: same height, same bottom rule.
         .child(
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_between()
-                .h(px(28.))
-                .pl(px(8.))
+                .h(tab_height() + px(1.))
+                .mx(px(-8.))
+                .mb(px(4.))
+                .pl(px(16.))
+                .pr(px(8.))
+                .border_b_1()
+                .border_color(p.line)
                 .child(
                     div()
                         .text_size(small_size())

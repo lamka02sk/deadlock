@@ -26,7 +26,7 @@ use gpui_kit::{
     relative, white,
 };
 
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font};
 use crate::ui::Clickable as _;
 
 actions!(dialog, [Cancel, Confirm, Press, NextButton, PrevButton]);
@@ -354,12 +354,13 @@ impl Render for Dialog {
                 .border_color(p.line)
                 .rounded(RADIUS)
                 .bg(p.panel)
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .line_height(px(20.))
                 .whitespace_nowrap()
                 // About as many characters as fit in the 480 px card.
-                .child(crate::query::table::highlighted(
+                .child(crate::query::table::selectable_sql(
+                    "dialog-sql",
                     &crate::query::table::wrap_sql(&sql, 52),
                     &p,
                 ))
@@ -381,7 +382,7 @@ impl Render for Dialog {
                     )
                     .child(
                         Styled::h(Input::new(f), crate::theme::row_height())
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(data_size()),
                     )
             });
@@ -407,7 +408,7 @@ impl Render for Dialog {
                         .border_color(p.line)
                         .rounded(RADIUS)
                         .overflow_hidden()
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(data_size())
                         .children(rows.iter().enumerate().map(|(i, (name, detail))| {
                             div()
@@ -526,7 +527,7 @@ impl Render for Dialog {
             .justify_center()
             .p(px(24.))
             .bg(hsla(0., 0., 10. / 255., 0.32))
-            .font_family(crate::theme::UI_FONT)
+            .font_family(crate::theme::ui_font())
             .text_size(crate::theme::ui_size())
             .text_color(p.tx)
             .child(

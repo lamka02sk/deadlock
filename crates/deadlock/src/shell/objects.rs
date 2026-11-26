@@ -501,17 +501,7 @@ impl Shell {
                         });
                     })
                 };
-                let view = matches!(object.kind, ObjectKind::View | ObjectKind::MaterializedView);
-                menu = menu.item(item(
-                    if view {
-                        "Edit definition".into()
-                    } else {
-                        "Open".into()
-                    },
-                    if view { Icon::Rename } else { Icon::Open },
-                    None,
-                    false,
-                ));
+                menu = menu.item(item("Edit".into(), Icon::Rename, None, false));
                 let name = object.name.clone();
                 menu = menu.item(
                     menu_item("Copy name", Icon::Copy).on_click(move |_, _, cx| {
@@ -581,6 +571,14 @@ impl Shell {
                 });
             },
         ));
+        let (s, c, t) = (shell.clone(), conn.clone(), table.clone());
+        let menu = menu.item(
+            menu_item("Edit", Icon::Rename).on_click(move |_, window, cx| {
+                s.update(cx, |s, cx| {
+                    s.open_table(&c, t.clone(), View::Structure, window, cx)
+                });
+            }),
+        );
         let name = name.clone();
         let menu = menu.item(
             menu_item("Copy name", Icon::Copy).on_click(move |_, _, cx| {

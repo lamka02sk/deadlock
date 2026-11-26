@@ -1,12 +1,54 @@
 //! Design tokens from the Deadlock design, light and dark, following the OS appearance.
 
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{App, Global, Hsla, Pixels, Window, WindowAppearance, px, rgb, white};
+use gpui_kit::{App, Global, Hsla, Pixels, SharedString, Window, WindowAppearance, px, rgb, white};
 
-pub const UI_FONT: &str = "Inter";
-pub const MONO_FONT: &str = "JetBrains Mono";
+/// The fonts the app ships, used until the settings name others.
+pub const DEFAULT_UI_FONT: &str = "Inter";
+pub const DEFAULT_MONO_FONT: &str = "JetBrains Mono";
+
+/// The interface and code fonts in use, from the settings.
+static FONTS: RwLock<(SharedString, SharedString)> = RwLock::new((
+    SharedString::new_static(DEFAULT_UI_FONT),
+    SharedString::new_static(DEFAULT_MONO_FONT),
+));
+
+/// Sets the fonts; a blank name keeps the shipped one.
+pub fn set_fonts(ui: &str, mono: &str) {
+    let pick = |name: &str, default: &'static str| {
+        let name = name.trim();
+        if name.is_empty() {
+            SharedString::new_static(default)
+        } else {
+            SharedString::from(name.to_owned())
+        }
+    };
+    let fonts = (pick(ui, DEFAULT_UI_FONT), pick(mono, DEFAULT_MONO_FONT));
+    *FONTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = fonts;
+}
+
+/// The interface font.
+pub fn ui_font() -> SharedString {
+    FONTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .0
+        .clone()
+}
+
+/// The font of SQL, values and other code.
+pub fn mono_font() -> SharedString {
+    FONTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .1
+        .clone()
+}
 pub const RADIUS: Pixels = px(6.);
 pub const SIDEBAR_WIDTH: Pixels = px(264.);
 
@@ -192,9 +234,9 @@ pub fn apply(appearance: WindowAppearance, cx: &mut App) {
         cx,
     );
     Theme::update(cx, |t| {
-        t.font_family = UI_FONT.into();
+        t.font_family = ui_font();
         t.font_size = ui_size();
-        t.mono_font_family = MONO_FONT.into();
+        t.mono_font_family = mono_font();
         t.mono_font_size = data_size();
         t.radius = RADIUS;
         t.radius_lg = RADIUS;

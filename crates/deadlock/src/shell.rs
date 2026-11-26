@@ -56,8 +56,8 @@ use crate::assets::{APP_LOGO, Icon};
 use crate::connection_form::{ConnectionForm, FormEvent};
 use crate::query::TxMode;
 use crate::theme::{
-    MONO_FONT, Palette, RADIUS, SIDEBAR_WIDTH, UI_FONT, row_height, small_size, status_bar_height,
-    toolbar_height, ui_size,
+    Palette, RADIUS, SIDEBAR_WIDTH, mono_font, row_height, small_size, status_bar_height,
+    toolbar_height, ui_font, ui_size,
 };
 use crate::ui::{Kind, button, button_icon, dot, icon_button};
 
@@ -323,6 +323,8 @@ impl Shell {
             _prompt: prompt,
         };
         this.tree_connections();
+        // Painted from the schema cache until the connection connects.
+        this.tree.expanded = this.project.state.expanded.iter().cloned().collect();
         this.rows = this.tree.rows();
         this.load_cache(cx);
         this.restore_tabs(window, cx);
@@ -650,7 +652,7 @@ impl Shell {
         self.close_form(cx);
     }
 
-    fn close_form(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_form(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         if self.front == Front::Form {
             self.front = match self.tabs.len() {
@@ -1025,6 +1027,7 @@ impl Render for Shell {
             panel
         });
         let history_width = px(self.project.state.history_width.unwrap_or(history::WIDTH));
+        let sidebar_width = self.project.state.sidebar_width.map_or(SIDEBAR_WIDTH, px);
         self.focus_rename(window, cx);
         // A closed tab took the focus with it: the tab now in front gets it, so the
         // shortcuts (Ctrl+W, Ctrl+Shift+T…) keep working.
@@ -1117,7 +1120,7 @@ impl Render for Shell {
                     h_resizable("shell")
                         .child(
                             resizable_panel()
-                                .size(SIDEBAR_WIDTH)
+                                .size(sidebar_width)
                                 .size_range(px(180.)..px(560.))
                                 .fixed()
                                 .child(sidebar::sidebar(self, cx)),
@@ -1143,6 +1146,9 @@ impl Render for Shell {
                             let sizes = state.read(cx).sizes().clone();
                             let _ = shell.update(cx, |this, cx| {
                                 let s = &mut this.project.state;
+                                if let Some(&w) = sizes.first() {
+                                    s.sidebar_width = Some(f32::from(w));
+                                }
                                 if s.history_open
                                     && let Some(&w) = sizes.get(2)
                                 {
@@ -1206,7 +1212,7 @@ fn password_prompt(shell: &Shell, prompt: &Prompt, cx: &mut Context<Shell>) -> i
                         )
                         .child(
                             div()
-                                .font_family(MONO_FONT)
+                                .font_family(mono_font())
                                 .text_size(small_size())
                                 .text_color(p.tx3)
                                 .overflow_hidden()
@@ -1336,6 +1342,8 @@ impl RenderOnce for Trigger {
 fn switcher(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElement + use<> {
     let p = *cx.global::<Palette>();
     let trigger = button("project", Kind::Outline, true, "", cx)
+        // A resting tint so it reads as a control, not a title; hover still deepens it.
+        .bg(p.hover.opacity(0.6))
         .child(
             div()
                 .font_weight(FontWeight::MEDIUM)
@@ -1484,7 +1492,7 @@ fn type_label(text: &str, p: &Palette) -> Div {
     div()
         .ml_auto()
         .pl(px(8.))
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(px(11.5))
         .text_color(p.tx3)
         .child(SharedString::from(text.to_owned()))
@@ -1544,7 +1552,7 @@ fn text_width(window: &Window, text: &str, weight: FontWeight) -> Pixels {
         len: text.len(),
         font: gpui_kit::Font {
             weight,
-            ..font(UI_FONT)
+            ..font(ui_font())
         },
         color: black(),
         background_color: None,

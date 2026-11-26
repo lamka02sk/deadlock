@@ -6,6 +6,67 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-26
+
+### Added
+
+- The connection menu lists every schema (database) with a checkbox: tick or untick to
+  show or hide them, several in one visit. Show all brings every hidden one back. Hide
+  in a schema's own menu stays.
+- Connection setting "Show empty object groups in the sidebar", off by default: groups
+  with nothing in them (Views 0, Sequences 0…) are left out of the tree.
+- Edit in the sidebar menu of tables (opens the Structure view), views, routines and
+  other objects.
+- Scratch files: New scratch file in the Files panel menu makes a `.sql` file in
+  `.deadlock/scratches/`, listed first as Scratches, outside the project's own folders.
+- Interface and code fonts in Settings → Appearance: any installed font, searchable,
+  for every window at once. Default keeps Inter and JetBrains Mono.
+- Search in Settings: filters settings, help texts and shortcuts (by name, group or keys)
+  across all sections.
+- The New / Edit connection tab closes like other tabs: its close button, a middle click
+  and `Ctrl+W`.
+- Stop button in the data view's pager while rows load: cancels the query on the server
+  and keeps the rows already on screen.
+- The `where` and `order by` fields show a spinner while the load their Enter started
+  runs.
+
+### Changed
+
+- The transposed data view (`Ctrl+T`) is now the data grid itself, turned: fields down,
+  rows across, field names fixed on the left. Everything the grid does works there too:
+  inline editing, sorting by a click on a field's name (Shift adds it), the cell menu,
+  drag selection with autoscroll at the edges, Shift+arrows, copy, paste and the pending
+  change marks. The cursor stays on the same value when switching. Lines between the
+  records keep them apart, since their fields line up differently. The data view has
+  the same lines between its columns.
+- A click on a column header shows the new sort arrow at once, with a spinner until
+  the sorted rows arrive (it used to appear only after the reload).
+- Leaf objects in the sidebar (columns, routines, sequences) start at the chevron's place,
+  so they are less indented.
+- The project button in the toolbar has a subtle background at rest.
+
+### Fixed
+
+- The sidebar keeps the width you drag it to after a restart (in `.deadlock/state.json`).
+- The sidebar remembers which nodes were open after a restart (in `.deadlock/state.json`),
+  painted from the schema cache until the connection connects. Opening a node under a
+  connection that is not connected yet connects it.
+- The sidebar header and the Files and History panel headers line up with the tab strip.
+- Hover in the sidebar tree and the Files panel stuck on the first row the pointer entered.
+- Empty object groups were indented a few pixels more than their siblings with a chevron.
+- Dragging a selection to the left or right edge of a grid scrolls it sideways, starting
+  32 px inside the edge, so it works when the grid ends at the screen's edge.
+- New files and folders did not show in the Files panel in big projects: the scan used up
+  its entry limit inside deep folders (`vendor/`, `node_modules/`) first. It now lists
+  folders level by level, so entries near the root always come first.
+- The Structure view's definition is a full-height side panel: it stays put while the
+  columns and indexes scroll, scrolls on its own both ways (Shift+wheel sideways), and its
+  text can be selected and copied with the mouse.
+- Read-only SQL can be selected with the mouse and copied everywhere it shows: an
+  object's Source tab (sequences, triggers…), the object and Structure form previews,
+  pending changes, confirmation dialogs, server configuration, session and deadlock
+  statements, and Redis command previews.
+
 ## [0.1.5] - 2026-11-26
 
 ### Added
@@ -124,7 +185,8 @@ First tagged version.
   shortcuts.
 - Linux packages (`.deb`, AppImage) and a macOS `.dmg`, attached to the release by CI.
 
-[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/lamka02sk/deadlock/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/lamka02sk/deadlock/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/lamka02sk/deadlock/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/lamka02sk/deadlock/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lamka02sk/deadlock/compare/v0.1.2...v0.1.3

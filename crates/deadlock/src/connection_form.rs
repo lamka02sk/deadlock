@@ -21,7 +21,7 @@ use gpui_kit::{
 
 use crate::app::Db;
 use crate::assets::{Icon, icon};
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
@@ -136,6 +136,7 @@ pub struct ConnectionForm {
     driver: Choice,
     keychain: bool,
     read_only: bool,
+    show_empty_groups: bool,
     tunnel: bool,
     ssh_host: Entity<InputState>,
     ssh_port: Entity<InputState>,
@@ -295,6 +296,7 @@ impl ConnectionForm {
             driver,
             keychain: source.is_none_or(|c| c.keychain),
             read_only: defaults.read_only,
+            show_empty_groups: defaults.show_empty_groups,
             tunnel: defaults.ssh_tunnel,
             ssh_host,
             ssh_port,
@@ -398,6 +400,7 @@ impl ConnectionForm {
             color: self.color.clone(),
             encryption: Self::selected(&self.encryption, &Encryption::ALL, cx).unwrap_or_default(),
             read_only: self.read_only,
+            show_empty_groups: self.show_empty_groups,
             keychain: self.keychain,
             sid: self.sid(cx),
             thick: self.thick(cx),
@@ -601,7 +604,7 @@ fn text_input(state: &Entity<InputState>, mono: bool) -> Input {
     // `Styled::h`, not `Input::h` (multi-line only): the design's 32 px field.
     let input = Styled::h(Input::new(state), px(32.));
     if mono {
-        input.font_family(MONO_FONT).text_size(data_size())
+        input.font_family(mono_font()).text_size(data_size())
     } else {
         input
     }
@@ -800,6 +803,15 @@ impl Render for ConnectionForm {
                         cx.notify();
                     }))
                     .into_any_element(),
+                Checkbox::new("empty-groups")
+                    .checked(self.show_empty_groups)
+                    .label("Show empty object groups in the sidebar")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.show_empty_groups = *checked;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
                 Checkbox::new("ssh")
                     .checked(self.tunnel)
                     .label("Connect through an SSH tunnel")
@@ -889,7 +901,7 @@ impl Render for ConnectionForm {
                     .border_color(p.line)
                     .rounded(RADIUS)
                     .bg(p.panel)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .child(SharedString::from(self.config(cx).address())),
             );

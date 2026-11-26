@@ -83,7 +83,7 @@ impl Render for Spike {
             .size_full()
             .bg(p.bg)
             .text_color(p.tx)
-            .font_family(theme::MONO_FONT)
+            .font_family(theme::mono_font())
             .text_size(theme::data_size())
             .child(DataTable::new(&self.table).bordered(false))
             .child(gpui_fps::fps_monitor(window, cx))

@@ -22,8 +22,8 @@ use gpui_kit::{
 
 use crate::app::Db;
 use crate::assets::{Icon, icon};
-use crate::query::table::highlighted;
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::query::table::selectable_sql;
+use crate::theme::{Palette, RADIUS, data_size, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
@@ -820,7 +820,7 @@ fn card(
         .child(div().text_color(p.tx3).child(SharedString::from(line)))
         .child(
             div()
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .overflow_hidden()
                 .text_ellipsis()
@@ -1104,7 +1104,7 @@ fn row(t: &SessionsTab, id: SessionId, cx: &mut Context<SessionsTab>) -> AnyElem
         .h(px(ROW))
         .border_b_1()
         .border_color(p.line)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .when(selected, |d| d.bg(p.sel))
         .when(!selected, |d| d.hover(|s| s.bg(p.panel)))
@@ -1160,7 +1160,7 @@ fn this_app_chip(p: &Palette) -> Div {
         .rounded(px(4.))
         .text_size(small_size())
         .text_color(p.tx2)
-        .font_family(crate::theme::UI_FONT)
+        .font_family(crate::theme::ui_font())
         .child("this app")
 }
 
@@ -1241,7 +1241,7 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
         fact(
             "Client",
             div()
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .child(text(s.host.clone())),
             &p,
@@ -1303,7 +1303,7 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
     };
     let statement = match &s.statement {
         Some(q) => div()
-            .font_family(MONO_FONT)
+            .font_family(mono_font())
             .text_size(data_size())
             .px(px(12.))
             .py(px(8.))
@@ -1312,7 +1312,7 @@ fn detail(t: &SessionsTab, snap: &Snapshot, cx: &mut Context<SessionsTab>) -> im
             .rounded(RADIUS)
             .bg(p.panel)
             .line_height(px(20.))
-            .child(highlighted(q, &p)),
+            .child(selectable_sql("session-statement", q, &p)),
         None => div()
             .text_color(p.tx3)
             .child("The server does not report it."),
@@ -1495,7 +1495,7 @@ fn slow_log(
             .h(px(ROW))
             .border_b_1()
             .border_color(p.line)
-            .font_family(MONO_FONT)
+            .font_family(mono_font())
             .text_size(data_size())
             .child(cell(Some(168.)).text_color(p.tx3).child(at))
             .child(cell(Some(96.)).child(took))
@@ -1553,7 +1553,7 @@ fn deadlock_section(t: &SessionsTab, cx: &mut Context<SessionsTab>) -> impl Into
     let body = d.open.then(|| {
         let mono = |s: String| {
             div()
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .child(SharedString::from(s))
         };
@@ -1638,10 +1638,13 @@ fn deadlock_section(t: &SessionsTab, cx: &mut Context<SessionsTab>) -> impl Into
                                 })
                                 .child(fact(
                                     "Statement",
-                                    div()
-                                        .font_family(MONO_FONT)
-                                        .text_size(data_size())
-                                        .child(highlighted(&tx.statement, &p)),
+                                    div().font_family(mono_font()).text_size(data_size()).child(
+                                        selectable_sql(
+                                            ("deadlock-statement", tx.number as usize),
+                                            &tx.statement,
+                                            &p,
+                                        ),
+                                    ),
                                     &p,
                                 ))
                                 .child(list("Held", &tx.holds))

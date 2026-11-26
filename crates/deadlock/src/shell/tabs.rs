@@ -1315,7 +1315,7 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
             .when(table && !key, |d| d.child(icon(Icon::Table, p.tx3)))
             // A Redis key's name, in mono as in the design.
             .when(key, |d| {
-                d.font_family(crate::theme::MONO_FONT)
+                d.font_family(crate::theme::mono_font())
                     .text_size(crate::theme::data_size())
             })
             .child(title)
@@ -1543,11 +1543,32 @@ pub(super) fn tab_strip(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElem
             Some(c) => format!("Edit {}", c.name).into(),
             None => "New connection".into(),
         };
-        tab("form-tab".into(), shell.front == Front::Form)
-            .pr(px(12.))
+        let on = shell.front == Front::Form;
+        tab("form-tab".into(), on)
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.close_form(cx)),
+            )
             .clickable(cx.listener(|this, _, window, cx| this.show_tab(Front::Form, window, cx)))
             .when(editing.is_none(), |d| d.child(icon(Icon::Plus, p.tx)))
             .child(label)
+            .child(
+                div()
+                    .id("close-form")
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .opacity(if on { 1. } else { 0. })
+                    .group_hover("form-tab", |s| s.opacity(1.))
+                    .hover(|s| s.bg(p.hover))
+                    .child(icon(Icon::Close, p.tx3).size(px(12.)))
+                    .clickable(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_form(cx);
+                    })),
+            )
     });
     div()
         .id("tab-strip")

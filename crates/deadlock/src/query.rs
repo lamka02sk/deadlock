@@ -47,7 +47,7 @@ pub use table::{
 use crate::app::{Db, HistoryDb};
 use crate::assets::{Icon, icon};
 use crate::results::{Grid, GridEvent, NextSet, duration, grid_actions, grid_text};
-use crate::theme::{MONO_FONT, Palette, editor_size, small_size, tab_height};
+use crate::theme::{Palette, editor_size, mono_font, small_size, tab_height};
 use crate::ui::Clickable as _;
 
 actions!(query, [CopySelection]);
@@ -2112,7 +2112,7 @@ impl QueryTab {
                 Editor::new(&self.editor)
                     .bordered(false)
                     .h_full()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(editor_size())
                     .line_height(px(22.))
                     .py(px(10.)),
@@ -2325,7 +2325,7 @@ fn messages(list: &[Message], p: &Palette) -> impl IntoElement {
                     .gap(px(2.))
                     .child(
                         div()
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(small_size())
                             .overflow_hidden()
                             .text_ellipsis()

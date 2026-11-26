@@ -19,6 +19,8 @@ pub struct ConnectionTree {
     pub nodes: Option<Vec<ObjectNode>>,
     /// Databases left out of the rows and of searches; the tree still holds them.
     pub hidden: Vec<String>,
+    /// Groups with no objects get rows too.
+    pub show_empty_groups: bool,
 }
 
 /// A load in flight or one that failed, shown as a row under the node.
@@ -301,8 +303,17 @@ impl Tree {
         {
             out.push(Row::status(parent, load));
         }
+        let show_empty = self
+            .connections
+            .iter()
+            .find(|c| parent.first() == Some(&c.id))
+            .is_some_and(|c| c.show_empty_groups);
         for n in nodes.unwrap_or_default() {
-            if hidden.contains(&n.name) {
+            if hidden.contains(&n.name)
+                || (!show_empty
+                    && n.kind == NodeKind::Group
+                    && n.children.as_ref().is_some_and(Vec::is_empty))
+            {
                 continue;
             }
             let id = child_id(parent, &n.name);
@@ -570,12 +581,14 @@ mod tests {
                     name: "shop".into(),
                     nodes: Some(vec![app]),
                     hidden: Vec::new(),
+                    show_empty_groups: true,
                 },
                 ConnectionTree {
                     id: "wh".into(),
                     name: "warehouse".into(),
                     nodes: Some(vec![stock]),
                     hidden: Vec::new(),
+                    show_empty_groups: true,
                 },
             ],
             ..Tree::default()
@@ -654,6 +667,18 @@ mod tests {
             ]
         );
         assert!(rows[5].expanded && !rows[8].expandable && !rows[8].expanded);
+    }
+
+    #[test]
+    fn empty_groups_leave_the_rows_unless_shown() {
+        let mut t = sample();
+        t.connections[0].show_empty_groups = false;
+        t.expanded.insert(id(&["shop"]));
+        t.expanded.insert(id(&["shop", "app"]));
+        assert_eq!(
+            labels(&t.rows()),
+            ["shop", "  app", "    Tables 3", "warehouse"]
+        );
     }
 
     #[test]

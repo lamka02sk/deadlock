@@ -12,7 +12,7 @@ use gpui_kit::{
 
 use crate::app::{OpenFolder, Registry, open_from_welcome, pick_folder};
 use crate::assets::{APP_LOGO, Icon, icon};
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, dot, icon_button};
 
@@ -178,7 +178,7 @@ fn recent_row(ix: usize, e: &RecentProject, open: bool, day: String, p: &Palette
                 .min_w_0()
                 .overflow_hidden()
                 .text_ellipsis()
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .text_color(p.tx3)
                 .child(tilde(path)),
@@ -210,7 +210,7 @@ fn empty_state(window: &Window, p: &Palette) -> impl IntoElement {
         strikethrough: None,
     };
     let mono = Font {
-        family: MONO_FONT.into(),
+        family: mono_font(),
         ..style.font()
     };
     let text = StyledText::new(format!("{before}{code}{after}")).with_runs(vec![

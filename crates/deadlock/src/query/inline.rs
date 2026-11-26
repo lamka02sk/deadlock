@@ -18,7 +18,7 @@ use gpui_kit::{
 
 use crate::assets::Icon;
 use crate::results::{Grid, duration, grid_actions, grid_text, shown};
-use crate::theme::{MONO_FONT, Palette, RADIUS, UI_FONT, ui_size};
+use crate::theme::{Palette, RADIUS, mono_font, ui_font, ui_size};
 use crate::ui::Clickable as _;
 use crate::ui::{self, Kind};
 
@@ -353,7 +353,7 @@ impl Render for ResultBlock {
                     .overflow_hidden()
                     .text_ellipsis()
                     .text_color(p.tx3)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(crate::theme::data_size())
                     .child(v),
             );
@@ -444,7 +444,7 @@ impl Render for ResultBlock {
             .pt(px(MARGIN_TOP))
             .pb(px(MARGIN_BOTTOM))
             .px(px(MARGIN_X))
-            .font_family(UI_FONT)
+            .font_family(ui_font())
             .text_size(ui_size())
             .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<Resize>, _, cx| {
                 if e.drag(cx).0 != me {

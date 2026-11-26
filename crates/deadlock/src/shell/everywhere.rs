@@ -25,7 +25,7 @@ use super::{Conn, EverywhereNext, EverywherePrev, Front, Shell};
 use crate::app::Db;
 use crate::assets::{Icon, icon};
 use crate::query::{Kind, View};
-use crate::theme::{MONO_FONT, Palette, RADIUS, small_size};
+use crate::theme::{Palette, RADIUS, mono_font, small_size};
 use crate::ui::Clickable as _;
 
 /// Two Shift taps this close (release to release) open the palette; a tap is a Shift
@@ -776,7 +776,7 @@ fn hit_row(
             d.child(
                 div()
                     .pl(px(24.))
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(small_size())
                     .text_color(p.tx2)
                     .overflow_hidden()

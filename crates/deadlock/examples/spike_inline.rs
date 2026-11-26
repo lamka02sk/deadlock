@@ -58,7 +58,7 @@ impl Render for Spike {
             Editor::new(&self.editor)
                 .bordered(false)
                 .h_full()
-                .font_family(theme::MONO_FONT)
+                .font_family(theme::mono_font())
                 .text_size(theme::editor_size()),
         )
     }
@@ -79,7 +79,7 @@ fn card(child: AnyElement, cx: &App) -> AnyElement {
                 .border_color(p.line)
                 .rounded(theme::RADIUS)
                 .overflow_hidden()
-                .font_family(theme::MONO_FONT)
+                .font_family(theme::mono_font())
                 .text_size(theme::data_size())
                 .child(child),
         )
