@@ -13,6 +13,7 @@ use deadlock_core::classify::{Kind as StatementKind, Statement};
 use deadlock_core::connection::{ConnectionConfig, Engine, Environment};
 use deadlock_core::driver::{Driver, ResultStream, Runtime, connect, page_size};
 use deadlock_core::history::{self, Outcome};
+use deadlock_core::session_schema::{default_schema, switch_sql, switched_to};
 use deadlock_core::split;
 use gpui_kit::base::input::BlockId;
 use gpui_kit::component::input::{
@@ -123,6 +124,8 @@ pub enum TabEvent {
     TableDropped(deadlock_core::edit::TableRef),
     /// A New table draft's Discard: the tab closes without asking.
     Discard,
+    /// The tab's schema changed (picked, typed `USE`, or reset): the tab list saves.
+    SchemaSet,
     /// The user chose where results go: inline (`true`) or the bottom panel. The
     /// project remembers it and every tab follows.
     ResultsInline(bool),
@@ -170,6 +173,8 @@ enum Pending {
     Run(Vec<(Range<usize>, String)>),
     /// A statement to explain, and whether to measure it.
     Explain(Range<usize>, String, bool),
+    /// A picked schema to switch the session to.
+    Use(String),
 }
 
 /// Delay between the last keystroke and the gutter refresh or the console save.
@@ -187,6 +192,11 @@ pub struct QueryTab {
     pub tx_mode: TxMode,
     /// The session holds an open transaction, as the server last reported it.
     pub tx_open: bool,
+    /// The schema statements run in: the connection's default until one is picked or
+    /// a typed `USE` ran. `None`: no default and none picked.
+    schema: Option<String>,
+    /// A picked schema's statement is on its way to the server.
+    switching: bool,
     pub editor: Entity<EditorState>,
     pub dirty: bool,
     /// The statements as the gutter shows them: byte range and first row.
@@ -293,6 +303,8 @@ impl QueryTab {
                 .as_ref()
                 .map_or(TxMode::Auto, |c| TxMode::default_for(c, cx)),
             tx_open: false,
+            schema: connection.as_ref().and_then(default_schema),
+            switching: false,
             connection,
             editor,
             dirty: false,
@@ -350,6 +362,95 @@ impl QueryTab {
         self.running.is_some() || self.exporting()
     }
 
+    /// The schema unqualified names resolve in: the picked one, else the connection's
+    /// default (MySQL `database`, the Oracle user, Redis `db<n>`).
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
+    /// The schema as `state.json` keeps it: only one that differs from the default.
+    pub fn picked_schema(&self) -> Option<&str> {
+        let default = self.connection.as_ref().and_then(default_schema);
+        self.schema().filter(|s| default.as_deref() != Some(*s))
+    }
+
+    /// A schema saved in `state.json`: the session switches to it when it opens.
+    pub fn restore_schema(&mut self, schema: Option<String>) {
+        if let Some(s) = schema.filter(|_| self.has_schema()) {
+            self.schema = Some(s);
+        }
+    }
+
+    /// Files and consoles bound to a connection have a schema to pick; table tabs
+    /// name theirs in every statement.
+    pub fn has_schema(&self) -> bool {
+        self.connection.is_some() && !matches!(self.kind, Kind::Table(_))
+    }
+
+    /// A picked schema's statement is on its way.
+    pub fn is_switching(&self) -> bool {
+        self.switching
+    }
+
+    /// Switches the tab's session to `schema` (opening the session first when there
+    /// is none). The chip follows once the server agreed; an error goes to Messages.
+    pub fn switch_schema(&mut self, schema: String, cx: &mut Context<Self>) {
+        if !self.has_schema() || self.is_running() || self.switching || self.pending.is_some() {
+            return;
+        }
+        self.switching = true;
+        cx.emit(TabEvent::Changed);
+        cx.notify();
+        self.when_ready(Pending::Use(schema), cx);
+    }
+
+    fn start_use(&mut self, schema: String, cx: &mut Context<Self>) {
+        let (Session::Ready(driver), Some(engine)) =
+            (&self.session, self.connection.as_ref().map(|c| c.engine))
+        else {
+            self.switching = false;
+            return;
+        };
+        let Some(sql) = switch_sql(engine, &schema) else {
+            self.switching = false;
+            return;
+        };
+        let d = Arc::clone(driver);
+        // A grid still paging holds the session.
+        self.close_grids(cx);
+        let text = sql.clone();
+        let rx = cx
+            .global::<Db>()
+            .0
+            .spawn(async move { d.execute(&text).await?.collect().await });
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |t, cx| {
+                t.switching = false;
+                match result {
+                    Ok(Ok(_)) => t.set_schema(Some(schema), cx),
+                    Ok(Err(e)) => t.switch_failed(&sql, e.to_string()),
+                    Err(_) => t.switch_failed(&sql, "the query task stopped".into()),
+                }
+                cx.emit(TabEvent::Changed);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn switch_failed(&mut self, sql: &str, error: String) {
+        self.note(sql, error, true);
+        self.show_panel(Panel::Messages);
+    }
+
+    fn set_schema(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
+        if self.schema != schema {
+            self.schema = schema;
+            cx.emit(TabEvent::SchemaSet);
+        }
+    }
+
     pub fn needs_session(&self) -> bool {
         (self.pending.is_some() || self.table.as_ref().is_some_and(|t| t.waiting))
             && matches!(self.session, Session::None)
@@ -371,6 +472,7 @@ impl QueryTab {
             .as_ref()
             .map_or(TxMode::Auto, |c| TxMode::default_for(c, cx));
         self.tx_open = false;
+        self.schema = connection.as_ref().and_then(default_schema);
         self.connection = connection;
         self.close_session(cx);
         self.split_now(cx);
@@ -495,6 +597,7 @@ impl QueryTab {
         match work {
             Pending::Run(plan) => self.start(plan, cx),
             Pending::Explain(range, text, analyze) => self.start_explain(range, text, analyze, cx),
+            Pending::Use(schema) => self.start_use(schema, cx),
         }
     }
 
@@ -610,30 +713,57 @@ impl QueryTab {
             return;
         }
         self.session = Session::Connecting;
-        // A Redis key tab's session selects the key's database.
-        let config = match (&self.kind, config.engine) {
-            (Kind::Table(t), Engine::Redis) => ConnectionConfig {
-                database: t.database.trim_start_matches("db").to_owned(),
+        // A Redis key tab's session selects the key's database, a console its picked
+        // one: the connection manager selects it again after a reconnect.
+        let redis_db = match &self.kind {
+            Kind::Table(t) => Some(t.database.as_str()),
+            _ => self.picked_schema(),
+        };
+        let config = match (redis_db, config.engine) {
+            (Some(db), Engine::Redis) => ConnectionConfig {
+                database: db.trim_start_matches("db").to_owned(),
                 ..config
             },
             _ => config,
         };
         let auto = self.tx_mode == TxMode::Auto;
+        // A schema picked before (or saved in `state.json`) is set again; through the
+        // healing session, so a reconnect sets it too.
+        let restore = self
+            .picked_schema()
+            .and_then(|s| switch_sql(config.engine, s))
+            .filter(|_| self.has_schema() && config.engine != Engine::Redis);
         let rx = cx.global::<Db>().0.spawn(async move {
             let driver = connect(&config, &password).await?;
             if driver.capabilities().transactions {
                 driver.set_auto_commit(auto).await?;
             }
-            Ok::<_, deadlock_core::driver::DriverError>(driver)
+            let restored = match restore {
+                Some(sql) => match driver.execute(&sql).await {
+                    Ok(s) => s.collect().await.err().map(|e| (sql, e.to_string())),
+                    Err(e) => Some((sql, e.to_string())),
+                },
+                None => None,
+            };
+            Ok::<_, deadlock_core::driver::DriverError>((driver, restored))
         });
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(Ok(driver)) => {
+                    Ok(Ok((driver, restored))) => {
                         this.session = Session::Ready(driver);
+                        // The session stayed on the default schema.
+                        let default = this.connection.as_ref().and_then(default_schema);
+                        if restored.is_some() {
+                            this.set_schema(default, cx);
+                        }
                         if let Some(work) = this.pending.take() {
                             this.start_pending(work, cx);
+                        }
+                        // After the waiting run started: it clears Messages.
+                        if let Some((sql, e)) = restored {
+                            this.switch_failed(&sql, e);
                         }
                         this.table_session(None, cx);
                     }
@@ -650,6 +780,7 @@ impl QueryTab {
     /// The session could not be opened; the waiting run is dropped with a message.
     pub fn fail_session(&mut self, error: String, cx: &mut Context<Self>) {
         self.session = Session::None;
+        self.switching = false;
         self.table_session(Some(error.clone()), cx);
         self.pending = None;
         self.messages.clear();
@@ -768,6 +899,7 @@ impl QueryTab {
                     })
                     .then(|| (text.clone(), binds.clone()));
                 let statement = text.clone();
+                let switched = engine.and_then(|e| switched_to(e, &text));
                 let head = rt.spawn(async move { d.execute_bound(&text, &binds).await });
                 let outcome = match head.await {
                     Ok(Ok(stream)) => {
@@ -780,6 +912,9 @@ impl QueryTab {
                 failed_any |= failed;
                 let took = started.elapsed();
                 let Ok(stop) = this.update(cx, |t, cx| {
+                    if !failed && t.has_schema() && switched.is_some() {
+                        t.set_schema(switched, cx);
+                    }
                     t.record(statement, took, &outcome, cx);
                     t.finish_statement(label, outcome.map(|(parts, _)| parts), took, cx)
                 }) else {

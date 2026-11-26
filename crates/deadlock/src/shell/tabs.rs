@@ -36,13 +36,14 @@ impl Shell {
         let saved = std::mem::take(&mut self.project.state.tabs);
         let front = self.project.state.active_tab;
         for tab in saved {
-            let (kind, connection, text) = match tab {
+            let (kind, connection, text, schema) = match tab {
                 TabState::File {
                     path: Some(path),
                     connection,
+                    schema,
                     ..
                 } => match std::fs::read_to_string(&path) {
-                    Ok(text) => (Kind::File(Some(path)), connection, text),
+                    Ok(text) => (Kind::File(Some(path)), connection, text, schema),
                     Err(e) => {
                         eprintln!("deadlock: {}: {e}", path.display());
                         continue;
@@ -52,7 +53,13 @@ impl Shell {
                     path: None,
                     connection,
                     text,
-                } => (Kind::File(None), connection, text.unwrap_or_default()),
+                    schema,
+                } => (
+                    Kind::File(None),
+                    connection,
+                    text.unwrap_or_default(),
+                    schema,
+                ),
                 TabState::Table {
                     connection,
                     database,
@@ -61,6 +68,7 @@ impl Shell {
                     Kind::Table(TableRef { database, table }),
                     Some(connection),
                     String::new(),
+                    None,
                 ),
                 TabState::Object {
                     connection,
@@ -76,11 +84,11 @@ impl Shell {
                     }
                     continue;
                 }
-                TabState::Console { connection } => {
+                TabState::Console { connection, schema } => {
                     match console_path(self.project.root(), &connection)
                         .and_then(|p| load_text(&p).map(|t| (p, t)))
                     {
-                        Ok((path, text)) => (Kind::Console(path), Some(connection), text),
+                        Ok((path, text)) => (Kind::Console(path), Some(connection), text, schema),
                         Err(e) => {
                             eprintln!("deadlock: console: {e}");
                             continue;
@@ -89,7 +97,8 @@ impl Shell {
                 }
             };
             let binding = self.binding(connection.as_deref());
-            self.add_tab(kind, binding, text, window, cx);
+            let i = self.add_tab(kind, binding, text, window, cx);
+            self.tabs[i].0.update(cx, |t, _| t.restore_schema(schema));
         }
         self.front = match front {
             Some(i) if i < self.tabs.len() => Front::Query(i),
@@ -215,6 +224,10 @@ impl Shell {
                 }
             }
             TabEvent::Recorded => self.history_changed(cx),
+            TabEvent::SchemaSet => {
+                self.schedule_save(cx);
+                cx.notify();
+            }
             TabEvent::Changed => {
                 if matches!(tab.read(cx).kind, Kind::File(None)) {
                     self.schedule_save(cx);
@@ -315,6 +328,7 @@ impl Shell {
 
     pub(super) fn show_tab(&mut self, front: Front, window: &mut Window, cx: &mut Context<Self>) {
         self.front = front;
+        self.sidebar_last = false;
         if let Some(tab) = self.front_tab().cloned() {
             if tab.read(cx).table.is_some() {
                 tab.update(cx, |t, cx| {
@@ -369,9 +383,13 @@ impl Shell {
         self.show_tab(Front::Query(i), window, cx);
     }
 
-    /// Ctrl+Shift+N: the active connection's console, opened or brought forward.
+    /// Ctrl+Shift+N: the console of what was clicked last (a sidebar row or the front
+    /// tab), opened or brought forward, on that row's or tab's schema when it has one.
     pub(super) fn open_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(binding) = self.binding(self.active(cx).as_deref()) else {
+        let Some(target) = self.console_target(cx) else {
+            return;
+        };
+        let Some(binding) = self.binding(Some(&target.connection)) else {
             return;
         };
         let open = self.tabs.iter().position(|(t, _)| {
@@ -393,6 +411,12 @@ impl Shell {
                 }
             },
         };
+        if let Some(schema) = target.schema {
+            let tab = self.tabs[i].0.clone();
+            if tab.read(cx).schema() != Some(schema.as_str()) {
+                tab.update(cx, |t, cx| t.switch_schema(schema, cx));
+            }
+        }
         self.show_tab(Front::Query(i), window, cx);
     }
 
@@ -901,14 +925,17 @@ impl Shell {
             .map(|(t, _)| {
                 let t = t.read(cx);
                 let connection = t.connection.as_ref().map(|c| c.id.clone());
+                let schema = t.picked_schema().map(str::to_owned);
                 match &t.kind {
                     Kind::File(path) => TabState::File {
                         path: path.clone(),
                         text: path.is_none().then(|| t.text(cx)),
                         connection,
+                        schema,
                     },
                     Kind::Console(_) => TabState::Console {
                         connection: connection.unwrap_or_default(),
+                        schema,
                     },
                     Kind::Table(r) => TabState::Table {
                         connection: connection.unwrap_or_default(),

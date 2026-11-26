@@ -11,6 +11,7 @@ mod history;
 mod import;
 mod keys;
 mod objects;
+mod schema;
 mod sessions;
 mod settings;
 mod sidebar;
@@ -46,6 +47,7 @@ use gpui_kit::{
     img, linear_color_stop, linear_gradient, pattern_slash, point, px, relative, size,
 };
 
+pub(crate) use schema::{SchemaNext, SchemaPick, SchemaPrev};
 pub(crate) use sidebar::Cache;
 use sidebar::{Nav, Search};
 
@@ -150,6 +152,11 @@ pub struct Shell {
     objects_settled: bool,
     tx_menu_open: bool,
     export_menu_open: bool,
+    /// The toolbar's schema menu.
+    schema_menu: schema::SchemaMenu,
+    /// A sidebar row was clicked after the front tab last changed: the console opens
+    /// on that row's connection and schema.
+    sidebar_last: bool,
     focus: FocusHandle,
     save: Option<Task<()>>,
     conns: HashMap<String, Conn>,
@@ -260,6 +267,8 @@ impl Shell {
             objects_settled: false,
             tx_menu_open: false,
             export_menu_open: false,
+            schema_menu: schema::SchemaMenu::new(window, cx),
+            sidebar_last: false,
             focus,
             save: None,
             conns: HashMap::new(),
@@ -1475,6 +1484,8 @@ enum Item {
     },
     Separator,
     TxMode,
+    /// The front tab's schema, before Run.
+    Schema,
     Spacer,
 }
 
@@ -1566,7 +1577,7 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
             "console",
             Icon::Console,
             Some("Console"),
-            shell.active(cx).is_some(),
+            shell.console_target(cx).is_some(),
             format!("Open console ({})", k("console")),
         ),
         tool(
@@ -1584,6 +1595,7 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
             format!("Save ({})", k("save")),
         ),
         Item::Separator,
+        Item::Schema,
         Item::Tool {
             id: "run",
             icon: Icon::Play,
@@ -1682,6 +1694,11 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
     // Widths from `.b`: 1 px border and 8 px padding a side, 16 px icon, 6 px gaps.
     let w = |text: &str, weight| text_width(window, text, weight);
     let switcher_w = px(2. + 16. + 6. + 16.) + w(&shell.project.name(), FontWeight::MEDIUM);
+    let chip = schema::chip_label(shell, cx);
+    let items: Vec<Item> = items
+        .into_iter()
+        .filter(|i| chip.is_some() || !matches!(i, Item::Schema))
+        .collect();
     let mut total = px(24. + 32. + 9.) + switcher_w + px(4. * (items.len() + 2) as f32);
     let mut labels: Vec<(&str, Pixels)> = Vec::new();
     for item in &items {
@@ -1707,6 +1724,9 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
                     + w("Tx", FontWeight::NORMAL)
                     + w(tx_mode.label(), FontWeight::NORMAL)
             }
+            Item::Schema => chip
+                .as_ref()
+                .map_or(px(0.), |(l, _)| schema::chip_width(window, l)),
             Item::Spacer => px(0.),
         };
         total += base;
@@ -1794,6 +1814,7 @@ fn toolbar(shell: &Shell, window: &Window, cx: &mut Context<Shell>) -> impl Into
         Item::Separator => separator(&p).into_any_element(),
         Item::Spacer => div().flex_1().into_any_element(),
         Item::TxMode => tx_menu(shell, has_tab && sql && !running, tx_mode, cx).into_any_element(),
+        Item::Schema => schema::chip(shell, cx),
     });
     let children: Vec<_> = children.collect();
     let config = &shell.project.config;

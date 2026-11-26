@@ -459,6 +459,7 @@ mod tests {
     struct Fake {
         dead: AtomicBool,
         runs: AtomicUsize,
+        texts: Mutex<Vec<String>>,
     }
 
     impl Driver for Fake {
@@ -468,8 +469,9 @@ mod tests {
         fn server_version(&self) -> &str {
             "MySQL 8.4.0"
         }
-        fn execute<'a>(&'a self, _text: &'a str) -> BoxFuture<'a, Result<ResultStream>> {
+        fn execute<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<ResultStream>> {
             self.runs.fetch_add(1, Ordering::Relaxed);
+            lock(&self.texts).push(text.to_owned());
             let dead = self.dead.load(Ordering::Relaxed);
             Box::pin(async move {
                 if dead {
@@ -569,5 +571,17 @@ mod tests {
         let e = rt.block_on(h.execute("SELECT 1")).unwrap_err();
         assert!(matches!(e, DriverError::ReconnectFailed(_)), "{e}");
         assert_eq!(first.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_picked_schema_is_set_again_on_a_new_session() {
+        let (h, first, opened) = healing(true);
+        let rt = rt();
+        first.dead.store(false, Ordering::Relaxed);
+        let pick = crate::session_schema::switch_sql(Engine::Mysql, "shop").unwrap();
+        rt.block_on(h.execute(&pick)).unwrap();
+        first.dead.store(true, Ordering::Relaxed);
+        rt.block_on(h.execute("SELECT 1")).unwrap();
+        assert_eq!(*lock(&lock(&opened)[0].texts), ["USE `shop`", "SELECT 1"]);
     }
 }

@@ -101,9 +101,18 @@ pub enum TabState {
         connection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// The schema picked or typed (`USE`) on the tab, when not the connection's
+        /// default: set again when the tab's session opens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
     },
     /// The connection's console; its buffer lives in `.deadlock/consoles/`.
-    Console { connection: String },
+    Console {
+        connection: String,
+        /// As a file tab's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+    },
     /// A table's or view's data.
     Table {
         connection: String,
@@ -431,14 +440,17 @@ mod tests {
                 path: Some(dir.path().join("a.sql")),
                 connection: Some("local".into()),
                 text: None,
+                schema: Some("shop_test".into()),
             },
             TabState::File {
                 path: None,
                 connection: None,
                 text: Some("SELECT 1".into()),
+                schema: None,
             },
             TabState::Console {
                 connection: "local".into(),
+                schema: Some("HR".into()),
             },
             TabState::Object {
                 connection: "local".into(),
@@ -456,6 +468,28 @@ mod tests {
         let json = fs::read_to_string(dir.path().join(DIR).join(STATE)).unwrap();
         assert!(json.contains(r#""kind": "console""#), "{json}");
         assert!(json.contains(r#""object": "trigger""#), "{json}");
+        assert!(json.contains(r#""schema": "shop_test""#), "{json}");
+    }
+
+    #[test]
+    fn tabs_saved_before_schemas_load() {
+        let old = r#"[{"kind":"console","connection":"local"},{"kind":"file","text":"x"}]"#;
+        let tabs: Vec<TabState> = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            tabs,
+            [
+                TabState::Console {
+                    connection: "local".into(),
+                    schema: None
+                },
+                TabState::File {
+                    path: None,
+                    connection: None,
+                    text: Some("x".into()),
+                    schema: None
+                }
+            ]
+        );
     }
 
     #[test]
