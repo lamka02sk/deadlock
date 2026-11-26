@@ -22,7 +22,7 @@ use super::{Conn, Shell};
 use crate::app::Db;
 use crate::assets::{Icon, menu_item, menu_item_danger};
 use crate::query::View;
-use crate::theme::{MONO_FONT, Palette, small_size};
+use crate::theme::{Palette, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button, labelled, modal};
 
@@ -1033,7 +1033,7 @@ pub(super) fn new_key_dialog(
                     .border_1()
                     .border_color(if on { p.tx } else { p.line2 })
                     .when(on, |d| d.bg(p.tx).text_color(p.bg))
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(small_size())
                     .child(t.label().to_owned())
                     .clickable(cx.listener(move |this, _, _, cx| {
@@ -1058,7 +1058,7 @@ pub(super) fn new_key_dialog(
     };
     let field = |s: &Entity<InputState>, mono: bool| {
         let i = Styled::h(Input::new(s), px(32.));
-        if mono { i.font_family(MONO_FONT) } else { i }
+        if mono { i.font_family(mono_font()) } else { i }
     };
     let mut body = vec![
         labelled("Key name", field(&n.name, true)).into_any_element(),

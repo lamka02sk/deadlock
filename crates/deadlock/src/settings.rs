@@ -49,6 +49,7 @@ pub fn get(cx: &App) -> &Settings {
 fn apply_globals(cx: &App) {
     let s = get(cx);
     crate::theme::set_sizes(s.ui_size, s.editor_size);
+    crate::theme::set_fonts(&s.ui_font, &s.mono_font);
     deadlock_core::driver::set_page_size(usize::try_from(s.page_size).unwrap_or(500));
 }
 
@@ -83,7 +84,8 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     if shortcuts {
         crate::keymap::apply(cx);
     }
-    if theme || before.ui_size != get(cx).ui_size {
+    let fonts = before.ui_font != get(cx).ui_font || before.mono_font != get(cx).mono_font;
+    if theme || fonts || before.ui_size != get(cx).ui_size {
         crate::theme::reapply(cx);
     }
     cx.refresh_windows();

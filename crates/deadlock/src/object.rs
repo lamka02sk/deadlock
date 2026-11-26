@@ -34,8 +34,8 @@ use gpui_kit::{
 use self::form::{Banner, Field, Tone, Widget};
 use crate::app::Db;
 use crate::assets::{Icon, icon};
-use crate::query::table::highlighted;
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, editor_size, row_height, small_size};
+use crate::query::table::selectable_sql;
+use crate::theme::{Palette, RADIUS, data_size, editor_size, mono_font, row_height, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button, icon_button};
 
@@ -1010,7 +1010,7 @@ fn fields_row(children: Vec<AnyElement>) -> Div {
 fn text_input(state: &Entity<InputState>, mono: bool, locked: bool) -> Input {
     let i = Styled::h(Input::new(state), row_height()).disabled(locked);
     if mono {
-        i.font_family(MONO_FONT).text_size(data_size())
+        i.font_family(mono_font()).text_size(data_size())
     } else {
         i
     }
@@ -1028,7 +1028,7 @@ fn fixed_box(value: String, p: &Palette) -> Div {
         .rounded(RADIUS)
         .bg(p.panel)
         .text_color(p.tx2)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .overflow_hidden()
         .whitespace_nowrap()
@@ -1041,7 +1041,7 @@ fn editor_box(editor: &Entity<EditorState>, locked: bool, p: &Palette) -> Editor
         .bordered(false)
         .readonly(locked)
         .h_full()
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(editor_size())
         .line_height(px(22.))
         .py(px(8.))
@@ -1100,7 +1100,7 @@ impl ObjectTab {
             .child(div().flex().gap(px(4.)).children(sections))
             .child(
                 div()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .child(name),
             )
@@ -1247,7 +1247,7 @@ impl ObjectTab {
                     .gap(px(8.))
                     .child(
                         div()
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .child(SharedString::from(e.code.clone())),
                     )
                     .child(
@@ -1320,7 +1320,7 @@ impl ObjectTab {
                             .gap(px(8.))
                             .child(
                                 div()
-                                    .font_family(MONO_FONT)
+                                    .font_family(mono_font())
                                     .text_color(p.tx3)
                                     .child(format!("{}", i + 1)),
                             )
@@ -1329,7 +1329,7 @@ impl ObjectTab {
                             .when(s.status != StepStatus::NotRun, |d| {
                                 d.child(
                                     div()
-                                        .font_family(MONO_FONT)
+                                        .font_family(mono_font())
                                         .text_color(p.tx3)
                                         .child(format!("{} ms", s.elapsed.as_millis())),
                                 )
@@ -1471,7 +1471,7 @@ impl ObjectTab {
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_color(p.tx3)
                         .child(format!("{}", i + 1))
                         .when(added, |d| d.child(changed_dot(p))),
@@ -1589,7 +1589,7 @@ impl ObjectTab {
                         .gap(px(12.))
                         .px(px(16.))
                         .py(px(2.))
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(data_size())
                         .child(div().text_color(p.tx3).child(format!("{}", i + 1)))
                         .child(s.clone())
@@ -1655,11 +1655,15 @@ impl ObjectTab {
             .overflow_scroll()
             .px(px(16.))
             .py(px(16.))
-            .font_family(MONO_FONT)
+            .font_family(mono_font())
             .text_size(data_size())
             .line_height(px(21.))
             .whitespace_nowrap()
-            .child(div().flex_none().child(highlighted(&text, p)))
+            .child(
+                div()
+                    .flex_none()
+                    .child(selectable_sql("object-source", &text, p)),
+            )
             .into_any_element()
     }
 
@@ -1688,7 +1692,7 @@ impl ObjectTab {
                     div()
                         .w(px(64.))
                         .flex_none()
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_color(p.link)
                         .child(at),
                 )
@@ -1698,7 +1702,7 @@ impl ObjectTab {
                         .flex_1()
                         .min_w_0()
                         .when(!warn, |d| d.text_color(p.danger))
-                        .child(div().font_family(MONO_FONT).child(code))
+                        .child(div().font_family(mono_font()).child(code))
                         .child(message),
                 )
                 .clickable(cx.listener(move |this, _, window, cx| this.goto(&e, window, cx)))
@@ -1923,11 +1927,15 @@ impl ObjectTab {
                 .border_1()
                 .border_color(p.line2)
                 .rounded(RADIUS)
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .line_height(px(20.))
                 .whitespace_nowrap()
-                .child(div().flex_none().child(highlighted(&self.preview, p)))
+                .child(
+                    div()
+                        .flex_none()
+                        .child(selectable_sql("object-preview", &self.preview, p)),
+                )
         });
         let folded = (!self.footer_open && self.source_first() && ready).then(|| {
             div().px(px(16.)).pb(px(8.)).child(hint(

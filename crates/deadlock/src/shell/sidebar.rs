@@ -23,7 +23,7 @@ use gpui_kit::{
 use super::{Conn, Shell, type_label};
 use crate::app::Db;
 use crate::assets::{Icon, icon};
-use crate::theme::{Palette, RADIUS, row_height, small_size};
+use crate::theme::{Palette, RADIUS, row_height, small_size, tab_height};
 use crate::ui::Clickable as _;
 use crate::ui::square_button;
 
@@ -59,6 +59,7 @@ impl Shell {
                     .find(|t| t.id == c.id)
                     .and_then(|t| t.nodes.take()),
                 hidden: c.hidden_schemas.clone(),
+                show_empty_groups: c.show_empty_groups,
             })
             .collect();
     }
@@ -321,6 +322,17 @@ impl Shell {
     /// Loads what an opened node needs: a connection connects, a database not fetched
     /// this session reloads, anything without children asks the driver.
     fn ensure_loaded(&mut self, id: &NodeId, cx: &mut Context<Self>) {
+        // A node reopened from the last run, under a connection not connected yet:
+        // connecting reloads the open databases.
+        if id.len() > 1
+            && self
+                .conns
+                .get(&id[0])
+                .is_none_or(|c| matches!(c, Conn::Failed(_)))
+        {
+            self.connect(&id[0], cx);
+            return;
+        }
         if id.len() == 1 {
             match self.conns.get(&id[0]) {
                 Some(Conn::Connected(_)) if !self.fresh.contains(id) => self.load(id.clone(), cx),
@@ -378,6 +390,12 @@ impl Shell {
                 (rows, 0)
             }
         };
+        let mut open: Vec<NodeId> = self.tree.expanded.iter().cloned().collect();
+        open.sort();
+        if open != self.project.state.expanded {
+            self.project.state.expanded = open;
+            self.schedule_save(cx);
+        }
         cx.notify();
     }
 
@@ -597,12 +615,9 @@ pub(super) enum Nav {
     Toggle,
 }
 
-/// `.t` rows: chevron at `4 + 16 × depth`; columns sit at 112 px, or 90 px with a key icon.
+/// `.t` rows: chevron at `4 + 16 × depth`; leaves start their icon there.
 fn indent(row: &Row) -> Pixels {
-    let key = row.primary_key || row.foreign_key;
     match row.kind {
-        RowKind::Node(NodeKind::Column) if key => px(90.),
-        RowKind::Node(NodeKind::Column) => px(112.),
         // Redis keys line up with their namespace's name, as in the design.
         RowKind::Node(NodeKind::Key | NodeKind::More) => {
             px((22. + 16. * row.depth().saturating_sub(1) as f32).max(58.))
@@ -716,12 +731,15 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                 this.toggle(&id, cx);
             }))
     });
-    // Leaves above the column level keep the chevron's place, so icons line up.
+    // Leaf groups and schemas keep the chevron's place, so they line up with their
+    // siblings; leaf objects start at it. A column without a key icon keeps that
+    // icon's place.
     let spacer = !row.expandable
-        && !matches!(
-            row.kind,
-            RowKind::Node(NodeKind::Column | NodeKind::Key | NodeKind::More)
-        );
+        && match row.kind {
+            RowKind::Node(NodeKind::Column) => !(row.primary_key || row.foreign_key),
+            RowKind::Node(NodeKind::Routine | NodeKind::Key | NodeKind::More) => false,
+            _ => true,
+        };
     let tip: Option<SharedString> = match (row.kind, shell.conns.get(&row.id[0])) {
         (RowKind::Connection, Some(Conn::Failed(e))) => Some(e.clone().into()),
         (RowKind::Error, _) => Some(row.label.clone().into()),
@@ -752,6 +770,9 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
         .pb(px(1.))
         .child(
             div()
+                // GPUI tracks hover only on elements with an id; without one the
+                // highlight stuck on the first row the pointer entered.
+                .id(("tree-cell", ix))
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -783,7 +804,8 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                     )
                 })
                 .children(chevron)
-                .when(spacer, |d| d.child(div().w(px(16.)).flex_none()))
+                // Icons are rem sized, so the stand-in is too.
+                .when(spacer, |d| d.child(div().size_4().flex_none()))
                 .children(row_icon(row, &p))
                 // Names keep their width up to three quarters of the row; the type
                 // label gives way first.
@@ -798,7 +820,7 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                         .overflow_hidden()
                         .text_ellipsis()
                         .when(mono, |d| {
-                            d.font_family(crate::theme::MONO_FONT)
+                            d.font_family(crate::theme::mono_font())
                                 .text_size(crate::theme::data_size())
                         })
                         .child(label(&shown_label, &row.hits, &p)),
@@ -827,6 +849,30 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
             .map(|c| c.hidden_schemas.clone())
             .unwrap_or_default();
         let current = shell.config(&id).and_then(|c| c.color.clone());
+        // Every schema the tree knows, then hidden ones it has not loaded (yet).
+        let mut schemas: Vec<String> = shell
+            .tree
+            .children(std::slice::from_ref(&id))
+            .unwrap_or_default()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Database)
+            .map(|n| n.name.clone())
+            .collect();
+        schemas.extend(
+            hidden
+                .iter()
+                .filter(|h| !schemas.contains(h))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let schemas_label = if shell
+            .config(&id)
+            .is_some_and(|c| c.engine == Engine::Oracle)
+        {
+            "Schemas"
+        } else {
+            "Databases"
+        };
         return element
             .context_menu(move |menu, window, cx| {
                 let item = |label: &'static str, ic: Icon, editing: bool| {
@@ -846,37 +892,44 @@ fn render_row(shell: &Shell, ix: usize, row: &Row, cx: &mut Context<Shell>) -> A
                     cx,
                     move |m, _, _| color_menu(m, &cshell, &cid, current.as_deref()),
                 );
-                let menu = hidden.iter().fold(
-                    if hidden.is_empty() {
-                        menu
-                    } else {
-                        menu.separator().item(
-                            crate::assets::menu_item("Unhide all schemas", Icon::Eye).on_click({
-                                let (shell, id) = (shell_entity.clone(), id.clone());
-                                let all = hidden.clone();
-                                move |_, _, cx| {
-                                    shell.update(cx, |s, cx| {
-                                        for h in &all {
-                                            s.set_schema_hidden(&id, h, false, cx);
-                                        }
-                                    });
-                                }
-                            }),
+                let menu = if schemas.is_empty() {
+                    menu
+                } else {
+                    let (shell, id, schemas, hidden) = (
+                        shell_entity.clone(),
+                        id.clone(),
+                        schemas.clone(),
+                        hidden.clone(),
+                    );
+                    menu.separator().submenu_with_icon(
+                        Some(crate::assets::menu_icon(Icon::Eye)),
+                        schemas_label,
+                        window,
+                        cx,
+                        move |m, _, _| schemas_menu(m, &shell, &id, &schemas, &hidden),
+                    )
+                };
+                let menu = if hidden.is_empty() {
+                    menu
+                } else {
+                    menu.item(
+                        crate::assets::menu_item(
+                            format!("Show all {}", schemas_label.to_lowercase()),
+                            Icon::Eye,
                         )
-                    },
-                    |menu, name| {
-                        let (shell, id, name) = (shell_entity.clone(), id.clone(), name.clone());
-                        menu.item(
-                            crate::assets::menu_item(format!("Unhide {name}"), Icon::Eye).on_click(
-                                move |_, _, cx| {
-                                    shell.update(cx, |s, cx| {
-                                        s.set_schema_hidden(&id, &name, false, cx)
-                                    });
-                                },
-                            ),
-                        )
-                    },
-                );
+                        .on_click({
+                            let (shell, id) = (shell_entity.clone(), id.clone());
+                            let all = hidden.clone();
+                            move |_, _, cx| {
+                                shell.update(cx, |s, cx| {
+                                    for h in &all {
+                                        s.set_schema_hidden(&id, h, false, cx);
+                                    }
+                                });
+                            }
+                        }),
+                    )
+                };
                 let (shell, id) = (shell_entity.clone(), id.clone());
                 menu.separator().item(
                     crate::assets::menu_item_danger("Delete connection…", Icon::Trash, cx)
@@ -1020,16 +1073,23 @@ pub(super) fn sidebar(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElemen
         .flex()
         .flex_col()
         .gap(px(4.))
-        .p(px(8.))
+        .px(px(8.))
+        .pb(px(8.))
         .bg(p.panel)
+        // The header lines up with the tab strip: same height, same bottom rule.
         .child(
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_between()
-                .h(px(28.))
-                .pl(px(8.))
+                .h(tab_height() + px(1.))
+                .mx(px(-8.))
+                .mb(px(4.))
+                .pl(px(16.))
+                .pr(px(8.))
+                .border_b_1()
+                .border_color(p.line)
                 .child(
                     div()
                         .text_size(small_size())
@@ -1104,6 +1164,32 @@ pub(super) fn sidebar(shell: &Shell, cx: &mut Context<Shell>) -> impl IntoElemen
                 ),
         )
         .children(super::keys::job_status(shell, cx))
+}
+
+/// The connection menu's schema list: checked ones show in the tree. A click flips
+/// one and the menu stays open for the next.
+fn schemas_menu(
+    menu: gpui_kit::component::menu::PopupMenu,
+    shell: &gpui_kit::Entity<Shell>,
+    id: &str,
+    schemas: &[String],
+    hidden: &[String],
+) -> gpui_kit::component::menu::PopupMenu {
+    schemas
+        .iter()
+        .fold(menu.toggles(true).scrollable(true), |menu, name| {
+            let (shell, id, name) = (shell.clone(), id.to_owned(), name.clone());
+            menu.item(
+                gpui_kit::component::menu::PopupMenuItem::new(name.clone())
+                    .checked(!hidden.contains(&name))
+                    .on_click(move |_, _, cx| {
+                        shell.update(cx, |s, cx| {
+                            let hide = !s.config(&id).is_some_and(|c| c.is_hidden(&name));
+                            s.set_schema_hidden(&id, &name, hide, cx);
+                        });
+                    }),
+            )
+        })
 }
 
 /// The Color submenu: None and the palette, the current one marked.

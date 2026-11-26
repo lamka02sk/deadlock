@@ -18,14 +18,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, HighlightStyle,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _,
-    Styled, StyledText, Subscription, Task, Window, div, px,
+    Styled, Subscription, Task, Window, div, px,
 };
 
 use super::{QueryTab, Session, TabEvent};
 use crate::app::Db;
 use crate::assets::Icon;
 use crate::dialog::Ask;
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button, icon_button, labelled, modal};
 
@@ -159,7 +159,12 @@ fn summary(kind: &KeyType, updated: usize, deleted: usize, added: usize) -> Stri
 }
 
 /// Commands with the design's colors: the name bold in the link color, values green.
-fn highlighted(commands: &[Command], p: &Palette) -> StyledText {
+/// Commands as text the mouse can select and copy.
+fn highlighted(
+    id: &'static str,
+    commands: &[Command],
+    p: &Palette,
+) -> gpui_kit::base::SelectableText {
     let mut text = String::new();
     let mut marks = Vec::new();
     for (i, c) in commands.iter().enumerate() {
@@ -190,7 +195,7 @@ fn highlighted(commands: &[Command], p: &Palette) -> StyledText {
             marks.push((start..text.len(), style));
         }
     }
-    StyledText::new(SharedString::from(text)).with_highlights(marks)
+    gpui_kit::base::SelectableText::new(id, text).highlights(marks)
 }
 
 impl QueryTab {
@@ -226,6 +231,7 @@ impl QueryTab {
             0
         };
         t.busy = true;
+        t.load = Some(super::table::Trigger::Other);
         if !keep {
             t.notice = None;
         }
@@ -303,6 +309,7 @@ impl QueryTab {
         if t.generation != generation {
             return;
         }
+        t.load = None;
         let (facts, rows, text) = match result {
             Ok(r) => r,
             Err(e) => {
@@ -918,7 +925,7 @@ pub(super) fn header(
             fact(
                 "Key",
                 div()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
                     .child(t.table.table.clone()),
@@ -1061,7 +1068,7 @@ pub(super) fn header(
             p.line2
         })
         .rounded(RADIUS)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .when(!matching, |d| d.opacity(0.5))
         .child(div().flex_none().text_color(p.tx3).child("match"))
@@ -1070,7 +1077,7 @@ pub(super) fn header(
                 Editor::new(&t.filter)
                     .xsmall()
                     .appearance(false)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .line_height(px(26.))
                     .h(px(26.))
@@ -1241,7 +1248,7 @@ pub(super) fn body(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyEle
                     Editor::new(editor)
                         .bordered(false)
                         .h_full()
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(data_size())
                         .line_height(px(20.))
                         .py(px(10.)),
@@ -1287,7 +1294,7 @@ pub(super) fn panel_text(this: &QueryTab, cx: &App) -> (String, Result<Vec<Comma
 /// The panel's commands, highlighted, or the error that stops them.
 pub(super) fn panel_commands(commands: &Result<Vec<Command>, String>, p: &Palette) -> AnyElement {
     match commands {
-        Ok(c) => highlighted(c, p).into_any_element(),
+        Ok(c) => highlighted("redis-commands", c, p).into_any_element(),
         Err(e) => div()
             .text_color(p.danger)
             .child(e.clone())
@@ -1312,7 +1319,7 @@ pub(super) fn dialog(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyE
             "A duration (90s, 15m, 2h, 1d), a local date and time, or never to keep the key.",
             labelled(
                 "Expires",
-                Styled::h(Input::new(input), px(32.)).font_family(MONO_FONT),
+                Styled::h(Input::new(input), px(32.)).font_family(mono_font()),
             ),
             None,
             "Set expiry",
@@ -1333,7 +1340,7 @@ pub(super) fn dialog(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyE
             "RENAMENX refuses a name that is taken; Overwrite uses RENAME, which replaces that key.",
             labelled(
                 "New name",
-                Styled::h(Input::new(input), px(32.)).font_family(MONO_FONT),
+                Styled::h(Input::new(input), px(32.)).font_family(mono_font()),
             ),
             Some((
                 Checkbox::new("rename-overwrite")
@@ -1365,9 +1372,9 @@ pub(super) fn dialog(this: &QueryTab, cx: &mut Context<QueryTab>) -> Option<AnyE
             .border_color(p.line)
             .rounded(RADIUS)
             .bg(p.panel)
-            .font_family(MONO_FONT)
+            .font_family(mono_font())
             .text_size(data_size())
-            .child(highlighted(std::slice::from_ref(c), &p)),
+            .child(highlighted("redis-command", std::slice::from_ref(c), &p)),
         Err(e) => div()
             .text_size(small_size())
             .text_color(p.danger)

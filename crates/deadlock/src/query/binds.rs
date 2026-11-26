@@ -9,7 +9,7 @@ use gpui_kit::{
 use tokio::sync::oneshot;
 
 use super::QueryTab;
-use crate::theme::{MONO_FONT, Palette, RADIUS, small_size};
+use crate::theme::{Palette, RADIUS, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
@@ -108,7 +108,7 @@ pub(super) fn render(
                 div()
                     .w(px(120.))
                     .flex_none()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(small_size())
                     .overflow_hidden()
                     .text_ellipsis()

@@ -323,6 +323,7 @@ fn mysql_big_schema_timings() {
         name: "c".into(),
         nodes: Some(dbs),
         hidden: Vec::new(),
+        show_empty_groups: true,
     });
     assert!(tree.set_children(&["c".into(), "big".into()], groups));
     for id in [vec!["c"], vec!["c", "big"], vec!["c", "big", "Tables"]] {

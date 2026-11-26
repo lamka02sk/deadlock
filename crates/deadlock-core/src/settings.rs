@@ -67,6 +67,13 @@ pub struct Settings {
     pub theme: Theme,
     pub ui_size: u8,
     pub editor_size: u8,
+    /// The interface font's family; empty keeps the shipped one (Inter).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ui_font: String,
+    /// The code font's family (SQL, values); empty keeps the shipped one
+    /// (JetBrains Mono).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mono_font: String,
     pub indent: Indent,
     pub keyword_case: KeywordCase,
     pub wrap: bool,
@@ -94,6 +101,8 @@ impl Default for Settings {
             theme: Theme::System,
             ui_size: 13,
             editor_size: 13,
+            ui_font: String::new(),
+            mono_font: String::new(),
             indent: Indent::Two,
             keyword_case: KeywordCase::Lower,
             wrap: false,
@@ -226,6 +235,8 @@ mod tests {
             theme: Theme::Light,
             ui_size: 15,
             editor_size: 16,
+            ui_font: "DejaVu Sans".into(),
+            mono_font: "Fira Code".into(),
             indent: Indent::Tab,
             keyword_case: KeywordCase::Keep,
             wrap: true,

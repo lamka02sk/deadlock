@@ -21,8 +21,8 @@ use gpui_kit::component::time_field::TimePrecision;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{Animation, AnimationExt as _, Transformation, percentage};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _,
-    FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, SharedString,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight,
+    HighlightStyle, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, StyledText, Subscription, Task, Window, actions, div, hsla,
     px,
 };
@@ -31,7 +31,7 @@ use super::{QueryTab, Session, TabEvent, TxMode};
 use crate::app::Db;
 use crate::assets::Icon;
 use crate::results::{Action, EditOverlay, Grid, GridEvent, date_kind, grid_actions, grid_text};
-use crate::theme::{MONO_FONT, Palette, RADIUS, small_size};
+use crate::theme::{Palette, RADIUS, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button, icon_button};
 
@@ -144,6 +144,8 @@ pub struct TableData {
     pub waiting: bool,
     /// Bumped on every load, so an older answer is dropped.
     pub(super) generation: u64,
+    /// The load in flight and what started it: a field that did shows a spinner.
+    pub(super) load: Option<Trigger>,
     /// When the running load started, and how long the last one took.
     started: Option<Instant>,
     took: Option<Duration>,
@@ -151,11 +153,17 @@ pub struct TableData {
     pub(super) redis: Option<super::key::KeyState>,
     /// Column widths set by hand, by column name: saved with the project.
     pub widths: BTreeMap<String, f32>,
-    /// One row as a Column / Value list instead of the grid.
+    /// The grid drawn turned: fields down, records across (see [`Grid::transposed`]).
     transposed: bool,
-    /// The transposed list's keys.
-    rows_focus: FocusHandle,
     _subs: Vec<Subscription>,
+}
+
+/// What started a load: Enter in the `where` or `order by` field, or anything else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trigger {
+    Other,
+    Filter,
+    Order,
 }
 
 /// A one-line SQL field: the `where` and `order by` fields (a Redis key's `match`
@@ -181,12 +189,12 @@ pub(super) fn data(
 ) -> TableData {
     let filter = sql_field(!redis, window, cx);
     let order = sql_field(!redis, window, cx);
-    let subs = [&filter, &order]
+    let subs = [(&filter, Trigger::Filter), (&order, Trigger::Order)]
         .into_iter()
-        .map(|f| {
-            cx.subscribe_in(f, window, |this, _, e: &InputEvent, window, cx| {
+        .map(|(f, which)| {
+            cx.subscribe_in(f, window, move |this, _, e: &InputEvent, window, cx| {
                 if matches!(e, InputEvent::PressEnter { .. }) {
-                    this.apply_fields(window, cx);
+                    this.apply_fields(which, window, cx);
                 }
             })
         })
@@ -211,12 +219,12 @@ pub(super) fn data(
         busy: false,
         waiting: false,
         generation: 0,
+        load: None,
         started: None,
         took: None,
         redis: None,
         widths: BTreeMap::new(),
         transposed: false,
-        rows_focus: cx.focus_handle(),
         _subs: subs,
     }
 }
@@ -344,7 +352,6 @@ impl QueryTab {
             return;
         };
         match &t.grid {
-            Some(_) if t.transposed => window.focus(&t.rows_focus, cx),
             Some(g) => window.focus(&g.read(cx).focus_handle(cx), cx),
             None => t.filter.update(cx, |f, cx| f.focus(window, cx)),
         }
@@ -456,8 +463,51 @@ impl QueryTab {
     }
 
     /// Enter in the where or order by field.
-    fn apply_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ask_discard(window, cx, |this, _, cx| this.load_table(false, cx));
+    fn apply_fields(&mut self, which: Trigger, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_discard(window, cx, move |this, _, cx| {
+            this.load_table(false, cx);
+            if let Some(t) = this.table.as_mut().filter(|t| t.load.is_some()) {
+                t.load = Some(which);
+            }
+        });
+    }
+
+    /// The pager's Stop: cancels the load on the server and keeps the rows on screen.
+    fn stop_load(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.table.as_mut().filter(|t| t.load.is_some()) else {
+            return;
+        };
+        // An answer that still comes is dropped.
+        t.generation += 1;
+        t.load = None;
+        t.busy = false;
+        t.started = None;
+        t.notice = Some((
+            "Stopped: the rows shown are from the last load.".into(),
+            false,
+        ));
+        if let Some(g) = t.grid.clone() {
+            g.update(cx, |g, cx| {
+                if let Some(e) = &mut g.delegate_mut().edit {
+                    e.sorting = false;
+                }
+                cx.notify();
+            });
+        }
+        if let Session::Ready(driver) = &self.session {
+            let driver = Arc::clone(driver);
+            let rx = cx
+                .global::<Db>()
+                .0
+                .spawn(async move { driver.cancel().await });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Err(e)) = rx.await {
+                    let _ = this.update(cx, |this, cx| this.table_note(e.to_string(), true, cx));
+                }
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     /// Runs `then` now, or after the user agrees to drop the pending changes.
@@ -543,6 +593,7 @@ impl QueryTab {
         let info = t.info.clone();
         let table = t.table.clone();
         t.busy = true;
+        t.load = Some(Trigger::Other);
         if !keep {
             t.notice = None;
             t.page = 0;
@@ -621,7 +672,18 @@ impl QueryTab {
             return;
         }
         t.busy = false;
+        t.load = None;
         t.took = t.started.take().map(|s| s.elapsed());
+        // A failed load keeps the old grid: its sort spinner stops.
+        if let Some(g) = t.grid.clone() {
+            g.update(cx, |g, cx| {
+                if let Some(e) = &mut g.delegate_mut().edit {
+                    e.sorting = false;
+                }
+                cx.notify();
+            });
+        }
+        let Some(t) = &mut self.table else { return };
         let (info, rows, stream) = match result {
             Ok(r) => r,
             Err((e, from_fields)) => {
@@ -677,6 +739,10 @@ impl QueryTab {
                 let mut overlay = EditOverlay::new(info.clone(), reason);
                 overlay.sort = sort.clone();
                 grid.edit = Some(overlay);
+                grid.transposed = self
+                    .table
+                    .as_ref()
+                    .is_some_and(|t| t.transposed && !key_tab);
                 let saved = self.table.as_ref().map(|t| &t.widths);
                 if let Some(saved) = saved.filter(|w| !w.is_empty() && !key_tab) {
                     grid.widths = (0..grid.columns().len())
@@ -889,7 +955,8 @@ impl QueryTab {
         cx.notify();
     }
 
-    /// Ctrl+T: the grid, or the selected row as a Column / Value list.
+    /// Ctrl+T: the grid turned, fields down and records across, or back. The same
+    /// grid either way, so editing, sorting, menus and keys work alike.
     fn toggle_transposed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(t) = self
             .table
@@ -899,32 +966,20 @@ impl QueryTab {
             return;
         };
         t.transposed = !t.transposed;
+        let on = t.transposed;
+        if let Some(g) = t.grid.clone() {
+            g.update(cx, |t, cx| {
+                t.delegate_mut().transposed = on;
+                t.refresh(cx);
+                // The cursor stays on the same value.
+                let head = t.delegate().sel.map(|s| s.head);
+                if let Some((rec, field)) = head {
+                    crate::results::show_cell(t, rec, field, cx);
+                }
+                cx.notify();
+            });
+        }
         self.focus_table(window, cx);
-        cx.notify();
-    }
-
-    /// The transposed list's row and selected column: the selection's head, else the
-    /// first row and column.
-    fn transposed_at(&self, cx: &App) -> (usize, usize) {
-        self.grid()
-            .and_then(|g| g.read(cx).delegate().sel)
-            .map_or((0, 0), |s| s.head)
-    }
-
-    /// Selects cell (`row`, `c`) of the grid, as the transposed list moves.
-    fn select_cell(&mut self, row: usize, c: usize, cx: &mut Context<Self>) {
-        let Some(g) = self.grid().cloned() else {
-            return;
-        };
-        g.update(cx, |t, cx| {
-            let grid = t.delegate();
-            let (rows, cols) = (grid.rows_count_now(), grid.columns().len());
-            if rows == 0 || cols == 0 {
-                return;
-            }
-            let gc = grid.grid_col(c.min(cols - 1));
-            t.set_selected_cell(row.min(rows - 1), gc, cx);
-        });
         cx.notify();
     }
 
@@ -938,11 +993,14 @@ impl QueryTab {
         match e {
             TableEvent::DoubleClickedCell(r, c) => {
                 let (r, c) = (*r, *c);
-                if let Some(c) = table.read(cx).delegate().data_col(c) {
+                if let Some((r, c)) = table.read(cx).delegate().data_at(r, c) {
                     self.start_edit(r, c, window, cx);
                 }
             }
-            TableEvent::ColumnWidthsChanged(widths) if !self.is_key() => {
+            // Turned, the columns are records: their widths are not kept.
+            TableEvent::ColumnWidthsChanged(widths)
+                if !self.is_key() && !table.read(cx).delegate().transposed =>
+            {
                 let grid = table.read(cx).delegate();
                 let data: Vec<f32> = (0..grid.columns().len())
                     .filter_map(|c| widths.get(grid.grid_col(c)).map(|w| f32::from(*w)))
@@ -1056,10 +1114,21 @@ impl QueryTab {
         let Some(t) = &self.table else { return };
         let Some(info) = &t.info else { return };
         let current = sort_of(info, &t.order.read(cx).value()).unwrap_or_default();
-        let next = sort_text(info, &click_sort(&current, col, extend));
+        let keys = click_sort(&current, col, extend);
+        let next = sort_text(info, &keys);
         let order = t.order.clone();
         self.ask_discard(window, cx, move |this, window, cx| {
             order.update(cx, |o, cx| o.set_value(next, window, cx));
+            // The new arrows show now, spinning, not once the rows are back.
+            if let Some(g) = this.grid().cloned() {
+                g.update(cx, |g, cx| {
+                    if let Some(e) = &mut g.delegate_mut().edit {
+                        e.sort = keys;
+                        e.sorting = true;
+                    }
+                    cx.notify();
+                });
+            }
             this.load_table(false, cx);
         });
     }
@@ -1067,6 +1136,14 @@ impl QueryTab {
     /// The selected cell as (display row, data column), or the selected row.
     pub(super) fn selected(&self, cx: &App) -> Option<(usize, Option<usize>)> {
         let g = self.grid()?.read(cx);
+        if g.delegate().transposed {
+            return match g.selection() {
+                TableSelection::Cell(r, c) => {
+                    g.delegate().data_at(r, c).map(|(rec, f)| (rec, Some(f)))
+                }
+                _ => None,
+            };
+        }
         match g.selection() {
             TableSelection::Cell(r, c) => Some((r, g.delegate().data_col(c))),
             TableSelection::Row(r) => Some((r, None)),
@@ -1175,9 +1252,7 @@ impl QueryTab {
         } else {
             initial
         };
-        let transposed = self.table.as_ref().is_some_and(|t| t.transposed);
         let dialog = json
-            || transposed
             || col.is_binary()
             || initial.chars().count() > INLINE_LIMIT
             || initial.contains('\n')
@@ -1339,7 +1414,7 @@ impl QueryTab {
                 if let Some(e) = &mut grid.edit {
                     e.editing = None;
                 }
-                let at = grid.display_row(ed.row).map(|r| (r, grid.grid_col(ed.col)));
+                let at = grid.display_row(ed.row).map(|r| grid.display_at(r, ed.col));
                 if let Some((r, c)) = at {
                     g.set_selected_cell(r, c, cx);
                 }
@@ -1502,8 +1577,15 @@ impl QueryTab {
         });
         if let Some(d) = added.and_then(|a| g.read(cx).delegate().display_row(a)) {
             g.update(cx, |t, cx| {
-                t.scroll_to_row(d, cx);
-                t.set_selected_row(d, cx);
+                if t.delegate().transposed {
+                    let n = t.delegate().columns().len();
+                    crate::results::show_cell(t, d, 0, cx);
+                    t.delegate_mut()
+                        .set_sel(Some(crate::results::Sel::rows_of(d, d, n)), cx);
+                } else {
+                    t.scroll_to_row(d, cx);
+                    t.set_selected_row(d, cx);
+                }
             });
             window.focus(&g.read(cx).focus_handle(cx), cx);
         }
@@ -1562,8 +1644,7 @@ impl QueryTab {
                 (next + n - 1) % n
             };
             if self.column(next).is_some_and(|col| col.locked().is_none()) {
-                let gc = g.read(cx).delegate().grid_col(next);
-                g.update(cx, |t, cx| t.set_selected_cell(display, gc, cx));
+                g.update(cx, |t, cx| crate::results::show_cell(t, display, next, cx));
                 self.start_edit(display, next, window, cx);
                 return;
             }
@@ -1641,8 +1722,7 @@ impl QueryTab {
             g.update(cx, |t, cx| {
                 t.scroll_to_row(display, cx);
                 if let Some(c) = first {
-                    let gc = t.delegate().grid_col(c);
-                    t.set_selected_cell(display, gc, cx);
+                    crate::results::show_cell(t, display, c, cx);
                 }
             });
             window.focus(&g.read(cx).focus_handle(cx), cx);
@@ -1957,6 +2037,20 @@ pub(crate) fn wrap_sql(sql: &str, width: usize) -> String {
 /// SQL with the design's colors: keywords in the link color, strings green. For the
 /// pending changes, the Structure view's definition and its ALTER previews.
 pub(crate) fn highlighted(sql: &str, p: &Palette) -> StyledText {
+    StyledText::new(SharedString::from(sql.to_owned())).with_highlights(sql_marks(sql, p))
+}
+
+/// [`highlighted`] the mouse can select and copy.
+pub(crate) fn selectable_sql(
+    id: impl Into<gpui_kit::ElementId>,
+    sql: &str,
+    p: &Palette,
+) -> gpui_kit::base::SelectableText {
+    gpui_kit::base::SelectableText::new(id, sql.to_owned()).highlights(sql_marks(sql, p))
+}
+
+/// The keyword and string ranges [`highlighted`] colors.
+fn sql_marks(sql: &str, p: &Palette) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
     const KEYWORDS: [&str; 72] = [
         "update",
         "set",
@@ -2082,7 +2176,7 @@ pub(crate) fn highlighted(sql: &str, p: &Palette) -> StyledText {
             _ => i += 1,
         }
     }
-    StyledText::new(SharedString::from(sql.to_owned())).with_highlights(marks)
+    marks
 }
 
 /// The Data / Structure switch: the view in front is filled with `--tx`.
@@ -2164,6 +2258,13 @@ fn pager(t: &TableData, cx: &mut Context<QueryTab>) -> gpui_kit::Div {
     .justify_center()
     .when(!busy, |b| {
         b.clickable(cx.listener(|this, _, window, cx| this.refresh_rows(window, cx)))
+    });
+    // While rows load: stop the query, keeping the rows on screen.
+    let stop = t.load.is_some().then(|| {
+        button("page-stop", ButtonKind::Ghost, true, "Stop loading", cx)
+            .child(crate::assets::icon(Icon::Stop, p.danger))
+            .child("Stop")
+            .clickable(cx.listener(|this, _, _, cx| this.stop_load(cx)))
     });
     let transposed = t.transposed;
     let transpose = icon_button(
@@ -2274,6 +2375,7 @@ fn pager(t: &TableData, cx: &mut Context<QueryTab>) -> gpui_kit::Div {
         .border_color(p.line)
         .text_size(small_size())
         .child(refresh)
+        .children(stop)
         .children(t.took.filter(|_| !busy).map(|d| {
             div()
                 .id("page-took")
@@ -2302,6 +2404,7 @@ fn field(
     label: &'static str,
     input: &Entity<EditorState>,
     error: bool,
+    loading: bool,
     p: &Palette,
 ) -> gpui_kit::Div {
     div()
@@ -2313,7 +2416,7 @@ fn field(
         .border_1()
         .border_color(if error { p.danger } else { p.line2 })
         .rounded(RADIUS)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(crate::theme::data_size())
         .child(div().flex_none().text_color(p.tx3).child(label))
         .child(
@@ -2322,179 +2425,21 @@ fn field(
                 SqlEditor::new(input)
                     .xsmall()
                     .appearance(false)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(crate::theme::data_size())
                     .line_height(px(26.))
                     .h(px(26.))
                     .p_0(),
             ),
         )
-}
-
-/// The transposed view: one row as a Column / Value list, a stepper above it.
-/// Arrows move (Up / Down a column, Left / Right a row); Enter edits in the dialog.
-fn transposed(
-    this: &QueryTab,
-    g: &Entity<TableState<Grid>>,
-    cx: &mut Context<QueryTab>,
-) -> AnyElement {
-    let p = *cx.global::<Palette>();
-    let Some(t) = &this.table else {
-        return div().into_any_element();
-    };
-    let (row, col) = this.transposed_at(cx);
-    let grid = g.read(cx).delegate();
-    let rows = grid.rows_count_now();
-    let null = crate::results::null_text(cx);
-    let key = |e: &gpui_kit::KeyDownEvent| e.keystroke.key.clone();
-    let focus = t.rows_focus.clone();
-    let stepper =
-        |id: &'static str, label: &'static str, to: Option<usize>, cx: &Context<QueryTab>| {
-            button(id, ButtonKind::Outline, to.is_some(), label, cx)
-                .child(label)
-                .when_some(to, |b, r| {
-                    b.clickable(cx.listener(move |this, _, window, cx| {
-                        let (_, c) = this.transposed_at(cx);
-                        this.select_cell(r, c, cx);
-                        this.focus_table(window, cx);
-                    }))
-                })
-        };
-    let head = div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(8.))
-        .px(px(16.))
-        .py(px(6.))
-        .font_family(crate::theme::UI_FONT)
-        .border_b_1()
-        .border_color(p.line)
-        .text_size(small_size())
-        .child(stepper("row-prev", "Previous row", row.checked_sub(1), cx))
-        .child(div().text_color(p.tx2).child(if rows == 0 {
-            "No rows".to_owned()
-        } else {
-            format!(
-                "Row {} of {}",
-                grouped((t.page * t.page_size + row + 1) as u64),
-                grouped((t.page * t.page_size + rows) as u64)
-            )
-        }))
-        .child(stepper(
-            "row-next",
-            "Next row",
-            (row + 1 < rows).then_some(row + 1),
-            cx,
-        ));
-    let id = grid.row_id(row);
-    let e = grid.edit.as_ref();
-    let deleted = id.is_some_and(|id| e.is_some_and(|e| e.pending.is_deleted(id)));
-    let added = matches!(id, Some(RowId::Added(_)));
-    let types: Vec<String> = t.info.as_ref().map_or_else(Vec::new, |i| {
-        i.columns.iter().map(|c| c.column_type.clone()).collect()
-    });
-    let lines = grid.columns().iter().enumerate().map(|(c, column)| {
-        let value = id.and_then(|id| grid.current(id, c));
-        let changed =
-            id.is_some_and(|id| e.is_some_and(|e| e.pending.cell(id, c).is_some())) && !added;
-        let (text, dim) = match (id, value) {
-            (None, _) => (SharedString::default(), false),
-            (Some(_), None) => ("DEFAULT".into(), true),
-            (Some(_), Some(Value::Null)) => (null.clone(), true),
-            (Some(_), Some(v)) => (crate::results::shown(v).into(), false),
-        };
-        div()
-            .id(("transposed-row", c))
-            .flex()
-            .items_center()
-            .min_h(crate::theme::row_height())
-            .border_b_1()
-            .border_color(p.line)
-            .when(c == col && rows > 0, |d| d.bg(p.sel))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(240.))
-                    .px(px(16.))
-                    .flex()
-                    .gap(px(8.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(div().text_color(p.tx2).child(column.name.clone()))
-                    .child(
-                        div()
-                            .text_color(p.tx3)
-                            .text_size(small_size())
-                            .child(types.get(c).cloned().unwrap_or_default()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .px(px(12.))
-                    .py(px(4.))
-                    .font_family(MONO_FONT)
-                    .text_size(crate::theme::data_size())
-                    .when(dim && !changed, |d| d.text_color(p.tx3))
-                    .when(changed && !deleted, |d| {
-                        d.bg(p.warn_bg)
-                            .text_color(p.warn)
-                            .font_weight(FontWeight::MEDIUM)
-                    })
-                    .when(deleted, |d| d.text_color(p.tx3).line_through())
-                    .child(text),
-            )
-            .on_mouse_down(
-                gpui_kit::MouseButton::Left,
-                cx.listener(move |this, e: &gpui_kit::MouseDownEvent, window, cx| {
-                    let (r, _) = this.transposed_at(cx);
-                    this.select_cell(r, c, cx);
-                    this.focus_table(window, cx);
-                    if e.click_count == 2 {
-                        this.start_edit(r, c, window, cx);
-                    }
-                }),
-            )
-    });
-    let n = grid.columns().len();
-    grid_text(
-        grid_actions(div().key_context("Results"), g)
-            .size_full()
-            .flex()
-            .flex_col()
-            .text_color(p.tx)
-            .track_focus(&focus)
-            .on_key_down(cx.listener(move |this, e: &gpui_kit::KeyDownEvent, _, cx| {
-                let m = e.keystroke.modifiers;
-                if m.shift || m.control || m.alt || m.platform {
-                    return;
-                }
-                let (r, c) = this.transposed_at(cx);
-                let to = match key(e).as_str() {
-                    "up" => (r, c.saturating_sub(1)),
-                    "down" => (r, (c + 1).min(n.saturating_sub(1))),
-                    "left" | "pageup" => (r.saturating_sub(1), c),
-                    "right" | "pagedown" => (r + 1, c),
-                    "home" => (r, 0),
-                    "end" => (r, n.saturating_sub(1)),
-                    _ => return,
-                };
-                cx.stop_propagation();
-                this.select_cell(to.0, to.1, cx);
-            }))
-            .child(head)
-            .child(
-                div()
-                    .id("transposed")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(lines),
-            ),
-    )
-    .into_any_element()
+        // Enter here started the load on its way.
+        .when(loading, |d| {
+            d.child(crate::assets::icon(Icon::Spinner, p.tx3).with_animation(
+                SharedString::from(format!("{label}-loading")),
+                Animation::new(Duration::from_millis(800)).repeat(),
+                |s, d| s.with_transformation(Transformation::rotate(percentage(d))),
+            ))
+        })
 }
 
 pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElement {
@@ -2534,7 +2479,13 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
                 .flex_shrink(1.)
                 .flex_basis(px(300.))
                 .min_w(px(160.))
-                .child(field("where", &t.filter, t.filter_error.is_some(), &p)),
+                .child(field(
+                    "where",
+                    &t.filter,
+                    t.filter_error.is_some(),
+                    t.load == Some(Trigger::Filter),
+                    &p,
+                )),
         )
         .child(
             div()
@@ -2542,7 +2493,13 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
                 .flex_shrink(1.)
                 .flex_basis(px(200.))
                 .min_w(px(140.))
-                .child(field("order by", &t.order, false, &p)),
+                .child(field(
+                    "order by",
+                    &t.order,
+                    false,
+                    t.load == Some(Trigger::Order),
+                    &p,
+                )),
         )
         .child({
             let on = t.info.is_some();
@@ -2614,7 +2571,6 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
     let key_body = super::key::body(this, cx);
     let body = match &t.grid {
         _ if key_body.is_some() => key_body.unwrap_or_else(|| div().into_any_element()),
-        Some(g) if t.transposed => transposed(this, g, cx),
         Some(g) => grid_text(
             grid_actions(div().key_context("Results"), g)
                 .size_full()
@@ -2703,13 +2659,13 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
                     .border_1()
                     .border_color(p.warn_line)
                     .rounded(RADIUS)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(crate::theme::data_size())
                     .line_height(px(20.))
                     .whitespace_nowrap()
                     .child(match &key_panel {
                         Some((_, commands)) => super::key::panel_commands(commands, &p),
-                        None => highlighted(&sql, &p).into_any_element(),
+                        None => selectable_sql("pending-sql-text", &sql, &p).into_any_element(),
                     }),
             )
             .child(
@@ -2798,7 +2754,7 @@ pub(super) fn render(this: &mut QueryTab, cx: &mut Context<QueryTab>) -> AnyElem
                             .border_1()
                             .border_color(p.line2)
                             .rounded(RADIUS)
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(crate::theme::data_size())
                             .child(Textarea::new(&state).appearance(false).h_full()),
                     )

@@ -25,7 +25,7 @@ use gpui_kit::{
 use tokio::sync::oneshot;
 
 use crate::assets::{Icon, icon, menu_item, menu_item_danger};
-use crate::theme::{MONO_FONT, Palette, UI_FONT, small_size};
+use crate::theme::{Palette, mono_font, small_size, ui_font};
 use crate::ui::Clickable as _;
 
 /// The result set after this one, sent once this one has been read or dropped.
@@ -167,6 +167,9 @@ pub struct EditOverlay {
     pub sort: Vec<(usize, bool)>,
     /// The editor's calendar opens once the editor has been drawn (Pick date…).
     pub open_picker: bool,
+    /// A header click's sort is loading: [`Self::sort`] already holds it, so its
+    /// arrows show at once, with a spinner until the rows arrive.
+    pub sorting: bool,
 }
 
 impl EditOverlay {
@@ -180,6 +183,7 @@ impl EditOverlay {
             anchor: None,
             sort: Vec::new(),
             open_picker: false,
+            sorting: false,
         }
     }
 }
@@ -225,6 +229,12 @@ pub struct Grid {
     dragging: bool,
     /// Where the pointer is during that drag, in window coordinates.
     drag_at: Option<Point<Pixels>>,
+    /// Where that drag's press was, so a click near the edge does not scroll.
+    press_at: Option<Point<Pixels>>,
+    /// Drawn turned (a table tab's Ctrl+T): the table's rows are the fields and its
+    /// columns the records, after the field names. Selection and edits stay in
+    /// (record, field) terms; [`Self::data_at`] and [`Self::display_at`] convert.
+    pub transposed: bool,
     rt: Arc<Runtime>,
     took: Duration,
 }
@@ -263,6 +273,8 @@ impl Grid {
             sel: None,
             dragging: false,
             drag_at: None,
+            press_at: None,
+            transposed: false,
             rt,
             took,
         }
@@ -281,12 +293,18 @@ impl Grid {
                     .unwrap_or(Sel::rows_of(r, r, n))
             };
             let next = match *e {
-                TableEvent::SelectCell(r, col) => match g.data_col(col) {
-                    Some(c) if g.sel.is_some_and(|s| s.head == (r, c)) => return,
-                    Some(c) => Some(Sel::cell(r, c)),
+                TableEvent::SelectCell(r, col) => match g.data_at(r, col) {
+                    Some(at) if g.sel.is_some_and(|s| s.head == at) => return,
+                    Some((r, c)) => Some(Sel::cell(r, c)),
+                    None if g.transposed => g.field_sel(r),
                     None => Some(whole_row(g, r)),
                 },
+                TableEvent::SelectRow(r) if g.transposed => g.field_sel(r),
                 TableEvent::SelectRow(r) => Some(whole_row(g, r)),
+                TableEvent::SelectColumn(col) if g.transposed => col
+                    .checked_sub(1)
+                    .filter(|rec| *rec < g.rows_count_now())
+                    .map(|rec| Sel::rows_of(rec, rec, n)),
                 TableEvent::SelectColumn(col) => {
                     let rows = g.rows_count(cx);
                     match g.data_col(col) {
@@ -433,9 +451,44 @@ impl Grid {
         default.max(fit.min(320.))
     }
 
-    /// Columns before the data: the row number, and on a table tab the mark.
+    /// Columns before the data: the row number, and on a table tab the mark. Turned,
+    /// the field names.
     fn lead(&self) -> usize {
-        if self.edit.is_some() { 2 } else { 1 }
+        if self.transposed {
+            1
+        } else if self.edit.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The (record, field) shown in table cell (`row`, `col`), if it shows a value.
+    pub fn data_at(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        if self.transposed {
+            let rec = col.checked_sub(1)?;
+            (row < self.columns.len() && rec < self.rows_count_now()).then_some((rec, row))
+        } else {
+            self.data_col(col).map(|c| (row, c))
+        }
+    }
+
+    /// The table cell that shows (record, field).
+    pub fn display_at(&self, rec: usize, field: usize) -> (usize, usize) {
+        if self.transposed {
+            (field, rec + 1)
+        } else {
+            (rec, self.grid_col(field))
+        }
+    }
+
+    /// Every record of field `f`: a turned grid's row.
+    fn field_sel(&self, f: usize) -> Option<Sel> {
+        let last = self.rows_count_now().checked_sub(1)?;
+        Some(Sel {
+            anchor: (0, f),
+            head: (last, f),
+        })
     }
 
     /// The data column under grid column `col`.
@@ -645,7 +698,16 @@ impl Grid {
             .items_center()
             .overflow_hidden()
             .whitespace_nowrap();
-        let (Some(e), Some(id)) = (self.edit.as_ref(), self.row_id(row)) else {
+        // Turned: the first column names the fields, the others are the records.
+        let (rec, data) = if self.transposed {
+            if col == 0 {
+                return self.render_field_name(row, cx);
+            }
+            (col - 1, Some(row).filter(|f| *f < self.columns.len()))
+        } else {
+            (row, self.data_col(col))
+        };
+        let (Some(e), Some(id)) = (self.edit.as_ref(), self.row_id(rec)) else {
             return cell.into_any_element();
         };
         let deleted = e.pending.is_deleted(id);
@@ -659,7 +721,7 @@ impl Grid {
             None
         };
         let cell = cell.when_some(row_bg, |d, bg| d.bg(bg));
-        if col == 0 {
+        if col == 0 && !self.transposed {
             let mark = e.pending.mark(id);
             let tip = match mark {
                 Some('M') => "Modified",
@@ -680,7 +742,7 @@ impl Grid {
         }
         // The mark stays unstruck; the rest of a deleted row is struck and dim.
         let cell = cell.when(deleted, |d| d.text_color(p.tx3).line_through());
-        let Some(c) = self.data_col(col) else {
+        let Some(c) = data else {
             let cell = cell
                 .justify_end()
                 .pr(px(8.))
@@ -710,9 +772,12 @@ impl Grid {
         let changed = e.pending.cell(id, c).is_some() && !added;
         let in_sel = self
             .sel
-            .is_some_and(|s| s.count() > 1 && s.contains(row, c));
+            .is_some_and(|s| s.count() > 1 && s.contains(rec, c));
         let cell = cell
             .px(px(12.))
+            // A line between columns: turned, a record's fields differ in alignment.
+            .border_r_1()
+            .border_color(p.line)
             .when(right, |d| d.justify_end())
             .when(changed && !deleted, |d| {
                 d.bg(p.warn_bg)
@@ -731,6 +796,60 @@ impl Grid {
             Some(v) => cell.child(div().overflow_hidden().text_ellipsis().child(shown(v))),
         };
         self.interactive(cell, row, col, cx)
+    }
+
+    /// A turned grid's field name, as the grid's column header: its type in the
+    /// tooltip, a click sorts by it (Shift adds it to the sort), Ctrl (Cmd) picks the
+    /// whole field.
+    fn render_field_name(
+        &self,
+        f: usize,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui_kit::AnyElement {
+        let p = *cx.global::<Palette>();
+        let Some(column) = self.columns.get(f) else {
+            return div().into_any_element();
+        };
+        let sorted = self.edit.as_ref().and_then(|e| {
+            let i = e.sort.iter().position(|(s, _)| *s == f)?;
+            Some((e.sort[i].1, (e.sort.len() > 1).then_some(i + 1)))
+        });
+        let tip: SharedString = column.type_name.clone().into();
+        let cell = div()
+            .id(("field", f))
+            .size_full()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .px(px(12.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .font_family(ui_font())
+            .font_weight(FontWeight::MEDIUM)
+            .text_size(small_size())
+            .text_color(if sorted.is_some() { p.tx } else { p.tx2 })
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |t, e: &gpui_kit::ClickEvent, _, cx| {
+                cx.stop_propagation();
+                if e.modifiers().secondary(cx) {
+                    let sel = t.delegate().field_sel(f);
+                    t.delegate_mut().set_sel(sel, cx);
+                } else {
+                    cx.emit(GridEvent::Sort(f, e.modifiers().shift));
+                }
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(column.name.clone()),
+            )
+            .when_some(sorted, |d, (desc, n)| {
+                d.child(sort_mark(f, desc, n, self.sorting(), &p))
+            });
+        self.interactive(cell, f, 0, cx)
     }
 
     /// The inline editor in its cell: the field, and on a date column a calendar
@@ -780,7 +899,7 @@ impl Grid {
                         "pick-null",
                         format!("Set NULL ({})", crate::keymap::label("set-null", cx)).into(),
                     )
-                    .font_family(UI_FONT)
+                    .font_family(ui_font())
                     .text_size(px(10.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(p.tx2)
@@ -850,17 +969,18 @@ impl Grid {
     where
         E: InteractiveElement + ParentElement + Styled + IntoElement + 'static,
     {
-        let el = match self.data_col(col) {
-            Some(c) => el
+        let el = match self.data_at(row, col) {
+            Some((r, c)) => el
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |t, e: &MouseDownEvent, _, cx| {
-                        t.delegate_mut().press(row, c, e.modifiers.shift, cx);
+                        t.delegate_mut().press_at = Some(e.position);
+                        t.delegate_mut().press(r, c, e.modifiers.shift, cx);
                     }),
                 )
                 .on_mouse_move(cx.listener(move |t, e: &MouseMoveEvent, _, cx| {
                     let held = e.pressed_button == Some(MouseButton::Left);
-                    t.delegate_mut().drag(row, c, held, cx);
+                    t.delegate_mut().drag(r, c, held, cx);
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
@@ -871,8 +991,7 @@ impl Grid {
                         let dragged =
                             std::mem::take(&mut g.dragging) && g.sel.is_some_and(|s| s.count() > 1);
                         if dragged {
-                            let gc = g.grid_col(c);
-                            t.set_selected_cell(row, gc, cx);
+                            t.set_selected_cell(row, col, cx);
                         }
                     }),
                 ),
@@ -896,6 +1015,21 @@ impl Grid {
     ) -> PopupMenu {
         let g = t.delegate();
         let n = g.columns.len();
+        if g.transposed {
+            // A value: as on the grid. A field's name: the whole field.
+            match g.data_at(row, col) {
+                Some((r, c)) if !g.sel.is_some_and(|s| s.contains(r, c)) => {
+                    t.set_selected_cell(row, col, cx);
+                    t.delegate_mut().set_sel(Some(Sel::cell(r, c)), cx);
+                }
+                None if !g.sel.is_some_and(|s| s.cols().contains(&row)) => {
+                    let sel = g.field_sel(row);
+                    t.delegate_mut().set_sel(sel, cx);
+                }
+                _ => {}
+            }
+            return t.delegate().build_menu(menu, cx);
+        }
         let marked = g
             .row_id(row)
             .zip(g.edit.as_ref())
@@ -1022,10 +1156,56 @@ impl Grid {
             )
     }
 
+    /// A header click's sort is loading.
+    fn sorting(&self) -> bool {
+        self.edit.as_ref().is_some_and(|e| e.sorting)
+    }
+
     /// Rows drawn: fetched plus added.
     pub fn rows_count_now(&self) -> usize {
         self.rows.len() + self.edit.as_ref().map_or(0, |e| e.pending.added_len())
     }
+}
+
+/// A sorted column's mark: its arrow, its place among several sort keys, and while
+/// the sorted rows load a spinner.
+fn sort_mark(c: usize, desc: bool, n: Option<usize>, loading: bool, p: &Palette) -> Div {
+    use gpui_kit::{Animation, AnimationExt as _, Transformation, percentage};
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .child(icon(
+            if desc { Icon::SortDesc } else { Icon::SortAsc },
+            p.link,
+        ))
+        .children(n.map(|n| {
+            div()
+                .text_size(px(10.))
+                .text_color(p.link)
+                .child(n.to_string())
+        }))
+        .when(loading, |d| {
+            d.child(icon(Icon::Spinner, p.link).size(px(12.)).with_animation(
+                ("sort-loading", c),
+                Animation::new(std::time::Duration::from_millis(800)).repeat(),
+                |s, d| s.with_transformation(Transformation::rotate(percentage(d))),
+            ))
+        })
+}
+
+/// Puts the table's cursor on (record, field) and scrolls it into view, turned or not.
+pub fn show_cell(
+    t: &mut TableState<Grid>,
+    rec: usize,
+    field: usize,
+    cx: &mut Context<TableState<Grid>>,
+) {
+    let (row, col) = t.delegate().display_at(rec, field);
+    t.set_selected_cell(row, col, cx);
+    t.scroll_to_row(row, cx);
+    t.scroll_to_col(col, cx);
 }
 
 /// Extends the selection's head by a step, moving the table's cursor with it.
@@ -1033,12 +1213,14 @@ fn extend(t: &mut TableState<Grid>, dr: isize, dc: isize, cx: &mut Context<Table
     let g = t.delegate_mut();
     let (rows, cols) = (g.rows_count_now(), g.columns.len());
     let Some(s) = g.sel else { return };
+    // Turned, Up and Down step through the fields, Left and Right through the records.
+    let (dr, dc) = if g.transposed { (dc, dr) } else { (dr, dc) };
     let s = s.extend(dr, dc, rows, cols);
     g.set_sel(Some(s), cx);
-    let gc = g.grid_col(s.head.1);
-    t.set_selected_cell(s.head.0, gc, cx);
-    t.scroll_to_row(s.head.0, cx);
-    t.scroll_to_col(gc, cx);
+    let (row, col) = g.display_at(s.head.0, s.head.1);
+    t.set_selected_cell(row, col, cx);
+    t.scroll_to_row(row, cx);
+    t.scroll_to_col(col, cx);
 }
 
 /// The keys every grid takes, on the element around its `DataTable`: Copy, Copy
@@ -1133,38 +1315,76 @@ fn drag_scroll(table: &Entity<TableState<Grid>>) -> impl IntoElement {
     .size_0()
 }
 
-/// One frame of [`drag_scroll`]: whether the pointer is past the rows.
+/// One frame of [`drag_scroll`]: whether the pointer is past the rows or the columns.
 fn autoscroll(t: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) -> bool {
     let g = t.delegate();
     let Some(at) = g.drag_at.filter(|_| g.dragging) else {
         return false;
     };
-    let handle = t.vertical_scroll_handle.0.borrow().base_handle.clone();
-    let body = handle.bounds();
-    let past = if at.y < body.top() {
-        at.y - body.top()
-    } else if at.y > body.bottom() {
-        at.y - body.bottom()
-    } else {
+    // How far past the near edge `at` is, zero inside.
+    let past = |at: Pixels, lo: Pixels, hi: Pixels| {
+        if at < lo {
+            at - lo
+        } else if at > hi {
+            at - hi
+        } else {
+            px(0.)
+        }
+    };
+    // Faster the further out, at most 64 px a frame.
+    let step = |past: Pixels| (past / 2.).clamp(px(-64.), px(64.));
+    let v = t.vertical_scroll_handle.0.borrow().base_handle.clone();
+    let body = v.bounds();
+    let past_y = past(at.y, body.top(), body.bottom());
+    let h = t.horizontal_scroll_handle.base_handle().clone();
+    let cols = h.bounds();
+    // Sideways the grid often ends at the screen's edge, where the pointer cannot get
+    // past it: scrolling starts this far inside instead.
+    // Only once the pointer moved sideways, so a click there stays a click.
+    let moved = g.press_at.is_none_or(|p| (at.x - p.x).abs() > px(8.));
+    let edge = if moved { px(32.) } else { px(0.) };
+    let past_x = past(at.x, cols.left() + edge, cols.right() - edge);
+    if past_y == px(0.) && past_x == px(0.) {
         return false;
-    };
-    // Faster the further out, at most two rows a frame.
-    let step = (past / 2.).clamp(px(-64.), px(64.));
-    let mut offset = handle.offset();
-    offset.y = (offset.y - step).clamp(-handle.max_offset().y, px(0.));
-    handle.set_offset(offset);
-    let rows = t.visible_range().rows().clone();
-    let edge = if past < px(0.) {
-        rows.start
-    } else {
-        rows.end.saturating_sub(1)
-    };
+    }
+    let (mut row, mut col) = (None, None);
+    if past_y != px(0.) {
+        let mut offset = v.offset();
+        offset.y = (offset.y - step(past_y)).clamp(-v.max_offset().y, px(0.));
+        v.set_offset(offset);
+        let rows = t.visible_range().rows().clone();
+        row = Some(if past_y < px(0.) {
+            rows.start
+        } else {
+            rows.end.saturating_sub(1)
+        });
+    }
+    if past_x != px(0.) {
+        let mut offset = h.offset();
+        offset.x = (offset.x - step(past_x)).clamp(-h.max_offset().x, px(0.));
+        h.set_offset(offset);
+        // Ranges over the scrollable columns, which are the data columns.
+        let cols = t.visible_range().cols().clone();
+        col = Some(if past_x < px(0.) {
+            cols.start
+        } else {
+            cols.end.saturating_sub(1)
+        });
+    }
     let g = t.delegate_mut();
     if let Some(s) = g.sel {
+        // The edges in view are table rows and columns: turned, fields and records.
+        let (rec, field) = if g.transposed { (col, row) } else { (row, col) };
+        let rec = rec
+            .unwrap_or(s.head.0)
+            .min(g.rows_count_now().saturating_sub(1));
+        let field = field
+            .unwrap_or(s.head.1)
+            .min(g.columns.len().saturating_sub(1));
         g.set_sel(
             Some(Sel {
                 anchor: s.anchor,
-                head: (edge, s.head.1),
+                head: (rec, field),
             }),
             cx,
         );
@@ -1344,14 +1564,34 @@ fn compare(a: &Value, b: &Value) -> Ordering {
 
 impl TableDelegate for Grid {
     fn columns_count(&self, _: &App) -> usize {
+        if self.transposed {
+            return self.rows_count_now() + 1;
+        }
         self.columns.len() + self.lead()
     }
 
     fn rows_count(&self, _: &App) -> usize {
+        if self.transposed {
+            return self.columns.len();
+        }
         self.rows.len() + self.edit.as_ref().map_or(0, |e| e.pending.added_len())
     }
 
     fn column(&self, col: usize, _: &App) -> table::Column {
+        if self.transposed {
+            return if col == 0 {
+                table::Column::new("fields", "")
+                    .width(px(220.))
+                    .fixed_left()
+                    .movable(false)
+                    .p_0()
+            } else {
+                table::Column::new(SharedString::from(format!("r{col}")), "")
+                    .width(px(200.))
+                    .movable(false)
+                    .p_0()
+            };
+        }
         let lead = |key: &'static str, w: f32| {
             table::Column::new(key, "")
                 .width(px(w))
@@ -1418,6 +1658,37 @@ impl TableDelegate for Grid {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let p = *cx.global::<Palette>();
+        if self.transposed {
+            // The records: a click picks the whole record, as a row number does.
+            let rec = col.checked_sub(1);
+            let n = self.columns.len();
+            let added = rec
+                .and_then(|r| self.row_id(r))
+                .is_some_and(|id| matches!(id, RowId::Added(_)));
+            return div()
+                .id(("th", col))
+                .size_full()
+                .flex()
+                .items_center()
+                .px(px(12.))
+                .whitespace_nowrap()
+                .font_family(ui_font())
+                .font_weight(FontWeight::MEDIUM)
+                .text_size(small_size())
+                .text_color(p.tx2)
+                .child(match rec {
+                    None => SharedString::from("Column"),
+                    Some(_) if added => "New row".into(),
+                    Some(r) => format!("Row {}", self.row_offset + r + 1).into(),
+                })
+                .when_some(rec, |d, r| {
+                    d.on_click(cx.listener(move |t, _: &gpui_kit::ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        t.delegate_mut().set_sel(Some(Sel::rows_of(r, r, n)), cx);
+                    }))
+                })
+                .into_any_element();
+        }
         let sorted = self.data_col(col).and_then(|c| {
             let sort = &self.edit.as_ref()?.sort;
             let i = sort.iter().position(|(s, _)| *s == c)?;
@@ -1442,7 +1713,7 @@ impl TableDelegate for Grid {
             .gap(px(4.))
             .px(px(if editing { 12. } else { 8. }))
             .whitespace_nowrap()
-            .font_family(UI_FONT)
+            .font_family(ui_font())
             .font_weight(FontWeight::MEDIUM)
             .text_size(small_size())
             .text_color(p.tx2)
@@ -1477,25 +1748,10 @@ impl TableDelegate for Grid {
                     .when(numeric, |d| d.text_right())
                     .child(name),
             )
-            .when_some(sorted, |d, (desc, n)| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap(px(2.))
-                        .child(icon(
-                            if desc { Icon::SortDesc } else { Icon::SortAsc },
-                            p.link,
-                        ))
-                        .children(n.map(|n| {
-                            div()
-                                .text_size(px(10.))
-                                .text_color(p.link)
-                                .child(n.to_string())
-                        })),
-                )
+            .when_some(sorted.zip(data), |d, ((desc, n), c)| {
+                d.child(sort_mark(c, desc, n, self.sorting(), &p))
             })
+            .into_any_element()
     }
 
     fn render_td(
@@ -1547,6 +1803,12 @@ impl TableDelegate for Grid {
     }
 
     fn cell_label(&self, row: usize, col: usize, _: &App) -> Option<SharedString> {
+        if self.transposed {
+            return match self.data_at(row, col) {
+                Some((r, c)) => self.rows.get(r)?.get(c).map(|v| v.to_string().into()),
+                None => self.columns.get(row).map(|c| c.name.clone().into()),
+            };
+        }
         if col == 0 {
             return Some((self.row_offset + row + 1).to_string().into());
         }
@@ -1626,7 +1888,7 @@ impl TableDelegate for Grid {
             .flex()
             .justify_center()
             .pt(px(24.))
-            .font_family(UI_FONT)
+            .font_family(ui_font())
             .text_color(p.tx3)
             .child("No rows")
     }
@@ -1634,7 +1896,7 @@ impl TableDelegate for Grid {
 
 /// Grid text styles the table does not take from the theme.
 pub fn grid_text<E: Styled>(e: E) -> E {
-    e.font_family(MONO_FONT)
+    e.font_family(mono_font())
         .text_size(crate::theme::data_size())
 }
 
@@ -1660,6 +1922,29 @@ mod tests {
             Arc::new(Runtime::new().unwrap()),
             Duration::from_millis(38),
         )
+    }
+
+    #[test]
+    fn turned_cells_map_to_records_and_fields_and_back() {
+        let mut g = grid(vec![
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Null],
+            vec![Value::Int(3), Value::Null],
+        ]);
+        for turned in [false, true] {
+            g.transposed = turned;
+            for rec in 0..3 {
+                for f in 0..2 {
+                    let (r, c) = g.display_at(rec, f);
+                    assert_eq!(g.data_at(r, c), Some((rec, f)));
+                }
+            }
+        }
+        // Turned: field 1 of record 2 is table row 1, column 3; column 0 names fields.
+        assert_eq!(g.display_at(2, 1), (1, 3));
+        assert_eq!(g.data_at(1, 0), None);
+        assert_eq!(g.data_at(2, 1), None);
+        assert_eq!(g.data_at(0, 4), None);
     }
 
     #[test]

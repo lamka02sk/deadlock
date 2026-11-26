@@ -15,7 +15,7 @@ use gpui_kit::{
 
 use super::{QueryTab, TabEvent};
 use crate::assets::{Icon, icon};
-use crate::theme::{MONO_FONT, Palette, data_size, small_size, tab_height};
+use crate::theme::{Palette, data_size, mono_font, small_size, tab_height};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button};
 
@@ -376,7 +376,7 @@ fn tree(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl IntoEl
                         .with_highlights(title_style(n, p)),
                 ),
             );
-        let mono = |d: Div| d.font_family(MONO_FONT).text_size(data_size());
+        let mono = |d: Div| d.font_family(mono_font()).text_size(data_size());
         let estimated = mono(num_cell(NUM_W)).children(n.estimated_rows.map(rows));
         let r = row()
             .id(("plan-step", i))
@@ -546,7 +546,7 @@ fn detail(view: &PlanView, p: &Palette, cx: &mut Context<QueryTab>) -> impl Into
                 div()
                     .flex_1()
                     .min_w_0()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .child(value),
             )
@@ -609,7 +609,7 @@ fn raw_text(raw: &str, p: &Palette) -> impl IntoElement {
         .overflow_scroll()
         .py(px(10.))
         .px(px(16.))
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .text_color(p.tx)
         .children(

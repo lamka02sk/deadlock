@@ -33,7 +33,7 @@ use crate::app::Db;
 use crate::assets::{Icon, icon, menu_item};
 use crate::query::View;
 use crate::shell::Trigger;
-use crate::theme::{MONO_FONT, Palette, RADIUS, UI_FONT, row_height};
+use crate::theme::{Palette, RADIUS, mono_font, row_height, ui_font};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button, button_icon};
 
@@ -434,11 +434,11 @@ pub fn paint(
         }
         let ui = |w| gpui_kit::Font {
             weight: w,
-            ..font(UI_FONT)
+            ..font(ui_font())
         };
         let mono = |w| gpui_kit::Font {
             weight: w,
-            ..font(MONO_FONT)
+            ..font(mono_font())
         };
         for &i in &board.order {
             let Some(r) = board.card(i) else { continue };

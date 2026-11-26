@@ -26,10 +26,60 @@ use crate::assets::{Icon, icon};
 use crate::keymap::{self, ENTRIES, Entry};
 use crate::settings::{self, get};
 use crate::shell::{Shell, pattern_layer};
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, row_height, small_size};
 use crate::ui::Clickable as _;
 
 type Choice = Entity<SelectState<Vec<SharedString>>>;
+/// A font picker: the installed families, searchable, "Default (…)" first.
+type FontChoice = Entity<SelectState<gpui_kit::component::select::SearchableVec<SharedString>>>;
+
+/// The font picker for `current` (empty: the shipped `default`); a pick sets it with
+/// `set`, and "Default (…)" stores an empty name.
+fn font_choice(
+    current: &str,
+    default: &'static str,
+    set: fn(&mut Settings, String),
+    subs: &mut Vec<Subscription>,
+    window: &mut Window,
+    cx: &mut Context<SettingsTab>,
+) -> FontChoice {
+    use gpui_kit::component::select::SearchableVec;
+    let first: SharedString = format!("Default ({default})").into();
+    let mut names = cx.text_system().all_font_names();
+    names.sort_by_key(|n| n.to_lowercase());
+    names.dedup();
+    let items: Vec<SharedString> = std::iter::once(first.clone())
+        .chain(names.into_iter().map(SharedString::from))
+        .collect();
+    let at = items
+        .iter()
+        .position(|n| !current.is_empty() && n.as_ref() == current)
+        .unwrap_or(0);
+    let state = cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(items),
+            Some(IndexPath::default().row(at)),
+            window,
+            cx,
+        )
+        .searchable(true)
+    });
+    subs.push(cx.subscribe(
+        &state,
+        move |_, _, e: &SelectEvent<SearchableVec<SharedString>>, cx| {
+            let SelectEvent::Confirm(Some(name)) = e else {
+                return;
+            };
+            let name = if *name == first {
+                String::new()
+            } else {
+                name.to_string()
+            };
+            settings::update(cx, |s| set(s, name));
+        },
+    ));
+    state
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
@@ -54,10 +104,14 @@ pub struct SettingsTab {
     section: Section,
     ui_size: Choice,
     editor_size: Choice,
+    ui_font: FontChoice,
+    mono_font: FontChoice,
     indent: Choice,
     keywords: Choice,
     page_size: Choice,
     null_text: Entity<InputState>,
+    /// Filters every section's settings and shortcuts at once while it holds text.
+    search: Entity<InputState>,
     capture: Option<Capture>,
     /// Held while a shortcut is captured.
     focus: gpui_kit::FocusHandle,
@@ -183,11 +237,33 @@ impl SettingsTab {
             window,
             cx,
         );
+        let ui_font = font_choice(
+            &s.ui_font,
+            crate::theme::DEFAULT_UI_FONT,
+            |s, f| s.ui_font = f,
+            &mut subs,
+            window,
+            cx,
+        );
+        let mono_font = font_choice(
+            &s.mono_font,
+            crate::theme::DEFAULT_MONO_FONT,
+            |s, f| s.mono_font = f,
+            &mut subs,
+            window,
+            cx,
+        );
         let null_text = cx.new(|cx| InputState::new(window, cx).default_value(s.null_text.clone()));
         subs.push(cx.subscribe(&null_text, |_, input, e: &InputEvent, cx| {
             if matches!(e, InputEvent::Change) {
                 let text = input.read(cx).value().to_string();
                 settings::update(cx, |s| s.null_text = text);
+            }
+        }));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
+        subs.push(cx.subscribe(&search, |_, _, e: &InputEvent, cx| {
+            if matches!(e, InputEvent::Change) {
+                cx.notify();
             }
         }));
         let folder = deadlock_core::project::folder_name(&root);
@@ -208,10 +284,13 @@ impl SettingsTab {
             section: Section::General,
             ui_size,
             editor_size,
+            ui_font,
+            mono_font,
             indent,
             keywords,
             page_size,
             null_text,
+            search,
             capture: None,
             root,
             shell,
@@ -466,6 +545,36 @@ fn label(
         })
 }
 
+thread_local! {
+    /// The settings search while a body is built: its lowercase words (none when not
+    /// searching), and the matching rows since the last fieldset.
+    static SEARCH: std::cell::RefCell<(Vec<String>, usize)> =
+        const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
+/// Whether `text` holds every word searched for; counts a match toward the fieldset.
+fn found(text: &str) -> bool {
+    SEARCH.with_borrow_mut(|(words, hits)| {
+        let text = text.to_lowercase();
+        let hit = words.iter().all(|w| text.contains(w.as_str()));
+        *hits += usize::from(hit && !words.is_empty());
+        hit
+    })
+}
+
+/// A setting row with its label, hidden while a search misses it.
+fn labeled(
+    title: &str,
+    help: Option<String>,
+    help_color: Option<gpui_kit::Hsla>,
+    p: &Palette,
+) -> gpui_kit::Div {
+    let hit = found(&format!("{title} {}", help.as_deref().unwrap_or_default()));
+    row(p)
+        .child(label(title, help, help_color, p))
+        .when(!hit, |d| d.hidden())
+}
+
 /// A setting row (`.row`).
 fn row(p: &Palette) -> gpui_kit::Div {
     div()
@@ -480,8 +589,16 @@ fn row(p: &Palette) -> gpui_kit::Div {
         .border_color(p.line)
 }
 
-/// A fieldset with its legend.
+/// A fieldset with its legend. While searching, one with no matching row is hidden,
+/// unless its legend matches.
 fn fieldset(legend: &'static str, rows: Vec<AnyElement>) -> gpui_kit::Div {
+    let empty = SEARCH.with_borrow_mut(|(words, hits)| {
+        let legend = legend.to_lowercase();
+        let shown =
+            words.is_empty() || *hits > 0 || words.iter().all(|w| legend.contains(w.as_str()));
+        *hits = 0;
+        !shown
+    });
     div()
         .flex()
         .flex_col()
@@ -493,6 +610,8 @@ fn fieldset(legend: &'static str, rows: Vec<AnyElement>) -> gpui_kit::Div {
                 .child(legend),
         )
         .children(rows)
+        // Last: a display set after it would show the fieldset again.
+        .when(empty, |d| d.hidden())
 }
 
 /// A key chip (`.kb`).
@@ -505,7 +624,7 @@ fn kb(keys: &str, capturing: bool, p: &Palette) -> gpui_kit::Div {
         .border_color(if capturing { p.blue } else { p.line2 })
         .rounded(px(4.))
         .bg(p.panel)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(small_size())
         .when(capturing, |d| {
             d.shadow(vec![gpui_kit::BoxShadow {
@@ -692,20 +811,19 @@ impl SettingsTab {
             return div();
         };
         let list = shell.read(cx).project().config.connections.clone();
-        let head = row(&p)
-            .child(label(
-                "Servers this project connects to",
-                Some("Saved in project.toml; passwords stay in the system keychain.".into()),
-                None,
-                &p,
-            ))
-            .child(
-                small_button("project-new-connection", "New connection".into(), &p).clickable(
-                    cx.listener(|this, _, window, cx| {
-                        this.on_shell(window, cx, |s, window, cx| s.new_connection(window, cx));
-                    }),
-                ),
-            );
+        let head = labeled(
+            "Servers this project connects to",
+            Some("Saved in project.toml; passwords stay in the system keychain.".into()),
+            None,
+            &p,
+        )
+        .child(
+            small_button("project-new-connection", "New connection".into(), &p).clickable(
+                cx.listener(|this, _, window, cx| {
+                    this.on_shell(window, cx, |s, window, cx| s.new_connection(window, cx));
+                }),
+            ),
+        );
         let empty = list
             .is_empty()
             .then(|| row(&p).text_color(p.tx3).child("No connections yet."));
@@ -834,29 +952,28 @@ impl SettingsTab {
         fieldset(
             "Danger zone",
             vec![
-                row(&p)
-                    .border_b_0()
-                    .child(label(
-                        "Delete project",
-                        Some(
-                            "Removes Deadlock's data for this folder: connections, saved \
-                             passwords, query history, schema cache, diagrams and consoles. \
-                             The folder and your files stay."
-                                .into(),
-                        ),
-                        None,
-                        &p,
-                    ))
-                    .child(
-                        small_button("project-delete", "Delete project…".into(), &p)
-                            .text_color(p.danger)
-                            .clickable(cx.listener(|this, _, window, cx| {
-                                this.on_shell(window, cx, |s, window, cx| {
-                                    s.delete_project(window, cx);
-                                });
-                            })),
-                    )
-                    .into_any_element(),
+                labeled(
+                    "Delete project",
+                    Some(
+                        "Removes Deadlock's data for this folder: connections, saved \
+                         passwords, query history, schema cache, diagrams and consoles. \
+                         The folder and your files stay."
+                            .into(),
+                    ),
+                    None,
+                    &p,
+                )
+                .border_b_0()
+                .child(
+                    small_button("project-delete", "Delete project…".into(), &p)
+                        .text_color(p.danger)
+                        .clickable(cx.listener(|this, _, window, cx| {
+                            this.on_shell(window, cx, |s, window, cx| {
+                                s.delete_project(window, cx);
+                            });
+                        })),
+                )
+                .into_any_element(),
             ],
         )
     }
@@ -923,29 +1040,25 @@ impl SettingsTab {
         let look = fieldset(
             "Name and color",
             vec![
-                row(&p)
-                    .child(label(
+                labeled(
                         "Name",
                         Some("Shown in the title bar, the window title and recent projects. The folder keeps its name.".into()),
                         None,
                         &p,
-                    ))
+                    )
                     .child(div().w(px(240.)).child(
                         gpui_kit::Styled::h(Input::new(&self.name), row_height()),
                     ))
                     .into_any_element(),
-                row(&p)
-                    .child(label(
+                labeled(
                         "Color",
                         Some("Tints the title bar, so this project's windows stand out.".into()),
                         None,
                         &p,
-                    ))
+                    )
                     .child(swatches)
                     .into_any_element(),
-                row(&p)
-                    .border_b_0()
-                    .child(label(
+                labeled(
                         "Pattern",
                         Some(if color.is_some() {
                             "Laid over the color at the left of the title bar.".into()
@@ -954,7 +1067,8 @@ impl SettingsTab {
                         }),
                         None,
                         &p,
-                    ))
+)
+                    .border_b_0()
                     .child(tiles)
                     .into_any_element(),
             ],
@@ -977,9 +1091,17 @@ impl SettingsTab {
         let p = *cx.global::<Palette>();
         let keys = keymap::keys(e.id, cx);
         let capture = self.capture.as_ref().filter(|c| c.id == e.id);
+        // Found by its name, its group or its keys ("ctrl+w").
+        let hit = found(&format!(
+            "{} {} {keys} {}",
+            e.name,
+            e.group,
+            keymap::display(&keys)
+        ));
         let Some(c) = capture else {
             return row(&p)
                 .child(label(e.name, None, None, &p))
+                .when(!hit, |d| d.hidden())
                 .child(kb(&keys, false, &p))
                 .child(
                     small_button(
@@ -1001,9 +1123,8 @@ impl SettingsTab {
             ),
             None => "Press the new shortcut. Esc cancels.".into(),
         };
-        row(&p)
+        labeled(e.name, Some(help), Some(p.warn), &p)
             .bg(p.warn_bg)
-            .child(label(e.name, Some(help), Some(p.warn), &p))
             .child(kb(&keys, true, &p))
             .when(c.conflict.is_some(), |d| {
                 d.child(
@@ -1042,76 +1163,93 @@ impl SettingsTab {
         let appearance = fieldset(
             "Appearance",
             vec![
-                row(&p)
-                    .child(label(
-                        "Theme",
-                        Some("System follows your desktop's light or dark mode.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(theme_seg)
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Interface text size",
-                        Some("Menus, tabs, the sidebar and grids.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(select(&self.ui_size, 100.))
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Editor text size",
-                        Some("SQL editor and console.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(select(&self.editor_size, 100.))
-                    .into_any_element(),
+                labeled(
+                    "Theme",
+                    Some("System follows your desktop's light or dark mode.".into()),
+                    None,
+                    &p,
+                )
+                .child(theme_seg)
+                .into_any_element(),
+                labeled(
+                    "Interface text size",
+                    Some("Menus, tabs, the sidebar and grids.".into()),
+                    None,
+                    &p,
+                )
+                .child(select(&self.ui_size, 100.))
+                .into_any_element(),
+                labeled(
+                    "Editor text size",
+                    Some("SQL editor and console.".into()),
+                    None,
+                    &p,
+                )
+                .child(select(&self.editor_size, 100.))
+                .into_any_element(),
+                labeled(
+                    "Interface font",
+                    Some("Menus, tabs, the sidebar and labels.".into()),
+                    None,
+                    &p,
+                )
+                .child(
+                    div()
+                        .w(px(240.))
+                        .child(Select::new(&self.ui_font).h(row_height())),
+                )
+                .into_any_element(),
+                labeled(
+                    "Code font",
+                    Some("SQL, the values in grids and other code.".into()),
+                    None,
+                    &p,
+                )
+                .child(
+                    div()
+                        .w(px(240.))
+                        .child(Select::new(&self.mono_font).h(row_height())),
+                )
+                .into_any_element(),
             ],
         );
         let editor = fieldset(
             "Editor",
             vec![
-                row(&p)
-                    .child(label(
-                        "Indent with",
-                        Some("Used by Tab and by Format.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(select(&self.indent, 120.))
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Keywords when formatting",
-                        Some("How Format writes select, from, where.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(select(&self.keywords, 150.))
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Wrap long lines",
-                        Some("Off scrolls sideways instead.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(checkbox("wrap", s.wrap, |s, v| s.wrap = v))
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Autocomplete",
-                        Some("Suggest tables, columns and keywords while typing.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(checkbox("autocomplete", s.autocomplete, |s, v| {
-                        s.autocomplete = v
-                    }))
-                    .into_any_element(),
+                labeled(
+                    "Indent with",
+                    Some("Used by Tab and by Format.".into()),
+                    None,
+                    &p,
+                )
+                .child(select(&self.indent, 120.))
+                .into_any_element(),
+                labeled(
+                    "Keywords when formatting",
+                    Some("How Format writes select, from, where.".into()),
+                    None,
+                    &p,
+                )
+                .child(select(&self.keywords, 150.))
+                .into_any_element(),
+                labeled(
+                    "Wrap long lines",
+                    Some("Off scrolls sideways instead.".into()),
+                    None,
+                    &p,
+                )
+                .child(checkbox("wrap", s.wrap, |s, v| s.wrap = v))
+                .into_any_element(),
+                labeled(
+                    "Autocomplete",
+                    Some("Suggest tables, columns and keywords while typing.".into()),
+                    None,
+                    &p,
+                )
+                .child(checkbox("autocomplete", s.autocomplete, |s, v| {
+                    s.autocomplete = v
+                }))
+                .into_any_element(),
             ],
         );
         let results_seg = div().flex().gap(px(4.)).children(
@@ -1128,42 +1266,39 @@ impl SettingsTab {
         let results = fieldset(
             "Results",
             vec![
-                row(&p)
-                    .child(label(
-                        "Show results",
-                        Some(
-                            "New projects start with this. Each project remembers its own choice."
-                                .into(),
-                        ),
-                        None,
-                        &p,
-                    ))
-                    .child(results_seg)
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Rows per page",
-                        Some("Fetched at a time as you scroll.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(select(&self.page_size, 100.))
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Show NULL as",
-                        Some("In grids. Exports are not affected.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(
-                        div().w(px(120.)).child(
-                            gpui_kit::Styled::h(Input::new(&self.null_text), row_height())
-                                .font_family(MONO_FONT)
-                                .text_size(data_size()),
-                        ),
-                    )
-                    .into_any_element(),
+                labeled(
+                    "Show results",
+                    Some(
+                        "New projects start with this. Each project remembers its own choice."
+                            .into(),
+                    ),
+                    None,
+                    &p,
+                )
+                .child(results_seg)
+                .into_any_element(),
+                labeled(
+                    "Rows per page",
+                    Some("Fetched at a time as you scroll.".into()),
+                    None,
+                    &p,
+                )
+                .child(select(&self.page_size, 100.))
+                .into_any_element(),
+                labeled(
+                    "Show NULL as",
+                    Some("In grids. Exports are not affected.".into()),
+                    None,
+                    &p,
+                )
+                .child(
+                    div().w(px(120.)).child(
+                        gpui_kit::Styled::h(Input::new(&self.null_text), row_height())
+                            .font_family(mono_font())
+                            .text_size(data_size()),
+                    ),
+                )
+                .into_any_element(),
             ],
         );
         let tx_seg = div().flex().gap(px(4.)).children(
@@ -1180,52 +1315,50 @@ impl SettingsTab {
         let safety = fieldset(
             "Safety",
             vec![
-                row(&p)
-                    .child(label(
-                        "New connections start in",
-                        Some("Production connections always start in Manual.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(tx_seg)
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Ask before UPDATE or DELETE without WHERE",
-                        Some("Also TRUNCATE and DROP. Production connections always ask.".into()),
-                        None,
-                        &p,
-                    ))
-                    .child(checkbox("ask-dangerous", s.ask_dangerous, |s, v| {
-                        s.ask_dangerous = v;
-                    }))
-                    .into_any_element(),
-                row(&p)
-                    .child(label(
-                        "Keep query history",
-                        Some(format!(
-                            "Per project, newest {} statements. Passwords are masked.",
-                            crate::export::grouped(deadlock_core::history::KEEP)
-                        )),
-                        None,
-                        &p,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .child(checkbox("keep-history", s.keep_history, |s, v| {
-                                s.keep_history = v;
-                            }))
-                            .child(
-                                small_button("clear-history", "Clear history".into(), &p)
-                                    .clickable(cx.listener(|this, _, window, cx| {
-                                        this.clear_history(window, cx);
-                                    })),
+                labeled(
+                    "New connections start in",
+                    Some("Production connections always start in Manual.".into()),
+                    None,
+                    &p,
+                )
+                .child(tx_seg)
+                .into_any_element(),
+                labeled(
+                    "Ask before UPDATE or DELETE without WHERE",
+                    Some("Also TRUNCATE and DROP. Production connections always ask.".into()),
+                    None,
+                    &p,
+                )
+                .child(checkbox("ask-dangerous", s.ask_dangerous, |s, v| {
+                    s.ask_dangerous = v;
+                }))
+                .into_any_element(),
+                labeled(
+                    "Keep query history",
+                    Some(format!(
+                        "Per project, newest {} statements. Passwords are masked.",
+                        crate::export::grouped(deadlock_core::history::KEEP)
+                    )),
+                    None,
+                    &p,
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(checkbox("keep-history", s.keep_history, |s, v| {
+                            s.keep_history = v;
+                        }))
+                        .child(
+                            small_button("clear-history", "Clear history".into(), &p).clickable(
+                                cx.listener(|this, _, window, cx| {
+                                    this.clear_history(window, cx);
+                                }),
                             ),
-                    )
-                    .into_any_element(),
+                        ),
+                )
+                .into_any_element(),
             ],
         );
         let mut shortcut_rows: Vec<AnyElement> = GENERAL_SHORTCUTS
@@ -1309,9 +1442,11 @@ impl Render for SettingsTab {
                 .upgrade()
                 .map_or_else(String::new, |s| s.read(cx).project().name()),
         );
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let searching = !query.is_empty();
         let nav_item =
             |id: &'static str, label: SharedString, s: Section, cx: &mut Context<Self>| {
-                let on = self.section == s;
+                let on = self.section == s && !searching;
                 div()
                     .id(id)
                     .flex()
@@ -1325,8 +1460,9 @@ impl Render for SettingsTab {
                     .when(on, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
                     .when(!on, |d| d.hover(|st| st.bg(p.hover)))
                     .child(label)
-                    .clickable(cx.listener(move |this, _, _, cx| {
+                    .clickable(cx.listener(move |this, _, window, cx| {
                         this.section = s;
+                        this.search.update(cx, |i, cx| i.set_value("", window, cx));
                         cx.notify();
                     }))
             };
@@ -1342,6 +1478,12 @@ impl Render for SettingsTab {
             .gap(px(1.))
             .border_r_1()
             .border_color(p.line)
+            .child(
+                div().mb(px(8.)).child(
+                    gpui_kit::Styled::h(Input::new(&self.search).cleanable(true), row_height())
+                        .prefix(icon(Icon::Search, p.tx3)),
+                ),
+            )
             .child(nav_item(
                 "settings-project",
                 project_name.clone(),
@@ -1374,11 +1516,26 @@ impl Render for SettingsTab {
                         "Settings apply to every project on this computer and take effect at once."
                     }),
             );
-        let body = match self.section {
-            Section::Project => self.project(cx),
-            Section::General => self.general(cx),
-            Section::Shortcuts => self.shortcuts(cx),
+        SEARCH.set((query.split_whitespace().map(str::to_owned).collect(), 0));
+        let body = if searching {
+            // Every section at once, without General's shortcut sample and the
+            // Shortcuts reset row, which would repeat or stand alone.
+            let mut general = self.general(cx);
+            general.pop();
+            let mut shortcuts = self.shortcuts(cx);
+            shortcuts.pop();
+            let mut all = self.project(cx);
+            all.extend(general);
+            all.extend(shortcuts);
+            all
+        } else {
+            match self.section {
+                Section::Project => self.project(cx),
+                Section::General => self.general(cx),
+                Section::Shortcuts => self.shortcuts(cx),
+            }
         };
+        SEARCH.set((Vec::new(), 0));
         let error = cx
             .global::<settings::SettingsState>()
             .error
@@ -1432,6 +1589,7 @@ impl Render for SettingsTab {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .line_height(relative(1.2))
                                         .child(match self.section {
+                                            _ if searching => "Search".into(),
                                             Section::Project => project_name,
                                             Section::General => "Settings".into(),
                                             Section::Shortcuts => "Shortcuts".into(),

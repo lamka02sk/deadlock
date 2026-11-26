@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 
 use crate::app::Db;
 use crate::export::grouped;
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, small_size};
 use crate::ui::Clickable as _;
 
 type Choice = Entity<SelectState<Vec<SharedString>>>;
@@ -669,7 +669,7 @@ fn big_button(
 impl Render for ImportTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *cx.global::<Palette>();
-        let mono = |d: gpui_kit::Div| d.font_family(MONO_FONT).text_size(data_size());
+        let mono = |d: gpui_kit::Div| d.font_family(mono_font()).text_size(data_size());
         let info = self.table_info().cloned();
         let header = div()
             .flex()
@@ -691,7 +691,7 @@ impl Render for ImportTab {
             .child(
                 div().flex_1().min_w_0().child(
                     gpui_kit::Styled::h(Input::new(&self.file), px(32.))
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(data_size()),
                 ),
             )
@@ -786,7 +786,7 @@ impl Render for ImportTab {
                     div().child(
                         Select::new(&self.targets[i])
                             .h(px(26.))
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(data_size()),
                     ),
                     mono(div())

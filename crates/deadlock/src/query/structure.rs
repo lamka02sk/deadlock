@@ -29,11 +29,11 @@ use gpui_kit::{
     SharedString, Stateful, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 
-use super::table::{View, highlighted, wrap_sql};
+use super::table::{View, selectable_sql, wrap_sql};
 use super::{QueryTab, Session, TabEvent};
 use crate::app::Db;
 use crate::assets::{Icon, icon, menu_item, menu_item_danger, menu_item_disabled, menu_item_hint};
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, row_height, small_size};
+use crate::theme::{Palette, RADIUS, data_size, mono_font, row_height, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind as ButtonKind, button, icon_button, warning_band, warning_line};
 
@@ -2385,7 +2385,7 @@ fn fixed_field(text: String, p: &Palette) -> Div {
         .rounded(RADIUS)
         .bg(p.panel)
         .text_color(p.tx3)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .overflow_hidden()
         .whitespace_nowrap()
@@ -2395,7 +2395,7 @@ fn fixed_field(text: String, p: &Palette) -> Div {
 fn text_field(state: &Entity<InputState>, mono: bool) -> Input {
     let input = Styled::h(Input::new(state), row_height());
     if mono {
-        input.font_family(MONO_FONT).text_size(data_size())
+        input.font_family(mono_font()).text_size(data_size())
     } else {
         input
     }
@@ -2436,7 +2436,7 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
         .child(segments)
         .child(
             div()
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .child(format!("{}.{}", t.table.database, t.table.table)),
         );
@@ -2530,7 +2530,7 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
                     .flex_1()
                     .min_w_0()
                     .items_center()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .children(cells),
             )
@@ -2927,11 +2927,15 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
     )
     .child(if s.copied { "Copied" } else { "Copy" })
     .clickable(cx.listener(|this, _, _, cx| this.copy_definition(cx)));
+    // A side panel: full height, scrolling on its own in both directions.
     let aside = div()
         .flex_grow(1.)
         .flex_shrink(1.)
         .flex_basis(px(400.))
         .min_w_0()
+        .h_full()
+        .flex()
+        .flex_col()
         .border_l_1()
         .border_color(p.line)
         .bg(p.panel)
@@ -2939,17 +2943,24 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
         .child(
             div()
                 .id("structure-definition")
-                .overflow_x_scroll()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_scroll()
                 .px(px(16.))
                 .pt(px(4.))
                 .pb(px(20.))
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .line_height(px(21.))
                 .whitespace_nowrap()
                 .flex()
                 // Not shrunk to the pane, so long lines scroll sideways.
-                .child(div().flex_none().child(highlighted(&d.ddl, &p))),
+                .child(
+                    div()
+                        .flex_none()
+                        .child(selectable_sql("structure-ddl", &d.ddl, &p)),
+                ),
         );
     div()
         .size_full()
@@ -2959,11 +2970,11 @@ pub(super) fn render(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryT
         .children(notes.into_iter().flatten())
         .child(
             div()
-                .id("structure-page")
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .child(div().flex().flex_wrap().child(main).child(aside)),
+                .flex()
+                .child(main.id("structure-page").h_full().overflow_y_scroll())
+                .child(aside),
         )
         .into_any_element()
 }
@@ -2992,45 +3003,43 @@ fn draft_view(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryTab>) ->
             .line_height(px(18.))
             .child(text)
     };
-    let toolbar = div()
-        .flex()
-        .flex_wrap()
-        .flex_none()
-        .items_center()
-        .gap_x(px(16.))
-        .gap_y(px(8.))
-        .px(px(16.))
-        .py(px(10.))
-        .min_h(px(49.))
-        .border_b_1()
-        .border_color(p.line)
-        .child(segments)
-        .child(
-            div()
-                .font_family(MONO_FONT)
-                .text_size(data_size())
-                .child(if name.is_empty() {
+    let toolbar =
+        div()
+            .flex()
+            .flex_wrap()
+            .flex_none()
+            .items_center()
+            .gap_x(px(16.))
+            .gap_y(px(8.))
+            .px(px(16.))
+            .py(px(10.))
+            .min_h(px(49.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(segments)
+            .child(div().font_family(mono_font()).text_size(data_size()).child(
+                if name.is_empty() {
                     t.table.database.clone()
                 } else {
                     format!("{}.{name}", t.table.database)
-                }),
-        )
-        .child(
-            div()
-                .px(px(6.))
-                .rounded(px(4.))
-                .border_1()
-                .border_color(p.line2)
-                .text_color(p.tx2)
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .child("Draft"),
-        )
-        .child(
-            div()
-                .text_color(p.tx3)
-                .child(format!("{n} {}", if n == 1 { "column" } else { "columns" })),
-        );
+                },
+            ))
+            .child(
+                div()
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(p.line2)
+                    .text_color(p.tx2)
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Draft"),
+            )
+            .child(
+                div()
+                    .text_color(p.tx3)
+                    .child(format!("{n} {}", if n == 1 { "column" } else { "columns" })),
+            );
 
     let mut table_fields =
         vec![labeled("Name", text_field(&d.name, true), 220., &p).into_any_element()];
@@ -3241,7 +3250,7 @@ fn draft_view(this: &mut QueryTab, segments: Div, cx: &mut Context<QueryTab>) ->
                     div()
                         .flex_1()
                         .min_w_0()
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(data_size())
                         .child(c.form.name.read(cx).value().to_string()),
                 )
@@ -3413,16 +3422,16 @@ fn preview(sql: &Result<Vec<String>, String>, p: &Palette) -> AnyElement {
             .border_1()
             .border_color(p.line2)
             .rounded(RADIUS)
-            .font_family(MONO_FONT)
+            .font_family(mono_font())
             .text_size(data_size())
             .line_height(px(20.))
             .whitespace_nowrap()
             .flex()
-            .child(
-                div()
-                    .flex_none()
-                    .child(highlighted(&wrap_statements(sql, 84), p)),
-            )
+            .child(div().flex_none().child(selectable_sql(
+                "form-sql-text",
+                &wrap_statements(sql, 84),
+                p,
+            )))
             .into_any_element(),
         Err(e) => div()
             .text_size(small_size())
@@ -3547,7 +3556,7 @@ fn column_form(
             .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .child("Edit column")
-            .child(div().font_family(MONO_FONT).child(e.name.clone()))
+            .child(div().font_family(mono_font()).child(e.name.clone()))
             .into_any_element()
     });
     let mut second = vec![
@@ -3716,7 +3725,7 @@ fn index_form(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .overflow_hidden()
                     .text_ellipsis()
@@ -3828,7 +3837,7 @@ fn fk_form(
                     .border_color(p.line2)
                     .rounded(RADIUS)
                     .bg(p.panel)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .overflow_hidden()
                     .whitespace_nowrap()

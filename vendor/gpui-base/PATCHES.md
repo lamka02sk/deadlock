@@ -83,6 +83,10 @@ the container `p_1p5`/`min_w(px(180.))`, separator `my_1`, and `gap_2` after ico
 container padding, 30 px items with 12 px side padding, 180 px minimum width, 16 px
 item icons. Its `Cargo.toml` has the workspace-inherited fields written out.
 
+`PopupMenu::toggles(true)` (grep `Deadlock patch: toggle`) makes every item a toggle: a
+click runs its handler, flips the item's check and leaves the menu open, and the check
+column stays reserved while items flip. The sidebar's schema list uses it.
+
 ## 4. Gutter widgets and Ctrl/Cmd links without a mouse move
 
 `src/input/editor/blocks.rs` (`EditorState::set_gutter_widgets`),

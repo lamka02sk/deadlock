@@ -309,6 +309,9 @@ pub struct PopupMenu {
     /// Indexes of the items added as options that can be checked, so an
     /// unchecked one reports its state rather than reading as a command.
     checkable: HashSet<usize>,
+    /// Deadlock patch: a click flips the item's check and leaves the menu open,
+    /// for toggle lists (see `toggles`).
+    toggles: bool,
 
     /// The parent menu of this menu, if this is a submenu
     parent_menu: Option<WeakEntity<Self>>,
@@ -357,6 +360,7 @@ impl PopupMenu {
             max_height: None,
             check_side: Side::Left,
             checkable: HashSet::new(),
+            toggles: false,
             bounds: Bounds::default(),
             scrollable: false,
             scroll_to_checked_frames: SCROLL_TO_CHECKED_FRAMES,
@@ -464,6 +468,13 @@ impl PopupMenu {
     /// Set the menu to be scrollable to show vertical scrollbar.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    /// Deadlock patch: every item is a toggle; a click runs its handler, flips its
+    /// check and keeps the menu open, so several can be changed in one visit.
+    pub fn toggles(mut self, toggles: bool) -> Self {
+        self.toggles = toggles;
         self
     }
 
@@ -905,7 +916,17 @@ impl PopupMenu {
                             self.dispatch_confirm_action(action, window, cx);
                         }
 
-                        self.dismiss(&Cancel, window, cx)
+                        // Deadlock patch: toggle lists stay open.
+                        if self.toggles {
+                            if let Some(PopupMenuItem::Item { checked, .. }) =
+                                self.menu_items.get_mut(index)
+                            {
+                                *checked = !*checked;
+                            }
+                            cx.notify();
+                        } else {
+                            self.dismiss(&Cancel, window, cx)
+                        }
                     }
                     Some(PopupMenuItem::ElementItem {
                         handler, action, ..
@@ -1376,7 +1397,8 @@ impl PopupMenu {
             }))
             .when_some(item.a11y_label(), |this, label| this.aria_label(label))
             .checked(
-                (item.is_checked() || self.checkable.contains(&ix)).then(|| item.is_checked()),
+                (item.is_checked() || self.toggles || self.checkable.contains(&ix))
+                    .then(|| item.is_checked()),
             );
 
         match item {
@@ -1601,10 +1623,12 @@ impl Render for PopupMenu {
             window_half_height.min(rems(28.125).to_pixels(window.rem_size()))
         });
 
-        let has_left_icon = self
-            .menu_items
-            .iter()
-            .any(|item| item.has_left_icon(self.check_side));
+        // Deadlock patch: a toggle list keeps its check column while items flip.
+        let has_left_icon = self.toggles
+            || self
+                .menu_items
+                .iter()
+                .any(|item| item.has_left_icon(self.check_side));
 
         let options = RenderOptions {
             has_left_icon,

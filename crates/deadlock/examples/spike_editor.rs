@@ -48,7 +48,7 @@ impl Render for Spike {
                 Editor::new(&self.editor)
                     .bordered(false)
                     .h(relative(1.))
-                    .font_family(theme::MONO_FONT)
+                    .font_family(theme::mono_font())
                     .text_size(theme::editor_size()),
             )
             .child(gpui_fps::fps_monitor(window, cx))

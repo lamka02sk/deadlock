@@ -32,38 +32,85 @@ impl Entry {
 /// `.deadlock`) are skipped; symlinked folders are not followed, so loops cannot occur.
 /// Folders in `keep` (made in the panel, still empty) are listed too.
 pub fn scan(root: &Path, keep: &HashSet<PathBuf>) -> Vec<Entry> {
-    let mut budget = MAX_ENTRIES;
-    scan_dir(root, keep, 0, &mut budget)
+    let mut out = scan_within(root, keep, MAX_ENTRIES);
+    let dir = scratch_dir(root);
+    let scratches = scan_within(&dir, keep, MAX_ENTRIES);
+    if !scratches.is_empty() {
+        out.insert(
+            0,
+            Entry {
+                path: dir,
+                name: "Scratches".into(),
+                children: Some(scratches),
+            },
+        );
+    }
+    out
 }
 
-fn scan_dir(dir: &Path, keep: &HashSet<PathBuf>, depth: usize, budget: &mut usize) -> Vec<Entry> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for item in read.flatten() {
-        if *budget == 0 {
-            break;
-        }
-        *budget -= 1;
-        let name = item.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+/// Scratch files: kept out of the project's own folders, in `.deadlock/scratches/`,
+/// and listed first in the panel as Scratches.
+pub fn scratch_dir(root: &Path) -> PathBuf {
+    root.join(".deadlock").join("scratches")
+}
+
+/// [`scan`], reading at most `budget` folder entries.
+fn scan_within(root: &Path, keep: &HashSet<PathBuf>, mut budget: usize) -> Vec<Entry> {
+    // Level by level, so the entry budget cuts the deepest folders (a dependency
+    // folder's insides), never a file near the root.
+    let mut listed: std::collections::HashMap<PathBuf, Vec<(String, PathBuf, bool)>> =
+        std::collections::HashMap::new();
+    let mut queue = std::collections::VecDeque::from([(root.to_owned(), 0)]);
+    'scan: while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
-        }
-        let Ok(kind) = item.file_type() else { continue };
-        let path = item.path();
-        if kind.is_dir() {
-            if depth + 1 < MAX_DEPTH {
-                let children = scan_dir(&path, keep, depth + 1, budget);
-                if !children.is_empty() || keep.contains(&path) {
-                    out.push(Entry {
-                        path,
-                        name,
-                        children: Some(children),
-                    });
-                }
+        };
+        let mut items = Vec::new();
+        for item in read.flatten() {
+            if budget == 0 {
+                listed.insert(dir, items);
+                break 'scan;
             }
-        } else if is_sql(&name) && path.is_file() {
+            budget -= 1;
+            let name = item.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = item.file_type() else { continue };
+            let path = item.path();
+            if kind.is_dir() {
+                if depth + 1 < MAX_DEPTH {
+                    queue.push_back((path.clone(), depth + 1));
+                    items.push((name, path, true));
+                }
+            } else if is_sql(&name) && path.is_file() {
+                items.push((name, path, false));
+            }
+        }
+        listed.insert(dir, items);
+    }
+    build(root, &mut listed, keep)
+}
+
+/// The entries of `dir` from the scan's listing: folders holding a `.sql` file
+/// somewhere below, or kept.
+fn build(
+    dir: &Path,
+    listed: &mut std::collections::HashMap<PathBuf, Vec<(String, PathBuf, bool)>>,
+    keep: &HashSet<PathBuf>,
+) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for (name, path, folder) in listed.remove(dir).unwrap_or_default() {
+        if folder {
+            let children = build(&path, listed, keep);
+            if !children.is_empty() || keep.contains(&path) {
+                out.push(Entry {
+                    path,
+                    name,
+                    children: Some(children),
+                });
+            }
+        } else {
             out.push(Entry {
                 path,
                 name,
@@ -244,10 +291,11 @@ pub fn shown_path(root: &Path, path: &Path) -> String {
 /// Whether a watcher event at `path` can change the list: hidden entries (like
 /// `.deadlock/state.json`, written all the time) cannot.
 pub fn relevant(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root).is_ok_and(|rel| {
-        !rel.components()
-            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-    })
+    path.starts_with(scratch_dir(root))
+        || path.strip_prefix(root).is_ok_and(|rel| {
+            !rel.components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        })
 }
 
 #[cfg(test)]
@@ -308,6 +356,39 @@ mod tests {
             rows.iter()
                 .all(|r| !r.path.starts_with(dir.path().join(".deadlock")))
         );
+    }
+
+    #[test]
+    fn scratches_are_listed_first() {
+        let dir = project();
+        let scratches = scratch_dir(dir.path());
+        assert_eq!(scan(dir.path(), &HashSet::new())[0].name, "migrations");
+        fs::create_dir_all(&scratches).unwrap();
+        fs::write(scratches.join("scratch.sql"), "").unwrap();
+        let tree = scan(dir.path(), &HashSet::new());
+        assert_eq!(tree[0].path, scratches);
+        assert_eq!(
+            names(&rows(&tree, &HashSet::new(), "").0)[..2],
+            ["Scratches", "  scratch.sql"]
+        );
+        assert!(relevant(dir.path(), &scratches.join("scratch.sql")));
+        assert!(!relevant(
+            dir.path(),
+            &dir.path().join(".deadlock/state.json")
+        ));
+    }
+
+    #[test]
+    fn a_big_deep_folder_cannot_hide_files_near_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("vendor/a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        for i in 0..50 {
+            fs::write(deep.join(format!("{i}.txt")), "").unwrap();
+        }
+        fs::write(dir.path().join("new.sql"), "").unwrap();
+        let tree = scan_within(dir.path(), &HashSet::new(), 10);
+        assert_eq!(names(&rows(&tree, &HashSet::new(), "").0), ["new.sql"]);
     }
 
     #[cfg(unix)]

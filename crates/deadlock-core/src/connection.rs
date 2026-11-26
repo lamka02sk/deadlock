@@ -142,6 +142,9 @@ pub struct ConnectionConfig {
     /// exact name the tree shows. The server keeps them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_schemas: Vec<String>,
+    /// List object groups with nothing in them (Views 0…) in the sidebar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_empty_groups: bool,
 }
 
 fn ssh_unset(s: &crate::ssh::SshConfig) -> bool {
@@ -189,6 +192,7 @@ impl ConnectionConfig {
             ssh_tunnel: false,
             ssh: crate::ssh::SshConfig::default(),
             hidden_schemas: Vec::new(),
+            show_empty_groups: false,
         }
     }
 

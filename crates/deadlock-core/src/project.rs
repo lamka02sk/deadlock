@@ -76,6 +76,9 @@ pub struct ProjectState {
     /// `None` until the project chooses: the app's setting decides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub results_in_panel: Option<bool>,
+    /// The sidebar's width, once the user changed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
     /// The History panel is open.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub history_open: bool,
@@ -91,6 +94,9 @@ pub struct ProjectState {
     /// Column widths set by hand in tables' Data views.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub column_widths: Vec<TableWidths>,
+    /// The sidebar's open nodes (connection id, then names down), sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expanded: Vec<Vec<String>>,
 }
 
 /// One table's Data view column widths, by column name, in logical pixels.

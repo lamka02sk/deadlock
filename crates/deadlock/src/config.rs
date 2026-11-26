@@ -24,8 +24,8 @@ use gpui_kit::{
 
 use crate::app::Db;
 use crate::assets::{Icon, icon};
-use crate::query::table::highlighted;
-use crate::theme::{MONO_FONT, Palette, RADIUS, data_size, small_size};
+use crate::query::table::selectable_sql;
+use crate::theme::{Palette, RADIUS, data_size, mono_font, small_size};
 use crate::ui::Clickable as _;
 use crate::ui::{Kind, button};
 
@@ -830,7 +830,7 @@ fn header(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                                     d.child(
                                         div()
                                             .id("config-file")
-                                            .font_family(MONO_FONT)
+                                            .font_family(mono_font())
                                             .text_size(data_size())
                                             .hover(|s| s.text_color(p.tx))
                                             .tooltip(|window, cx| {
@@ -989,7 +989,7 @@ fn nav_row(
             d.child(
                 div()
                     .flex_none()
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(px(11.5))
                     .text_color(p.tx3)
                     .font_weight(FontWeight::NORMAL)
@@ -1196,7 +1196,7 @@ fn line(t: &ConfigTab, l: Line, cx: &mut Context<ConfigTab>) -> AnyElement {
         .h(px(ROW))
         .border_b_1()
         .border_color(p.line)
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .when(pending.is_some() && !selected, |d| d.bg(p.warn_bg))
         .when(selected, |d| d.bg(p.sel))
@@ -1245,7 +1245,7 @@ fn fact(term: &'static str, value: impl IntoElement, p: &Palette) -> Div {
 
 fn mono(s: String) -> Div {
     div()
-        .font_family(MONO_FONT)
+        .font_family(mono_font())
         .text_size(data_size())
         .child(SharedString::from(s))
 }
@@ -1317,7 +1317,7 @@ fn editor(t: &ConfigTab, x: &ConfigParam, cx: &mut Context<ConfigTab>) -> AnyEle
                     .h(px(28.))
                     .px(px(8.))
                     .rounded(RADIUS)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .when(on, |d| d.bg(p.sel).font_weight(FontWeight::MEDIUM))
                     .when(!on, |d| d.hover(|s| s.bg(p.hover)))
@@ -1374,7 +1374,7 @@ fn editor(t: &ConfigTab, x: &ConfigParam, cx: &mut Context<ConfigTab>) -> AnyEle
                 })
                 .rounded(RADIUS)
                 .bg(p.bg)
-                .font_family(MONO_FONT)
+                .font_family(mono_font())
                 .text_size(data_size())
                 .child(Input::new(&t.value).appearance(false).h(px(30.)).px_0());
             let units = x.unit.map(|u| {
@@ -1395,7 +1395,7 @@ fn editor(t: &ConfigTab, x: &ConfigParam, cx: &mut Context<ConfigTab>) -> AnyEle
                         .border_1()
                         .border_color(if on { p.tx } else { p.line2 })
                         .rounded(RADIUS)
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(data_size())
                         .when(on, |d| d.bg(p.tx).text_color(p.bg))
                         .when(!on && ok, |d| d.hover(|s| s.bg(p.hover)))
@@ -1554,7 +1554,7 @@ fn detail(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> impl IntoElement {
                 .gap(px(6.))
                 .child(
                     div()
-                        .font_family(MONO_FONT)
+                        .font_family(mono_font())
                         .text_size(px(15.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(text(x.name.clone())),
@@ -1787,7 +1787,7 @@ fn pending_panel(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> Option<impl Into
                                         .border_1()
                                         .border_color(p.warn_line)
                                         .rounded(RADIUS)
-                                        .font_family(MONO_FONT)
+                                        .font_family(mono_font())
                                         .text_size(data_size())
                                         .line_height(px(20.))
                                         .whitespace_nowrap()
@@ -1832,11 +1832,11 @@ fn pending_panel(t: &ConfigTab, cx: &mut Context<ConfigTab>) -> Option<impl Into
                     .border_1()
                     .border_color(p.warn_line)
                     .rounded(RADIUS)
-                    .font_family(MONO_FONT)
+                    .font_family(mono_font())
                     .text_size(data_size())
                     .line_height(px(20.))
                     .whitespace_nowrap()
-                    .child(highlighted(&sql, &p)),
+                    .child(selectable_sql("config-sql", &sql, &p)),
             )
             .child(
                 div()
